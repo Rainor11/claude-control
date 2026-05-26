@@ -84,6 +84,10 @@ tmux_session="claude-${project}"
 if tmux has-session -t "$tmux_session" 2>/dev/null; then
   echo "Session already running: $tmux_session"
   echo "Attach locally: tmux attach -t $tmux_session"
+  existing_pane="$(tmux capture-pane -t "$tmux_session" -pJ 2>/dev/null || true)"
+  if [[ "$existing_pane" =~ (https://claude\.ai/code[^[:space:]]*) ]]; then
+    echo "Open:           ${BASH_REMATCH[1]}"
+  fi
   exit 0
 fi
 
@@ -115,12 +119,39 @@ cmd_str="$(printf '%q ' "$claude_bin" remote-control \
   --name "$project" --spawn "$spawn_mode" --capacity "$CAPACITY")"
 tmux new-session -d -s "$tmux_session" -c "$path" "$cmd_str"
 
+# Capture the environment/session URL claude prints once it registers.
+# Without this, an env spawned via spawn=worktree doesn't appear in the
+# user's Recents until they visit the URL once — so we surface the URL
+# back to whatever invoked claude-rc (typically the control session, which
+# can then quote it in chat).
+#
+# Use `-pJ` to ask tmux to join wrapped lines (the URL is long enough to
+# wrap in a default-width pane). Poll briefly because claude needs a few
+# seconds to register the env with the remote.
+url=""
+for _ in $(seq 1 20); do
+  pane="$(tmux capture-pane -t "$tmux_session" -pJ 2>/dev/null || true)"
+  if [[ "$pane" =~ (https://claude\.ai/code[^[:space:]]*) ]]; then
+    url="${BASH_REMATCH[1]}"
+    break
+  fi
+  sleep 1
+done
+
 cat <<EOF
 Started Claude Code remote-control session.
   Project: $project
   Path:    $path
   tmux:    $tmux_session
   spawn:   $spawn_mode
-
-Open the Claude app -> Code and select session: $project
 EOF
+if [[ -n "$url" ]]; then
+  echo "  Open:    $url"
+  echo
+  echo "First-time setup: open the link above once to register the session"
+  echo "in your Claude account; after that '$project' appears in Recents."
+else
+  echo
+  echo "Open the Claude app -> Code and select session: $project"
+  echo "(URL not yet captured; check 'tmux attach -t $tmux_session' for QR/link.)"
+fi
