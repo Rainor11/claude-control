@@ -9,8 +9,13 @@ CAPACITY="${CLAUDE_RC_CAPACITY:-5}"
 usage() {
   cat <<EOF
 Usage:
-  claude-rc list                 List configured projects.
-  claude-rc <project-name>       Start a remote-control session in tmux.
+  claude-rc list                              List configured projects.
+  claude-rc <project-name> [spawn-mode]       Start a remote-control session in tmux.
+
+Spawn modes (optional second arg):
+  auto       (default) worktree for git repos, same-dir otherwise.
+  worktree   each on-demand session in its own git worktree under .claude/worktrees/.
+  same-dir   sessions share the project's working directory.
 
 Projects file: $PROJECTS_FILE
 Environment:
@@ -45,12 +50,23 @@ if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
 fi
 
 project="$cmd"
+spawn_arg="${2:-auto}"
 
 # Strict charset for project: used as tmux session name, Claude --name, and YAML key lookup.
 if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   echo "Invalid project name: $project (allowed: a-z A-Z 0-9 _ -)" >&2
   exit 1
 fi
+
+# Strict allow-list for spawn mode — also used to validate input from the
+# control session, which can pass attacker-controlled strings via the second
+# positional arg if the dispatcher is tricked.
+case "$spawn_arg" in
+  auto|worktree|same-dir) ;;
+  *)
+    echo "Invalid spawn mode: $spawn_arg (allowed: auto, worktree, same-dir)" >&2
+    exit 1 ;;
+esac
 
 path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
 if [[ -z "$path" || "$path" == "null" ]]; then
@@ -91,10 +107,28 @@ if tmux has-session -t "$tmux_session" 2>/dev/null; then
   exit 0
 fi
 
-if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  spawn_mode="worktree"
-else
-  spawn_mode="same-dir"
+case "$spawn_arg" in
+  worktree|same-dir)
+    spawn_mode="$spawn_arg"
+    ;;
+  auto)
+    # Default: worktree for git repos (parallel-safe), same-dir for everything
+    # else (no git, no isolated checkout possible).
+    if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      spawn_mode="worktree"
+    else
+      spawn_mode="same-dir"
+    fi
+    ;;
+esac
+
+# If the caller asked for worktree but the directory isn't a git repo, refuse
+# rather than letting claude error out with a confusing message later.
+if [[ "$spawn_mode" == "worktree" ]] \
+   && ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Spawn mode 'worktree' requires a git repo; $path is not one." >&2
+  echo "Use 'same-dir' or 'auto' instead." >&2
+  exit 1
 fi
 
 claude_bin="${CLAUDE_BIN:-claude}"
