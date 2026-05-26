@@ -12,10 +12,10 @@ Claude Code already supports remote-control sessions (`claude remote-control --n
 
 `claude-control` closes that gap:
 
-- A single **control session** runs on the Mac at all times (launchd keeps it alive). It's reachable from the phone around the clock.
+- A single **control session** runs on your machine at all times (launchd on macOS / systemd --user on Linux keeps it alive). It's reachable from the phone around the clock.
 - From the phone you tell the control session "lift `<project>`". It runs `claude-rc <project>`, which spawns the per-project session in `tmux` inside the right directory.
 - Open the Claude app again, you see a new `<project>` session — you're inside the project, remotely, with no SSH and no manual `cd`.
-- A small **watchdog** restarts the control session if it silently dies (see [docs/troubleshooting.md](./docs/troubleshooting.md)) — launchd doesn't notice on its own.
+- A small **watchdog** restarts the control session if it silently dies (see [docs/troubleshooting.md](./docs/troubleshooting.md)) — the process manager itself doesn't notice.
 
 ## What you get
 
@@ -37,10 +37,16 @@ You                      - inside the project, remotely
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel). Linux/systemd is on the roadmap.
+- **Platform:** macOS (Apple Silicon or Intel) **or** Linux with systemd (Ubuntu 22.04+ / any recent systemd distro).
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, logged in via `claude /login` (Claude subscription).
-- `tmux` (`brew install tmux`).
-- Recommended: keep the Mac awake while you're remote. launchd doesn't run user agents during sleep, and no remote-control session survives sleep. The usual trick is a separate launchd agent running `caffeinate -i`; this repo doesn't ship one — how you keep the box awake is your call.
+- `tmux` (`brew install tmux` / `sudo apt install tmux`).
+- `yq` from mikefarah (`brew install yq` / [binary from GitHub releases](https://github.com/mikefarah/yq/releases)). **Warning:** `apt install yq` installs a different parser by kislyuk with incompatible syntax — don't use it.
+- **macOS:** keep the Mac awake while you're remote. launchd doesn't run user agents during sleep, and no remote-control session survives sleep. The usual trick is a separate launchd agent running `caffeinate -i`; this repo doesn't ship one — how you keep the box awake is your call.
+- **Linux:** enable `loginctl Linger`, otherwise systemd `--user` services don't survive logout:
+  ```sh
+  sudo loginctl enable-linger "$USER"
+  ```
+  `install.sh` bails with a hint if linger is off.
 
 ## Quickstart
 
@@ -57,17 +63,18 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
 
 ## Principles
 
-- **Idempotent.** `./install.sh` is safe to re-run: launchd units are reloaded, existing `~/.claude-control/projects.yaml`, `CLAUDE.md`, and logs are left alone.
+- **Idempotent.** `./install.sh` is safe to re-run: units are reloaded, existing `~/.claude-control/projects.yaml`, `CLAUDE.md`, and logs are left alone.
 - **Repo separate from runtime.** The repo lives wherever (e.g. `~/Work/claude-control/`); user data lives in `~/.claude-control/`. After a copying install the repo can be deleted safely.
-- **launchd-only.** No daemons outside launchd, no `sudo`. Everything goes into the user prefix.
-- **No magic in the watchdog.** The watchdog reads the last 30 lines of `control.log` and runs `launchctl kickstart` when the heartbeat is missing. Everything it does is visible by eye in `~/.claude-control/watchdog.log`.
+- **User-scope only.** No system daemons, no `sudo` for day-to-day operation. Everything goes into the user prefix — launchd user agent on macOS or systemd `--user` units on Linux.
+- **No magic in the watchdog.** The watchdog looks at recent control-session output (the file on macOS / the journal on Linux) and restarts the unit when the heartbeat is missing. Everything it does is visible by eye in `~/.claude-control/watchdog.log`.
 
 ## Repo layout
 
 - [`bin/claude-rc`](./bin/claude-rc) — the command the control session calls; spawns the per-project session in `tmux`.
 - [`bin/claude-control-session`](./bin/claude-control-session) — launchd entrypoint (the always-on control session).
 - [`bin/claude-control-watchdog`](./bin/claude-control-watchdog) — health check for the control session (every 5 minutes).
-- [`launchd/`](./launchd/) — plist templates; `install.sh` renders them and writes to `~/Library/LaunchAgents/`.
+- [`launchd/`](./launchd/) — plist templates for macOS; `install.sh` renders them and writes to `~/Library/LaunchAgents/`.
+- [`systemd/`](./systemd/) — unit templates for Linux; `install.sh` renders them and writes to `~/.config/systemd/user/`.
 - [`examples/`](./examples/) — starter `projects.yaml`, `CLAUDE.md`, `settings.local.json` for `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) — diagram and component description (Russian-only for now).
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) — common failure modes (Russian-only for now).
@@ -75,6 +82,7 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
 
 ## What ends up where after install
 
+**macOS:**
 ```
 ~/.local/bin/
   claude-rc, claude-control-session, claude-control-watchdog
@@ -89,6 +97,27 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
   .claude/settings.local.json  # allow-list of bash commands for the control session
   control.log, control.err     # launchd output
   watchdog.log, watchdog.out, watchdog.err
+```
+
+**Linux:**
+```
+~/.local/bin/
+  claude-rc, claude-control-session, claude-control-watchdog
+
+~/.config/systemd/user/
+  claude-control.service
+  claude-control-watchdog.service
+  claude-control-watchdog.timer
+
+~/.config/claude-control/env   # optional (PATH, CLAUDE_BIN, proxy, etc.)
+
+~/.claude-control/
+  projects.yaml                # your project registry (gitignored in the repo)
+  CLAUDE.md                    # control-session project context
+  .claude/settings.local.json  # allow-list of bash commands for the control session
+  watchdog.log                 # watchdog restart log
+  # stdout/stderr of the control session goes to the systemd journal,
+  # follow with `journalctl --user -u claude-control -f`
 ```
 
 ## Uninstall

@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code remote-control dispatcher session
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN_DIR__/claude-control-session
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Optional environment file (CLAUDE_BIN, custom proxy, etc.). Prefixed with
+# '-' so the unit starts even if the file is missing. Note: PATH is set
+# explicitly by the entrypoint script, so PATH= in this file has no effect.
+EnvironmentFile=-%h/.config/claude-control/env
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Run claude-control-watchdog every 5 minutes
+
+[Timer]
+# OnActiveSec defers the first run by 2 minutes relative to *this timer*
+# becoming active, giving the control session time to come up before we
+# check it. (Don't use OnStartupSec — that's relative to user-manager
+# startup, which usually elapsed long ago by the time install.sh runs,
+# making the first fire immediate.)
+OnActiveSec=2min
+OnUnitActiveSec=5min
+Unit=__WATCHDOG_LABEL__.service
+# Persistent=true would compensate for missed runs by firing immediately —
+# we don't want catch-up; the next interval is fine.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

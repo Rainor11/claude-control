@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# claude-control-session: launchd entrypoint for the always-on "control"
-# remote-control session. It runs claude in the ~/.claude-control directory,
-# so the project-level CLAUDE.md there is loaded as context.
+# claude-control-session: entrypoint for the always-on "control" remote-control
+# session, run by launchd on macOS or systemd --user on Linux. It runs claude
+# in the ~/.claude-control directory so the project-level CLAUDE.md there is
+# loaded as context.
+#
+# PATH covers both platforms: Homebrew prefixes for macOS, /usr/local for
+# anything self-installed, then user prefixes ($HOME/.local/bin is where the
+# official claude installer puts the binary on both platforms).
+# CLAUDE_BIN: override the binary name without editing this script (useful
+# when the user installs the CLI under a different name or via a wrapper).
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
 cd "$HOME/.claude-control" || exit 1
-exec claude remote-control --name control --capacity 1
+exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1

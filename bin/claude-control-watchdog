@@ -1,34 +1,113 @@
 #!/usr/bin/env bash
 # claude-control-watchdog: periodic check that the control remote-control
-# session is still registered. launchd keeps the process alive but does not
-# know if the named session went away (the process can stay healthy while
-# the session capacity drops to 0 and the phone-side entry disappears).
+# session is still registered. The process manager (launchd / systemd) keeps
+# the process alive but does not know if the named session went away (the
+# process can stay healthy while the session capacity drops to 0 and the
+# phone-side entry disappears).
 #
-# Strategy: read the last lines of control.log and look for a heartbeat that
-# mentions our session name. If we don't see one, kickstart the unit.
+# Strategy: look at recent control-session log output for a heartbeat that
+# mentions our session name. If we don't see one, kickstart/restart the unit.
+#
+# Two backends supported:
+#   macOS:  read tail of $CLAUDE_CONTROL_LOG (file written by launchd
+#           StandardOutPath), kickstart via `launchctl kickstart`.
+#   Linux:  read recent `journalctl --user -u $LABEL.service` output, restart
+#           via `systemctl --user restart`.
+# Backend is auto-detected from `uname -s` (override with CLAUDE_CONTROL_BACKEND).
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
 
-LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
-LABEL="${CLAUDE_CONTROL_LABEL:-com.${USER}.claude-control}"
 SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
+BACKEND="${CLAUDE_CONTROL_BACKEND:-$(uname -s)}"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-if [[ ! -f "$LOG" ]]; then
-  echo "$(ts) control log missing ($LOG) - kickstart $LABEL" >> "$WLOG"
-  launchctl kickstart -k "gui/$UID/$LABEL"
-  exit 0
-fi
+restart_unit() {
+  local reason="$1"
+  echo "$(ts) ${reason} - restart ${LABEL}" >> "$WLOG"
+  case "$BACKEND" in
+    Darwin)
+      launchctl kickstart -k "gui/$UID/$LABEL"
+      ;;
+    Linux)
+      systemctl --user restart "${LABEL}.service"
+      ;;
+    *)
+      echo "$(ts) unknown backend '$BACKEND', cannot restart" >> "$WLOG"
+      exit 1
+      ;;
+  esac
+}
 
-# Match SESSION_NAME as a whitespace-bounded token in recent log lines.
-# Claude Code prints the name in its status line; we deliberately don't pin to
-# specific bullet decoration (it has changed before) - only that the name is
-# present as a standalone word in the tail.
-if tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"; then
-  exit 0
-fi
+case "$BACKEND" in
+  Darwin)
+    LABEL="${CLAUDE_CONTROL_LABEL:-com.${USER}.claude-control}"
+    LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
+    if [[ ! -f "$LOG" ]]; then
+      restart_unit "control log missing ($LOG)"
+      exit 0
+    fi
+    recent="$(tail -n 30 "$LOG" 2>/dev/null || true)"
+    # Match SESSION_NAME as a whitespace-bounded token in recent log lines.
+    # On macOS the launchd-written log file contains plain-text status lines
+    # that print the session name verbatim; the bullet decoration around it
+    # may change between Claude versions, so we only check for the name as a
+    # standalone word.
+    if grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)" <<<"$recent"; then
+      exit 0
+    fi
+    restart_unit "session '${SESSION_NAME}' not visible in recent log"
+    ;;
+  Linux)
+    LABEL="${CLAUDE_CONTROL_LABEL:-claude-control}"
+    # On Linux journald captures the dispatcher's ANSI status-line refreshes
+    # as opaque "[NN B blob data]", so we can't grep for the session name
+    # the way the macOS branch does on its plain-text control.log. Instead
+    # use the plain-text "Capacity: X/Y" line printed during startup and
+    # state transitions as the heartbeat.
+    #
+    # Trade-off: a long-stable session prints Capacity once at startup and
+    # then stays silent for hours. We therefore scope the journal window to
+    # the *current* service generation (--since="<service start>") rather
+    # than a rolling N-minute window — that way startup Capacity counts as
+    # a healthy signal indefinitely, while a freshly restarted but broken
+    # generation (no Capacity at all since its start) is correctly flagged.
+    # The "process alive but unregistered after running fine" failure mode
+    # is not detectable from journald output alone; for that case we rely
+    # on the systemd unit's Restart=always to recover from process crashes.
+    capacity_re='Capacity:[[:space:]]*[0-9]+/[0-9]+'
+    started_at="$(systemctl --user show "${LABEL}.service" --value -p ActiveEnterTimestamp 2>/dev/null)"
 
-echo "$(ts) session '${SESSION_NAME}' not visible in last 30 log lines - kickstart $LABEL" >> "$WLOG"
-launchctl kickstart -k "gui/$UID/$LABEL"
+    check_heartbeat() {
+      local since recent
+      if [[ -n "$started_at" && "$started_at" != "n/a" ]]; then
+        since="$started_at"
+      else
+        # Service not yet started or systemd doesn't know — last 5 min is the
+        # safe fallback so we don't miss a heartbeat in normal operation.
+        since='-5min'
+      fi
+      recent="$(journalctl --user -u "${LABEL}.service" --since="$since" --no-pager 2>/dev/null || true)"
+      [[ -n "$recent" ]] && grep -qE "$capacity_re" <<<"$recent"
+    }
+
+    if check_heartbeat; then
+      exit 0
+    fi
+
+    # Don't restart yet — re-check after a short delay. The first watchdog tick
+    # right after install (or right after a service restart) can race the
+    # dispatcher's startup, before the first "Capacity:" line is written.
+    sleep 5
+    if check_heartbeat; then
+      exit 0
+    fi
+
+    restart_unit "no 'Capacity:' heartbeat for ${LABEL} since service start"
+    ;;
+  *)
+    echo "$(ts) unsupported platform: $BACKEND" >> "$WLOG"
+    exit 1
+    ;;
+esac

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# uninstall.sh: remove launchd units and bin/ scripts installed by install.sh.
-# Leaves ~/.claude-control/ alone (user data — projects.yaml, logs).
+# uninstall.sh: remove launchd/systemd units and bin/ scripts installed by
+# install.sh. Leaves ~/.claude-control/ alone by default (user data —
+# projects.yaml, logs); pass --purge to remove it too.
 #
 #   ./uninstall.sh                 Use default paths and labels.
 #   ./uninstall.sh --prefix DIR    Same as install.sh.
@@ -9,8 +10,8 @@
 set -euo pipefail
 
 PREFIX="$HOME/.local"
-LABEL="com.${USER}.claude-control"
 PURGE=0
+LABEL=""   # filled in per-platform below if not given
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -18,7 +19,7 @@ while [[ $# -gt 0 ]]; do
     --label)  LABEL="$2"; shift 2 ;;
     --purge)  PURGE=1; shift ;;
     -h|--help)
-      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -28,28 +29,55 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+PLATFORM="$(uname -s)"
+case "$PLATFORM" in
+  Darwin) : "${LABEL:=com.${USER}.claude-control}" ;;
+  Linux)  : "${LABEL:=claude-control}" ;;
+  *)      echo "Unsupported platform: $PLATFORM" >&2; exit 1 ;;
+esac
+
 BIN_DIR="$PREFIX/bin"
-LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 CONTROL_DIR="$HOME/.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
 
 say() { echo "==> $*"; }
 
-remove_unit() {
-  local label="$1"
-  local plist="$LAUNCHD_DIR/${label}.plist"
-  if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
-    say "Bootout $label"
-    launchctl bootout "gui/$UID/$label" || true
-  fi
-  if [[ -e "$plist" ]]; then
-    say "Remove $plist"
-    rm -f "$plist"
-  fi
-}
+case "$PLATFORM" in
+  Darwin)
+    LAUNCHD_DIR="$HOME/Library/LaunchAgents"
+    remove_unit() {
+      local label="$1"
+      local plist="$LAUNCHD_DIR/${label}.plist"
+      if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+        say "Bootout $label"
+        launchctl bootout "gui/$UID/$label" || true
+      fi
+      if [[ -e "$plist" ]]; then
+        say "Remove $plist"
+        rm -f "$plist"
+      fi
+    }
+    remove_unit "$WATCHDOG_LABEL"
+    remove_unit "$LABEL"
+    ;;
 
-remove_unit "$WATCHDOG_LABEL"
-remove_unit "$LABEL"
+  Linux)
+    SYSTEMD_DIR="$HOME/.config/systemd/user"
+    remove_unit() {
+      local unit="$1"   # full unit name, e.g. claude-control-watchdog.timer
+      local path="$SYSTEMD_DIR/$unit"
+      systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+      if [[ -e "$path" ]]; then
+        say "Remove $path"
+        rm -f "$path"
+      fi
+    }
+    remove_unit "${WATCHDOG_LABEL}.timer"
+    remove_unit "${WATCHDOG_LABEL}.service"
+    remove_unit "${LABEL}.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    ;;
+esac
 
 for script in claude-rc claude-control-session claude-control-watchdog; do
   target="$BIN_DIR/$script"

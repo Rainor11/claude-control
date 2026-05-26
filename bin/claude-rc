@@ -16,11 +16,14 @@ Projects file: $PROJECTS_FILE
 Environment:
   CLAUDE_RC_PROJECTS_FILE  Override path to projects.yaml.
   CLAUDE_RC_CAPACITY       Max parallel sessions per project (default: 5).
+  CLAUDE_BIN               Override the claude binary name (default: claude).
 EOF
 }
 
 if ! command -v yq >/dev/null 2>&1; then
-  echo "claude-rc requires yq (https://github.com/mikefarah/yq). Install: brew install yq" >&2
+  echo "claude-rc requires yq (https://github.com/mikefarah/yq)." >&2
+  echo "  macOS: brew install yq" >&2
+  echo "  Linux: download the binary from https://github.com/mikefarah/yq/releases" >&2
   exit 1
 fi
 
@@ -90,8 +93,27 @@ else
   spawn_mode="same-dir"
 fi
 
-tmux new-session -d -s "$tmux_session" \
-  "cd $(printf '%q' "$path") && claude remote-control --name $(printf '%q' "$project") --spawn $(printf '%q' "$spawn_mode") --capacity $(printf '%q' "$CAPACITY")"
+claude_bin="${CLAUDE_BIN:-claude}"
+# Resolve to an absolute path *before* handing the command to tmux. If the tmux
+# server was already running from an unrelated session, its PATH may differ
+# from ours (in particular it may not have $HOME/.local/bin first, bypassing a
+# user-installed claude wrapper). Resolving here pins the right binary.
+if [[ "$claude_bin" != /* ]]; then
+  resolved="$(command -v "$claude_bin" 2>/dev/null || true)"
+  if [[ -z "$resolved" ]]; then
+    echo "claude binary not found in PATH: $claude_bin" >&2
+    exit 1
+  fi
+  claude_bin="$resolved"
+fi
+
+# tmux new-session concatenates trailing args into a single /bin/sh -c string,
+# so each token must be shell-quoted. Build the command with printf %q to keep
+# values from CLAUDE_BIN/CLAUDE_RC_CAPACITY/etc. from being re-parsed. The cwd
+# is handled by `-c "$path"`, which tmux uses directly (no shell involved).
+cmd_str="$(printf '%q ' "$claude_bin" remote-control \
+  --name "$project" --spawn "$spawn_mode" --capacity "$CAPACITY")"
+tmux new-session -d -s "$tmux_session" -c "$path" "$cmd_str"
 
 cat <<EOF
 Started Claude Code remote-control session.

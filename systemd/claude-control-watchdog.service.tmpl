@@ -1,0 +1,8 @@
+[Unit]
+Description=Claude Code remote-control watchdog (one-shot check)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-control-watchdog
+Environment="CLAUDE_CONTROL_LABEL=__CONTROL_LABEL__"
+Environment="CLAUDE_CONTROL_SESSION_NAME=control"

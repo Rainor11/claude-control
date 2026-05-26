@@ -12,10 +12,10 @@ Claude Code умеет открывать сессию для удаленног
 
 `claude-control` закрывает этот зазор:
 
-- На Mac'е постоянно крутится одна **control-сессия** (launchd держит ее живой). Она доступна с телефона круглосуточно.
+- На машине постоянно крутится одна **control-сессия** (launchd на macOS / systemd --user на Linux держит ее живой). Она доступна с телефона круглосуточно.
 - С телефона ты говоришь control-сессии "подними `<проект>`". Она запускает `claude-rc <проект>`, который поднимает уже проектную сессию в `tmux` в нужной директории.
 - Открываешь приложение Claude еще раз, видишь новую сессию `<проект>` - ты внутри проекта, удаленно, без SSH и ручного `cd`.
-- Маленький **watchdog** перезапускает control-сессию, если она тихо умерла (см. [docs/troubleshooting.md](./docs/troubleshooting.md)) - launchd сам этого не замечает.
+- Маленький **watchdog** перезапускает control-сессию, если она тихо умерла (см. [docs/troubleshooting.md](./docs/troubleshooting.md)) - сам процесс-менеджер этого не замечает.
 
 ## Что это дает
 
@@ -37,10 +37,16 @@ control-сессия   - запускает claude-rc cactus-adm, отвечае
 
 ## Требования
 
-- macOS (Apple Silicon или Intel). Linux/systemd в планах.
+- **Платформа**: macOS (Apple Silicon или Intel) **или** Linux с systemd (Ubuntu 22.04+ / любой свежий systemd дистр).
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, залогинен через `claude /login` (Claude-подписка).
-- `tmux` (`brew install tmux`).
-- Желательно держать Mac неспящим, пока ты удаленно. launchd не работает во время сна, и любая удаленная сессия гибнет вместе с системой. Стандартный прием - отдельный launchd-агент с `caffeinate -i`; этот репо его не ставит, держи Mac бодрым сам.
+- `tmux` (`brew install tmux` / `sudo apt install tmux`).
+- `yq` от mikefarah (`brew install yq` / [бинарь с GitHub release](https://github.com/mikefarah/yq/releases)). **Внимание:** `apt install yq` ставит другой парсер от kislyuk, синтаксис несовместим.
+- **macOS:** желательно держать Mac неспящим, пока ты удаленно. launchd не работает во время сна, и любая удаленная сессия гибнет вместе с системой. Стандартный прием - отдельный launchd-агент с `caffeinate -i`; этот репо его не ставит, держи Mac бодрым сам.
+- **Linux:** включить `loginctl Linger`, иначе systemd `--user` services не переживают logout:
+  ```sh
+  sudo loginctl enable-linger "$USER"
+  ```
+  `install.sh` падает с подсказкой, если linger выключен.
 
 ## Быстрый старт
 
@@ -57,10 +63,10 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ## Принципы
 
-- **Идемпотентность.** `./install.sh` можно гонять повторно: launchd-юниты пересоздаются, существующие `~/.claude-control/projects.yaml`, `CLAUDE.md`, логи не трогаются.
+- **Идемпотентность.** `./install.sh` можно гонять повторно: юниты пересоздаются, существующие `~/.claude-control/projects.yaml`, `CLAUDE.md`, логи не трогаются.
 - **Runtime отдельно от репо.** Сам репо живет где удобно (например, `~/Work/claude-control/`); пользовательские данные - в `~/.claude-control/`. Снести репо безопасно после копирующей установки.
-- **launchd-only.** Никаких демонов вне launchd, никакого `sudo`. Все ставится в пользовательский префикс.
-- **Никакой магии в watchdog.** Watchdog читает последние 30 строк `control.log` и при отсутствии heartbeat'а делает `launchctl kickstart`. Все, что он делает, видно глазами в `~/.claude-control/watchdog.log`.
+- **User-scope only.** Никаких системных демонов, никакого `sudo` для повседневной работы. Все ставится в пользовательский префикс - launchd user-agent на macOS или systemd `--user` units на Linux.
+- **Никакой магии в watchdog.** Watchdog смотрит recent-логи (файл на macOS / journal на Linux) и при отсутствии heartbeat'а перезапускает control-юнит. Все, что он делает, видно глазами в `~/.claude-control/watchdog.log`.
 
 ## Безопасность
 
@@ -76,7 +82,8 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`bin/claude-rc`](./bin/claude-rc) - команда для control-сессии, поднимает проектную сессию в `tmux`.
 - [`bin/claude-control-session`](./bin/claude-control-session) - entrypoint launchd-агента (вечная control-сессия).
 - [`bin/claude-control-watchdog`](./bin/claude-control-watchdog) - проверка живости control-сессии (раз в 5 минут).
-- [`launchd/`](./launchd/) - шаблоны plist'ов; `install.sh` их рендерит и кладет в `~/Library/LaunchAgents/`.
+- [`launchd/`](./launchd/) - шаблоны plist'ов для macOS; `install.sh` их рендерит и кладет в `~/Library/LaunchAgents/`.
+- [`systemd/`](./systemd/) - шаблоны unit'ов для Linux; `install.sh` их рендерит и кладет в `~/.config/systemd/user/`.
 - [`examples/`](./examples/) - стартовые `projects.yaml`, `CLAUDE.md`, `settings.local.json` для `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) - схема: что где живет, как взаимодействует.
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) - типовые поломки (сессия гаснет на простое, пустой watchdog-лог, сон Mac'а).
@@ -84,6 +91,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ## Что лежит после установки
 
+**macOS:**
 ```
 ~/.local/bin/
   claude-rc, claude-control-session, claude-control-watchdog
@@ -98,6 +106,27 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
   .claude/settings.local.json  # allow-list команд для control-сессии
   control.log, control.err     # логи launchd
   watchdog.log, watchdog.out, watchdog.err
+```
+
+**Linux:**
+```
+~/.local/bin/
+  claude-rc, claude-control-session, claude-control-watchdog
+
+~/.config/systemd/user/
+  claude-control.service
+  claude-control-watchdog.service
+  claude-control-watchdog.timer
+
+~/.config/claude-control/env   # опциональный (PATH, CLAUDE_BIN, прокси и т.д.)
+
+~/.claude-control/
+  projects.yaml                # твой реестр проектов (в .gitignore)
+  CLAUDE.md                    # контекст control-сессии
+  .claude/settings.local.json  # allow-list команд для control-сессии
+  watchdog.log                 # история restart'ов watchdog'а
+  # stdout/stderr control-сессии — в systemd journal,
+  # смотреть через `journalctl --user -u claude-control -f`
 ```
 
 ## Удалить
