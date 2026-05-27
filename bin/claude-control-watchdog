@@ -14,8 +14,9 @@
 #   Linux:  read recent `journalctl --user -u $LABEL.service` output, restart
 #           via `systemctl --user restart`.
 # Backend is auto-detected from `uname -s` (override with CLAUDE_CONTROL_BACKEND).
-set -u
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
+set -uo pipefail
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$self_dir:$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
 SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"

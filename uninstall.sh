@@ -92,6 +92,13 @@ if [[ $PURGE -eq 1 ]]; then
     say "Purge $CONTROL_DIR"
     rm -rf "$CONTROL_DIR"
   fi
+  # The optional env-file used by the Linux systemd service lives outside
+  # CONTROL_DIR (it's referenced as %h/.config/claude-control/env in the unit
+  # template), so handle it explicitly under --purge.
+  if [[ -d "$HOME/.config/claude-control" ]]; then
+    say "Purge $HOME/.config/claude-control"
+    rm -rf "$HOME/.config/claude-control"
+  fi
 else
   say "Leaving $CONTROL_DIR in place (use --purge to remove)."
 fi

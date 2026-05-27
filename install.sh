@@ -131,11 +131,18 @@ if [[ "$PLATFORM" == "Linux" ]]; then
   # systemd --user services don't survive logout unless lingering is enabled.
   linger="$(loginctl show-user "$USER" --value -p Linger 2>/dev/null || echo "no")"
   if [[ "$linger" != "yes" ]]; then
-    echo "loginctl Linger is not enabled for $USER." >&2
-    echo "Without it, the control session would exit on logout (no SSH session = no service)." >&2
-    echo "Enable it once with:" >&2
-    echo "  sudo loginctl enable-linger $USER" >&2
-    exit 1
+    cat >&2 <<EOF
+warning: loginctl Linger is not enabled for $USER.
+
+The install will proceed and the control session will work while you have
+an active login session. But the systemd --user manager exits when the
+last login session ends — without linger, your control session will die
+on logout and won't come back at boot.
+
+Enable lingering once to make the setup survive logout/reboot:
+  sudo loginctl enable-linger $USER
+
+EOF
   fi
 fi
 
@@ -294,7 +301,7 @@ case "$PLATFORM" in
       fi
       # systemd-analyze writes to stderr on failure; we capture and surface that.
       local err
-      err="$(mktemp)"
+      err="$(mktemp -t claude-control-verify.XXXXXX)"
       if ! systemd-analyze --user verify "$unit" 2>"$err"; then
         echo "systemd unit verification failed for $unit:" >&2
         cat "$err" >&2
@@ -304,7 +311,11 @@ case "$PLATFORM" in
       rm -f "$err"
     }
 
-    disable_if_active() {
+    # Unconditional cleanup: disable + stop the unit so the new file takes
+    # effect and there are no leftover enabled instances even when the unit
+    # was set up by a prior `./install.sh` run that has since changed flags.
+    # Errors (unit doesn't exist, not enabled) are intentionally ignored.
+    teardown_unit() {
       local unit="$1"
       run systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
     }
@@ -324,12 +335,12 @@ case "$PLATFORM" in
 
     # Stop old instances so the new unit file takes effect even if it was
     # already loaded, then enable+start fresh.
-    # Watchdog units are disabled unconditionally so that a `--no-watchdog`
+    # Watchdog units are torn down unconditionally so that a `--no-watchdog`
     # reinstall actually removes a previously-installed watchdog instead of
     # leaving it running.
-    disable_if_active "${LABEL}.service"
-    disable_if_active "${WATCHDOG_LABEL}.timer"
-    disable_if_active "${WATCHDOG_LABEL}.service"
+    teardown_unit "${LABEL}.service"
+    teardown_unit "${WATCHDOG_LABEL}.timer"
+    teardown_unit "${WATCHDOG_LABEL}.service"
 
     if [[ $WATCHDOG -eq 0 ]]; then
       # Remove watchdog unit files so daemon-reload picks up their absence.
