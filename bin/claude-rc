@@ -179,6 +179,12 @@ tmux_session="claude-${project}"
 if tmux has-session -t "$tmux_session" 2>/dev/null; then
   echo "Session already running: $tmux_session"
   echo "Attach locally: tmux attach -t $tmux_session"
+  # Surface the env/session URL from the live pane too, so the control session
+  # can re-quote it in chat (e.g. when a project needs a first-time Recents tap).
+  existing_pane="$(tmux capture-pane -t "$tmux_session" -pJ 2>/dev/null || true)"
+  if [[ "$existing_pane" =~ (https://claude\.ai/code[^[:space:]]*) ]]; then
+    echo "Open:           ${BASH_REMATCH[1]}"
+  fi
   exit 0
 fi
 
@@ -252,6 +258,21 @@ else
     "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log")"
 fi
 
+# Capture the environment/session URL claude prints once it registers. Without
+# this, an env spawned via --spawn doesn't appear in the user's Recents until
+# they visit the URL once - so we surface it back to whatever invoked claude-rc
+# (typically the control session, which then quotes it in chat). Use -pJ so the
+# wrapped URL line is rejoined; poll briefly since registration takes a few sec.
+url=""
+for _ in $(seq 1 20); do
+  pane="$(tmux capture-pane -t "$tmux_session" -pJ 2>/dev/null || true)"
+  if [[ "$pane" =~ (https://claude\.ai/code[^[:space:]]*) ]]; then
+    url="${BASH_REMATCH[1]}"
+    break
+  fi
+  sleep 1
+done
+
 cat <<EOF
 Started Claude Code remote-control session.
   Project: $project
@@ -259,6 +280,14 @@ Started Claude Code remote-control session.
   tmux:    $tmux_session
   spawn:   $spawn_mode
   log:     $session_log
-
-Open the Claude app -> Code and select session: $project
 EOF
+if [[ -n "$url" ]]; then
+  echo "  Open:    $url"
+  echo
+  echo "First-time setup: open the link above once to register the session"
+  echo "in your Claude account; after that '$project' appears in Recents."
+else
+  echo
+  echo "Open the Claude app -> Code and select session: $project"
+  echo "(URL not yet captured; 'tmux attach -t $tmux_session' shows the QR/link.)"
+fi
