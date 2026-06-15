@@ -13,9 +13,14 @@ LOG_DIR="${CLAUDE_RC_LOG_DIR:-$HOME/.claude-control/sessions}"
 usage() {
   cat <<EOF
 Usage:
-  claude-rc list                 List configured projects.
-  claude-rc <project-name>       Start a remote-control session in tmux.
-  claude-rc status <project>     Diagnose a session (alive? 403? flapping? gone?).
+  claude-rc list                       List configured projects.
+  claude-rc <project> [worktree|same-dir|auto]   Start a remote-control session in tmux.
+  claude-rc status <project>           Diagnose a session (alive? 403? flapping? gone?).
+
+Spawn mode (optional 2nd arg; --same-dir/--worktree/--auto also accepted):
+  worktree  - each session in its own git worktree (concurrent-safe; needs a git repo)
+  same-dir  - session works directly in the project dir (simple; concurrent sessions clash)
+  auto      - default: worktree for a git repo, same-dir otherwise
 
 Projects file: $PROJECTS_FILE
 Environment:
@@ -146,6 +151,23 @@ if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   exit 1
 fi
 
+# Optional spawn-mode override (local addition over upstream). The control session
+# is instructed (control CLAUDE.md) to call `claude-rc <name> <mode>` with a
+# POSITIONAL mode (worktree|same-dir|auto) — that contract was documented but never
+# implemented here (the 2nd arg was silently ignored, so the auto default always
+# won). Implement it now; also accept the --flag spelling. `auto`/none = the
+# git-detection default below.
+spawn_override=""
+shift || true   # drop the project name; what's left is the optional mode
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    worktree|--worktree) spawn_override="worktree"; shift ;;
+    same-dir|--same-dir) spawn_override="same-dir"; shift ;;
+    auto|--auto)         spawn_override=""; shift ;;
+    *) echo "Unknown spawn mode: $1 (allowed: worktree, same-dir, auto)" >&2; exit 1 ;;
+  esac
+done
+
 path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
 if [[ -z "$path" || "$path" == "null" ]]; then
   echo "Unknown project: $project" >&2
@@ -188,10 +210,18 @@ if tmux has-session -t "$tmux_session" 2>/dev/null; then
   exit 0
 fi
 
-if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Explicit override wins; otherwise auto: git repo -> isolated worktree, else same-dir.
+if [[ -n "$spawn_override" ]]; then
+  spawn_mode="$spawn_override"
+elif git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   spawn_mode="worktree"
 else
   spawn_mode="same-dir"
+fi
+# worktree spawn needs a git repo; fail clearly instead of letting claude error opaquely.
+if [[ "$spawn_mode" == "worktree" ]] && ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "claude-rc: --worktree needs a git repo, but '$path' is not one" >&2
+  exit 1
 fi
 
 session_log="$LOG_DIR/${project}.log"
