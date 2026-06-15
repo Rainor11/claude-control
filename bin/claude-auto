@@ -72,6 +72,7 @@ cmd_install_units() {
 # ---- adopt -----------------------------------------------------------------
 cmd_adopt() {
   local session="" cwd="" name="" mode="acceptEdits" mission="" mission_file="" probe_config="" model=""
+  local remote_control=false rc_name=""
   local -a allow=() ask=() deny=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,6 +87,8 @@ cmd_adopt() {
       --deny) deny+=("${2:-}"); shift 2 ;;
       --probe-config) probe_config="${2:-}"; shift 2 ;;
       --model) model="${2:-}"; shift 2 ;;
+      --remote-control) remote_control=true; shift ;;
+      --remote-control-name) rc_name="${2:-}"; shift 2 ;;
       *) die "adopt: unknown arg $1" ;;
     esac
   done
@@ -95,6 +98,17 @@ cmd_adopt() {
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "adopt: name must be [a-zA-Z0-9_-]"
   [ -d "$cwd" ] || die "adopt: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"  # absolutize
+
+  # Remote Control (worker visible in claude.ai/code + Claude app). Preflight:
+  # an inference-only token (CLAUDE_CODE_OAUTH_TOKEN / setup-token) CANNOT establish
+  # Remote Control — the worker would fail at launch and look like a crash-loop.
+  # Warn loudly; don't block (the env may differ at unit runtime).
+  if [ "$remote_control" = true ]; then
+    local _envf="$HOME/.config/claude-control/env"
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || { [ -f "$_envf" ] && grep -q '^[^#]*CLAUDE_CODE_OAUTH_TOKEN=' "$_envf" 2>/dev/null; }; then
+      echo "claude-auto: WARNING — CLAUDE_CODE_OAUTH_TOKEN is set; Remote Control needs a full-scope claude.ai login (run 'claude auth login'). The worker may fail to register and restart-loop." >&2
+    fi
+  fi
 
   # Detect whether this worker lives inside a brain DEAL folder, so its mission
   # can make deal-memory curation an invariant and `status` can flag stale memory.
@@ -143,8 +157,11 @@ cmd_adopt() {
   # empty (jq cartesian-product semantics), silently producing a 0-byte spec.
   jq -n --arg n "$name" --arg w "$W" --arg o "$session" --arg c "$cwd" \
         --arg m "$mode" --arg model "$model" --arg t "$(ts)" \
+        --argjson rc "$remote_control" --arg rcn "$rc_name" \
     '{name:$n, session_id:$w, origin_id:$o, cwd:$c, permission_mode:$m,
-      seeded:false, model:(if $model=="" then null else $model end), created_at:$t}' \
+      seeded:false, model:(if $model=="" then null else $model end),
+      remote_control:$rc, remote_control_name:(if $rcn=="" then null else $rcn end),
+      created_at:$t}' \
     > "$home/spec.json" || die "failed to write spec.json"
   [ -s "$home/spec.json" ] && jq -e . "$home/spec.json" >/dev/null 2>&1 || die "spec.json is empty/invalid after write"
 
@@ -246,13 +263,17 @@ cmd_adopt() {
   systemctl --user enable --now "claude-auto@$name.service" \
     || die "failed to start unit claude-auto@$name.service (see: journalctl --user -u claude-auto@$name)"
 
+  local rc_line=""
+  [ "$remote_control" = true ] && rc_line="
+  remote control : ON (name '${rc_name:-$name}') — find it in claude.ai/code & the Claude app once it registers"
+
   cat <<EOF
 worker '$name' adopted and started.
   worker session : $W  (forked from origin $session)
   cwd            : $cwd
   mode           : $mode
   home           : $home
-  unit           : claude-auto@$name.service  (enabled; survives reboot via linger)
+  unit           : claude-auto@$name.service  (enabled; survives reboot via linger)$rc_line
 
 NEXT: close the ORIGIN session/window now. Its conversation has been forked into
 the worker (new id), so leaving the origin open does not corrupt the worker, but

@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude Code claude-control env-URL Telegram notify (boot oneshot)
+# Ordering only: this may start as soon as the control PROCESS starts, BEFORE the
+# bridge registers and rewrites bridge-pointer.json. The script handles that by
+# polling for registration (correlating the pointer env with a 2xx poll in the
+# debug log) and treating a stale/missing pointer as "wait".
+After=claude-control.service
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-control-url-notify
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# Optional override file (timeout/poll/TG path); missing is fine.
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/url-notify.log
+StandardError=append:__CONTROL_DIR__/url-notify.err
+
+[Install]
+WantedBy=default.target

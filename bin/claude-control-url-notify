@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# claude-control-url-notify — after the dispatcher ("control") re-registers,
+# Telegram rainor the FRESH env-URL so he can reopen it.
+#
+# Why: a FULL SERVER REBOOT makes Anthropic hand the control session a NEW
+# environmentId, so the old claude.ai/code bookmark / Recents card goes dead. A
+# plain `systemctl restart` keeps the env_id (control reads bridge-pointer.json
+# and reconnects). This runs as a boot-time oneshot and pings the new URL only
+# when the env_id actually changed.
+#
+# Registration detection (NOT mtime alone — the watchdog docs note a HEALTHY
+# long-poll can leave the debug log silent for MINUTES): correlate the
+# bridge-pointer's environmentId with a "Starting poll loop ... environmentId=E"
+# line in control.debug.log that is FOLLOWED by a `[bridge:api] ... -> 2xx` poll.
+# That proves THIS env (post-reboot) registered — immune to a stale pointer or a
+# pre-reboot log tail still on disk.
+#
+# Idempotent: notifies only when env_id != last-notified (so a restart that keeps
+# the env, or a re-run, doesn't dup). Fallback: if registration isn't confirmed in
+# the timeout, send a WARNING (silence != success). Fail-safe: errors exit 0.
+set -u
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+TG="${CLAUDE_CONTROL_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+POINTER="${CLAUDE_CONTROL_BRIDGE_POINTER:-$HOME/.claude/projects/-home-rainor--claude-control/bridge-pointer.json}"
+DEBUG_LOG="${CLAUDE_CONTROL_DEBUG_FILE:-$CONTROL_DIR/control.debug.log}"
+TIMEOUT="${CLAUDE_CONTROL_URL_NOTIFY_TIMEOUT:-120}"
+POLL="${CLAUDE_CONTROL_URL_NOTIFY_POLL:-3}"
+LAST="$CONTROL_DIR/.last-notified-env"
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+say() { echo "$(ts) url-notify: $*" >&2; }
+
+command -v jq >/dev/null 2>&1 || { say "jq required — abort"; exit 0; }
+
+read_env() { jq -r '.environmentId // empty' "$POINTER" 2>/dev/null; }
+
+# System boot epoch — the fence between a pre-reboot LEFTOVER registration (which
+# we must NOT send: a full reboot rotates the env) and THIS boot's fresh one.
+BOOT_EPOCH="$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)"
+[ -n "$BOOT_EPOCH" ] || BOOT_EPOCH=0
+
+# Is env E the CURRENT, freshly-registered dispatcher env?
+# Codex review: scanning the last E loop-start to EOF for any 2xx is unsafe — the
+# 2xx could belong to a different (later) env, OR be a stale pre-reboot poll. So:
+#   1) the LAST "Starting poll loop" line overall must name E (pointer agrees with
+#      the most recent session — not an older env still on disk);
+#   2) that line's timestamp must be >= boot (rejects a pre-reboot leftover whose
+#      pointer hasn't been overwritten yet — exactly the stale window);
+#   3) a `[bridge:api] ... -> 2xx` must appear AFTER it (registered + polling).
+registered() {
+  local e="$1" line ln content elog tiso tepoch
+  [ -n "$e" ] && [ -f "$DEBUG_LOG" ] || return 1
+  line="$(grep -n 'Starting poll loop' "$DEBUG_LOG" 2>/dev/null | tail -1)"   # LINENO:content
+  [ -n "$line" ] || return 1
+  ln="${line%%:*}"          # leading line number
+  content="${line#*:}"      # strip "LINENO:" so the timestamp anchor isn't broken
+  elog="$(printf '%s' "$content" | sed -n 's/.*environmentId=\([A-Za-z0-9_-]\{1,\}\).*/\1/p')"
+  [ "$elog" = "$e" ] || return 1                                  # (1) pointer == latest session
+  tiso="$(printf '%s' "$content" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z')"
+  [ -n "$tiso" ] || return 1                                      # no parseable ts → can't trust; wait
+  tepoch="$(date -d "$tiso" +%s 2>/dev/null)"
+  [ -n "$tepoch" ] && [ "$tepoch" -ge $(( BOOT_EPOCH - 5 )) ] || return 1   # (2) fresh this boot
+  tail -n +"$ln" "$DEBUG_LOG" 2>/dev/null | grep -qE '\[bridge:api\].*-> 2[0-9][0-9]'   # (3) polling
+}
+
+# Poll until registration is confirmed or the timeout elapses.
+now() { date +%s; }
+deadline=$(( $(now) + TIMEOUT ))
+env=""
+while :; do
+  env="$(read_env)"
+  registered "$env" && break
+  if [ "$(now)" -ge "$deadline" ]; then
+    say "registration not confirmed in ${TIMEOUT}s (env='${env:-none}')"
+    if [ -x "$TG" ]; then
+      "$TG" "⚠️ claude-control не зарегистрировался за ${TIMEOUT}с после старта — проверь: systemctl --user status claude-control (и control.debug.log)." >/dev/null 2>&1 || true
+    fi
+    exit 0
+  fi
+  sleep "$POLL"
+done
+
+# Idempotency: notify only when the env changed since last time.
+prev=""
+[ -f "$LAST" ] && prev="$(cat "$LAST" 2>/dev/null || true)"
+if [ "$env" = "$prev" ]; then
+  say "env unchanged ($env) — no notify"
+  exit 0
+fi
+
+URL="https://claude.ai/code?environment=$env"
+if [ -x "$TG" ] && "$TG" "🔄 claude-control перезагрузился. Диспетчер: $URL — открой ссылку один раз, чтобы вернуть control в Recents." >/dev/null 2>&1; then
+  printf '%s\n' "$env" > "$LAST" 2>/dev/null || true
+  say "notified env=$env"
+else
+  say "telegram send failed (env=$env) — not recording; will retry next boot"
+fi
+exit 0

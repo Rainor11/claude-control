@@ -37,6 +37,8 @@ cwd="$(j '.cwd')"
 mode="$(j '.permission_mode // "acceptEdits"')"
 seeded="$(j '.seeded // false')"
 model="$(j '.model // empty')"
+remote_control="$(j '.remote_control // false')"
+rc_name="$(j '.remote_control_name // empty')"
 
 # The worker's OWN (forked, pinned) transcript, created on its FIRST turn (not at
 # launch) — so seeding is confirmed by watching for this file in the supervise
@@ -110,6 +112,12 @@ else
   # the preview gate is lifted.)
   [ -s "$home/CLAUDE.md" ] && args+=( --append-system-prompt "$(cat "$home/CLAUDE.md")" )
   [ -n "$model" ] && args+=( --model "$model" )
+  # Remote Control: expose this durable session to claude.ai/code + the Claude app.
+  # It's a flag on the same interactive session, so --resume/--settings/mission all
+  # still apply (durability kept). TTY is provided by tmux. Name defaults to worker.
+  if [ "$remote_control" = "true" ]; then
+    args+=( --remote-control "${rc_name:-$name}" )
+  fi
 
   say "launching: ${seeded:+resume }$session_id mode=$mode cwd=$cwd"
   # tmux -e passes env with NO shell parsing (robust). Worker-scoped env points

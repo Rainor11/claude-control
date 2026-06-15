@@ -66,6 +66,7 @@ WATCHDOG_SERVICE_UNIT="claude-control-watchdog.service"
 WATCHDOG_TIMER_UNIT="claude-control-watchdog.timer"
 LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
+URL_NOTIFY_UNIT="claude-control-url-notify.service"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -187,7 +188,8 @@ install_script() {
 }
 
 for script in claude-rc claude-control-run claude-control-logrotate \
-              claude-control-session claude-control-watchdog; do
+              claude-control-session claude-control-watchdog \
+              claude-control-url-notify; do
   install_script "$script"
 done
 
@@ -355,6 +357,11 @@ else  # linux
   render_template "$REPO_DIR/systemd/claude-control-logrotate.service.tmpl" "$LOGROTATE_SERVICE_PATH"
   render_template "$REPO_DIR/systemd/claude-control-logrotate.timer.tmpl"   "$LOGROTATE_TIMER_PATH"
 
+  # Boot-time oneshot: Telegram the fresh dispatcher env-URL after a reboot (the
+  # env_id rotates on full reboot). Installed regardless of --watchdog.
+  URL_NOTIFY_PATH="$UNIT_DIR/$URL_NOTIFY_UNIT"
+  render_template "$REPO_DIR/systemd/claude-control-url-notify.service.tmpl" "$URL_NOTIFY_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -374,6 +381,7 @@ else  # linux
   fi
   verify_unit "$LOGROTATE_SERVICE_PATH"
   verify_unit "$LOGROTATE_TIMER_PATH"
+  verify_unit "$URL_NOTIFY_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -382,6 +390,10 @@ else  # linux
     run systemctl --user enable --now "$WATCHDOG_TIMER_UNIT"
   fi
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
+  # Boot oneshot: enable only (no --now) — it should fire on each boot via
+  # default.target, not send a Telegram during install. Test manually with
+  # `systemctl --user start claude-control-url-notify.service`.
+  run systemctl --user enable "$URL_NOTIFY_UNIT"
 
   # Lingering: without it, the user manager (and our services) stops on logout.
   # We do not call sudo - just check and warn loudly so the user can fix it.

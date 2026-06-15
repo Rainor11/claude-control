@@ -46,6 +46,25 @@ claude-auto status <name>           # spec + unit + tmux state
 claude-auto list                    # all workers
 ```
 
+### See the worker in the Claude app (optional, per-worker)
+
+By default a worker is reachable only via `tmux attach`. To also surface it in
+claude.ai/code and the Claude mobile app (with push notifications), adopt it with
+Remote Control:
+```
+/go-autonomous            # answer "yes" to the Claude-app visibility question, or:
+claude-auto adopt … --remote-control [--remote-control-name "Title in the app"]
+```
+`--remote-control` is just a flag on the same durable interactive session, so the
+pinned `--resume`, `--settings` bounds and `--append-system-prompt` mission all
+still apply — durability is unchanged; the worker additionally registers a Remote
+Control session (the TUI footer shows `/rc active`). The TTY it needs is provided
+by tmux. Notes: it requires a claude.ai OAuth login (NOT an inference-only
+`CLAUDE_CODE_OAUTH_TOKEN`/setup-token — `adopt` warns if one is set); a network
+outage longer than ~10 min makes the Remote Control session time out and the
+process exit, which `Restart=always` + the reconciler bring back (resuming the
+pinned session). Keep it OFF for workers handling untrusted internet events.
+
 Under the hood (`claude-auto adopt`):
 1. generates a fresh pinned worker session id `W`;
 2. first launch forks the origin into `W`
