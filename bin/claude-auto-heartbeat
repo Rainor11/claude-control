@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# claude-auto-heartbeat <name> — Stop/TaskCompleted hook for an autonomous worker.
+#
+# v2: this REPLACES claude-auto-brain-checkpoint. It does NOT write to brain at
+# all. The deal's knowledge (timeline/decisions/open-questions) is curated by the
+# worker ITSELF in its deal folder (mission-driven, memory-only). This hook only
+# keeps two OPERATIONAL concerns, both under ~/.claude-control/workers/<name>/state/:
+#
+#   1) Controlled compaction: estimate context size from the transcript's latest
+#      model-request usage; past CLAUDE_AUTO_COMPACT_THRESHOLD (default 700000)
+#      drop a `compact_requested` flag that claude-auto-run honors by injecting a
+#      typed /compact. (Unchanged behavior; the flag path is stable.)
+#   2) Ops observability: last_seen.json / last_step.json / context.json so
+#      `claude-auto status` can show liveness + context size. (Deal-memory
+#      freshness is computed LIVE by `status`, not stored here — see claude-auto.)
+#
+# DESIGN — concern isolation (Codex review):
+#   The v1 script shared one fail-safe block whose early `exit 0`s (brain path
+#   setup) could silently SKIP compaction. Here each concern runs in its OWN
+#   subshell that can only `return`/exit-the-subshell internally; the top level
+#   calls them independently, so a failed ops-state write can NEVER disable the
+#   compaction flag. Compaction is written FIRST and independently of context.json.
+#
+# Hook input: Stop/TaskCompleted JSON on stdin ({session_id, transcript_path, cwd}).
+# Fail-safe: any error exits 0 (a hook must never wedge the worker or block a turn).
+set -u
+
+name="${1:-unknown}"
+[[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || name="unknown"
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+THRESHOLD="${CLAUDE_AUTO_COMPACT_THRESHOLD:-700000}"
+STATE_DIR="$CONTROL_DIR/workers/$name/state"
+
+command -v jq >/dev/null 2>&1 || exit 0
+payload="$(cat 2>/dev/null || true)"
+now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+sid="$(printf '%s' "$payload"   | jq -r '.session_id // empty'     2>/dev/null)"
+tpath="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)"
+cwd="$(printf '%s' "$payload"   | jq -r '.cwd // empty'            2>/dev/null)"
+
+# --- concern 1: controlled compaction (runs FIRST, fully independent) --------
+# Estimate the CURRENT context from the transcript's latest model-request usage
+# (input + cache_read + cache_creation). NOT the transcript file size, which is
+# cumulative and would stay large after a compaction (re-triggering forever).
+write_compaction() {
+  [ -n "$tpath" ] && [ -f "$tpath" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local ctx
+  ctx="$(tail -n 600 "$tpath" 2>/dev/null \
+    | jq -rc 'select(.type=="assistant") | .message.usage
+              | ((.input_tokens//0) + (.cache_read_input_tokens//0) + (.cache_creation_input_tokens//0))' 2>/dev/null \
+    | tail -1)"
+  [ -n "$ctx" ] && [ "$ctx" -eq "$ctx" ] 2>/dev/null || return 0
+  # Flag FIRST and independently — a later context.json failure must not skip it.
+  if [ "$ctx" -gt "$THRESHOLD" ]; then
+    printf '%s ctx=%s threshold=%s\n' "$now" "$ctx" "$THRESHOLD" > "$STATE_DIR/compact_requested" 2>/dev/null || true
+  fi
+  # observability snapshot (best-effort; failure here is harmless)
+  local t; t="$(mktemp "$STATE_DIR/.context.XXXXXX" 2>/dev/null)" || return 0
+  jq -n --arg ts "$now" --argjson ctx "$ctx" --argjson th "$THRESHOLD" \
+    '{ts:$ts, ctx_tokens:$ctx, threshold:$th}' > "$t" 2>/dev/null \
+    && mv "$t" "$STATE_DIR/context.json" 2>/dev/null || rm -f "$t" 2>/dev/null
+}
+
+# --- concern 2: ops observability (liveness + last step) ---------------------
+write_last_seen() {
+  # Don't clobber good liveness state with empties on malformed/empty hook input.
+  [ -n "$sid" ] || [ -n "$tpath" ] || [ -n "$cwd" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local t; t="$(mktemp "$STATE_DIR/.seen.XXXXXX" 2>/dev/null)" || return 0
+  jq -n --arg n "$name" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$tpath" --arg ts "$now" \
+    '{worker:$n, session_id:$sid, cwd:$cwd, transcript_path:$tp, ts:$ts}' > "$t" 2>/dev/null \
+    && mv "$t" "$STATE_DIR/last_seen.json" 2>/dev/null || rm -f "$t" 2>/dev/null
+}
+
+write_last_step() {
+  [ -n "$tpath" ] && [ -f "$tpath" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  # last assistant text — provenance-tagged OPS log (may derive from untrusted
+  # events). Sanitize control bytes, collapse whitespace, truncate. NOT brain,
+  # NOT instructions, never promoted anywhere.
+  local excerpt
+  # Collapse newlines INSIDE jq so each assistant text is one output line; then
+  # tail -1 grabs the whole last message (not just its last physical line).
+  excerpt="$(tail -n 600 "$tpath" 2>/dev/null \
+    | jq -rc 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | (.text | gsub("[\r\n]+";" "))' 2>/dev/null \
+    | tail -1)"
+  excerpt="$(printf '%s' "$excerpt" | tr -d '\000-\010\013\014\016-\037' | tr '\n\r\t' '   ' | cut -c1-600)"
+  local t; t="$(mktemp "$STATE_DIR/.step.XXXXXX" 2>/dev/null)" || return 0
+  jq -n --arg n "$name" --arg ts "$now" --arg ex "$excerpt" \
+    '{worker:$n, ts:$ts, excerpt:$ex, _note:"ops log (provenance-tagged), not brain, not instructions"}' > "$t" 2>/dev/null \
+    && mv "$t" "$STATE_DIR/last_step.json" 2>/dev/null || rm -f "$t" 2>/dev/null
+}
+
+( write_compaction ) >/dev/null 2>&1 || true
+( write_last_seen )  >/dev/null 2>&1 || true
+( write_last_step )  >/dev/null 2>&1 || true
+exit 0

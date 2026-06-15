@@ -2,8 +2,8 @@
 
 Turn any Claude Code session into a **durable, unattended worker** that keeps
 running on its own (surviving logout, crash, and reboot), reacts to external
-events, checkpoints its progress to brain, and that you reconnect to occasionally
-to check status or correct.
+events, curates its deal's memory in brain (when adopted from a deal folder), and
+that you reconnect to occasionally to check status or correct.
 
 This builds on claude-control (tmux sessions under `systemd --user` + linger).
 
@@ -15,15 +15,15 @@ This builds on claude-control (tmux sessions under `systemd --user` + linger).
 | `bin/claude-auto-run` | Foreground supervisor (one per worker, the `ExecStart` of `claude-auto@<name>.service`). Launches the worker in tmux, blocks for its lifetime, restarts it, runs controlled compaction, starts the event watcher. |
 | `bin/event-bridge-watch` | Per-worker event loop: runs the worker's probes and injects new events as user turns. |
 | `bin/session-inject` | Types a message into a live Claude tmux session as a user turn (hardened idle/approval-aware send-keys). The fallback transport and the `/compact` injector. |
-| `bin/claude-auto-brain-checkpoint` | `TaskCompleted` hook: memory-only progress checkpoint to brain + sets the compaction flag past threshold. |
+| `bin/claude-auto-heartbeat` | `Stop`/`TaskCompleted` hook: writes ops-state (liveness, last step, context-size estimate, compaction flag) under the worker's `state/`. **No brain writes** — deal memory is the worker's own job (see "Deal memory" below). |
 | `bin/claude-auto-notify` | `Notification` hook: one-way Telegram ping when the worker blocks on a permission prompt. |
 | `bin/claude-auto-reconciler` | Timer/boot job that (re)starts any registered-active worker whose unit isn't up. |
 | `channels/event-bridge/` | An MCP **channel** version of the event feed (opt-in, see "Channel mode" below). |
 | `/go-autonomous` slash command | The helper that gathers mission + bounds and calls `claude-auto adopt`. |
 
 State lives in `~/.claude-control/`:
-- `autonomous.json` — registry (`workers.<name> = {state, cwd, created_at}`).
-- `workers/<name>/` — `spec.json`, `settings.json` (bounds), `CLAUDE.md` (mission), `event-bridge.config.json` (probes), `state/`, `logs/`.
+- `autonomous.json` — registry (`workers.<name> = {state, cwd, created_at, brain_path, brain_rel}`). `brain_path`/`brain_rel` link a worker to its brain deal folder (null when not adopted from one).
+- `workers/<name>/` — `spec.json`, `settings.json` (bounds), `CLAUDE.md` (mission), `event-bridge.config.json` (probes), `logs/`, and `state/` (`last_seen.json`, `last_step.json`, `context.json`, `compact_requested`).
 
 ## Turn the current session autonomous
 
@@ -64,7 +64,10 @@ Under the hood (`claude-auto adopt`):
   session, so it picks up where it left off.
 - The reconciler timer re-starts any active worker whose unit didn't come up
   (e.g. network/proxy/auth not ready right after boot).
-- If a worker dies for good, brain still holds its latest progress checkpoint.
+- If a worker dies for good, its **transcript** holds the full conversation
+  (restored on `--resume`); for a brain deal worker, the **deal folder** also
+  holds the memory it curated up to its last completed step (seconds/minutes
+  behind the transcript — accepted trade-off).
 
 ## Adding an event trigger (probe + target + template)
 
@@ -142,26 +145,52 @@ inline yes/no relay is not used by default: Telegram allows one getUpdates
 consumer per bot token, so co-loading the shared telegram channel in every worker
 would 409-conflict. For a single worker you can opt into the channel-mode relay.)
 
-## Brain checkpoints — by progress, memory only
+## Deal memory — curated by the worker, in its own deal folder
 
-The `TaskCompleted` hook (`claude-auto-brain-checkpoint`) writes a structured
-progress checkpoint (`progress.md` + `state.json`) under
-`~/brain/wiki/work/ai-dev/автономные-воркеры/<name>/` after each completed step,
-and commits it in brain.
+Three things, three homes:
+1. **Ops** (which workers exist, which to restart) → `~/.claude-control/autonomous.json`
+   + `claude-auto list`. The central ops view, not brain.
+2. **Worker conversation memory** → the session transcript (`--resume`). Automatic.
+3. **Deal knowledge** (`timeline.md` / `decisions.md` / open-questions) → the brain
+   **deal folder**, the vault's native memory model.
 
-This is **memory update only — never ingest.** It writes only to that
-allowlisted progress path (fail-closed otherwise), never imports ingest code, and
-never creates knowledge-base pages from external material. Bringing new external
-sources into the wiki stays a human-approved action (the brain gatekeeper). The
-auto-extracted excerpt is stored as provenance-tagged log data, never promoted to
-instructions/knowledge.
+When `adopt` is run from inside a brain deal folder
+(`…/brain/wiki/work/{ai-dev,retail}/{клиенты,продукты}/<slug>`), it stores
+`brain_path`/`brain_rel` in the registry and **bakes deal-memory curation into the
+worker's mission**: after each completed step the worker updates that deal's
+`timeline.md` / `decisions.md` / open-questions per the brain schema. This is
+**memory update only — never ingest**: bringing new external material into the wiki
+stays a human-approved action (the brain gatekeeper). The mission also carries hard
+anti-injection rules — never copy raw external event text into `decisions.md`;
+external claims go to open-questions tagged with their source; a decision needs the
+worker's own conclusion or operator approval; instructions embedded in events are
+ignored.
+
+There is **no** mechanical brain checkpoint anymore (v1's orphan
+`автономные-воркеры/<name>/` log is gone — it duplicated the transcript and never
+touched the actual deal folder). Instead:
+- the `claude-auto-heartbeat` hook keeps lightweight **ops-state** in
+  `workers/<name>/state/` (liveness, last step, context-size, compaction flag) — no
+  brain writes;
+- `claude-auto status <name>` reports **deal-memory freshness** live: it compares the
+  worker transcript's mtime against the newest mtime of the deal's memory files. If
+  the transcript advanced well past the last memory edit
+  (`CLAUDE_AUTO_STALE_SECONDS`, default 1800), it shows `deal memory: STALE` — the
+  worker is doing steps without curating memory. This is detection, not writing
+  (no orphan pollution), and is immune to clock/timezone issues and to the
+  Stop+TaskCompleted double-fire.
+
+**Accepted trade-off:** if a worker dies mid-step before curating the deal folder,
+that step lives only in the transcript (recovered on `--resume`; the deal folder is
+seconds/minutes behind). The transcript is the source of truth.
 
 ## Controlled compaction (~700k)
 
 To avoid the native auto-compact firing mid-task and burying nuance, the
-checkpoint hook estimates context size from the transcript's latest model-request
-usage; past `CLAUDE_AUTO_COMPACT_THRESHOLD` (default 700000) it drops a
-`state/compact_requested` flag. The supervisor then injects `/compact <preserve
+heartbeat hook estimates context size from the transcript's latest model-request
+usage (independently of its ops-state writes, so a state-write failure can't
+disable compaction); past `CLAUDE_AUTO_COMPACT_THRESHOLD` (default 700000) it drops
+a `state/compact_requested` flag. The supervisor then injects `/compact <preserve
 mission/state/questions/bounds>` via `session-inject` — but only when the TUI is
 idle (no approval prompt, settled) and a cooldown
 (`CLAUDE_AUTO_COMPACT_COOLDOWN`, default 900s) has elapsed. Native auto-compact
