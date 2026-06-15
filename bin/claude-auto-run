@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# claude-auto-run <name> — foreground supervisor for one autonomous worker.
+#
+# Why foreground: this is the ExecStart of claude-auto@<name>.service. It must
+# stay alive for as long as the worker lives, otherwise systemd's Restart=always
+# is meaningless (it would relaunch a process that already exited). So it starts
+# the worker inside a durable tmux session and then BLOCKS until that session
+# ends (worker exits / crashes), at which point systemd restarts this unit and
+# the worker resumes. With loginctl linger this also brings the worker back
+# after a reboot. (Fixes the "tmux new-session -d && exit" pattern in claude-rc
+# which is fine for on-demand projects but wrong for a supervised unit.)
+#
+# Worker spec lives in ~/.claude-control/workers/<name>/spec.json:
+#   { session_id, origin_id, cwd, permission_mode, seeded, model }
+# First start (seeded=false) forks the origin conversation into the worker's
+# OWN pinned session id (verified: --resume <origin> --fork-session
+# --session-id <W> copies history into a fresh W.jsonl, no double-write).
+# Subsequent starts just --resume <W>, so restarts continue the SAME session.
+set -u
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+WORKERS_DIR="$CONTROL_DIR/workers"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+name="${1:?usage: claude-auto-run <name>}"
+[[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "claude-auto-run: bad name '$name'" >&2; exit 2; }
+
+home="$WORKERS_DIR/$name"
+spec="$home/spec.json"
+[ -f "$spec" ] || { echo "claude-auto-run: no spec at $spec" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "claude-auto-run: jq required" >&2; exit 2; }
+
+j() { jq -r "$1" "$spec"; }
+session_id="$(j '.session_id')"
+origin_id="$(j '.origin_id // empty')"
+cwd="$(j '.cwd')"
+mode="$(j '.permission_mode // "acceptEdits"')"
+seeded="$(j '.seeded // false')"
+model="$(j '.model // empty')"
+
+# Path where the worker's OWN (forked, pinned) transcript will live. It is
+# created on the worker's FIRST turn, not at launch — so we confirm seeding by
+# watching for this file in the supervise loop, not by a one-shot wait.
+proj="$(printf '%s' "$cwd" | sed 's#/#-#g')"
+wfile="$HOME/.claude/projects/$proj/$session_id.jsonl"
+
+flip_seeded_if_ready() {
+  [ "$seeded" = "true" ] && return 0
+  [ -f "$wfile" ] || return 0
+  local t="$spec.tmp"
+  jq '.seeded = true' "$spec" > "$t" 2>/dev/null && mv "$t" "$spec" && { seeded=true; say "seeded confirmed (worker transcript present)"; }
+}
+
+[ -d "$cwd" ] || { echo "claude-auto-run: cwd missing: $cwd" >&2; exit 1; }
+mkdir -p "$home/logs" "$home/state"
+log="$home/logs/worker.log"
+sess="claude-$name"
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+say() { echo "$(ts) claude-auto-run[$name]: $*" | tee -a "$log" >&2; }
+
+# Pre-accept the folder-trust dialog for this cwd. An interactive worker would
+# otherwise BLOCK on "Is this a project you trust?" with no one to answer. In
+# normal use the origin already trusted its cwd, but seed it idempotently so
+# fresh dirs and headless-origin cases don't wedge. Atomic; only adds keys.
+trust_cfg="$HOME/.claude.json"
+if [ -f "$trust_cfg" ] && command -v jq >/dev/null 2>&1; then
+  # flock serializes concurrent workers (e.g. several starting at boot) so they
+  # don't lost-update each other's trust entries. (It can't serialize against
+  # claude itself rewriting ~/.claude.json, but that read-modify-write window is
+  # tiny; the multi-worker boot race is the real hazard.)
+  (
+    flock 201 || exit 1
+    [ "$(jq -r --arg c "$cwd" '.projects[$c].hasTrustDialogAccepted // false' "$trust_cfg" 2>/dev/null)" = "true" ] && exit 0
+    ttmp="$(mktemp "$trust_cfg.autotrust.XXXXXX")" || exit 1
+    if jq --arg c "$cwd" '.projects[$c] = ((.projects[$c] // {}) + {hasTrustDialogAccepted:true, hasCompletedProjectOnboarding:true})' "$trust_cfg" > "$ttmp" 2>/dev/null && [ -s "$ttmp" ]; then
+      mv "$ttmp" "$trust_cfg"
+    else
+      rm -f "$ttmp"; exit 2
+    fi
+  ) 201>"$trust_cfg.trustlock"
+  [ $? = 0 ] && say "pre-trusted cwd $cwd (or already trusted)" || say "WARN: could not pre-trust $cwd"
+fi
+
+# Already running? Then just attach our lifetime to it (don't double-launch).
+if tmux has-session -t "$sess" 2>/dev/null; then
+  say "tmux session $sess already running — supervising existing"
+else
+  # Build claude argv.
+  args=( "$CLAUDE_BIN" )
+  # Resume the pinned worker session if it's seeded OR its transcript already
+  # exists (don't re-fork into an existing id — that risks corrupting it if the
+  # seeded flag merely lagged). Only fork when there is genuinely no worker
+  # transcript yet.
+  if [ "$seeded" = "true" ] || [ -f "$wfile" ]; then
+    args+=( --resume "$session_id" )
+  else
+    [ -n "$origin_id" ] || { say "FATAL: not seeded but no origin_id"; exit 1; }
+    args+=( --resume "$origin_id" --fork-session --session-id "$session_id" )
+  fi
+  args+=( --permission-mode "$mode" )
+  args+=( --settings "$home/settings.json" )
+  # Mission + bounds prose pinned into the system-prompt layer (survives
+  # compaction). NOTE: events are delivered by event-bridge-watch + session-inject,
+  # NOT a channel — the channel's --dangerously-load-development-channels warning
+  # re-prompts on every launch (no persisted ack), which would wedge an
+  # unattended restart. (Channel mode is kept in channels/event-bridge for when
+  # the preview gate is lifted.)
+  [ -s "$home/CLAUDE.md" ] && args+=( --append-system-prompt "$(cat "$home/CLAUDE.md")" )
+  [ -n "$model" ] && args+=( --model "$model" )
+
+  say "launching: ${seeded:+resume }$session_id mode=$mode cwd=$cwd"
+  # tmux -e passes env with NO shell parsing (robust). Worker-scoped env points
+  # event-bridge at this worker's probe config + dedup state.
+  tmux new-session -d -s "$sess" -c "$cwd" \
+    -e "EVENT_BRIDGE_CONFIG=$home/event-bridge.config.json" \
+    -e "EVENT_BRIDGE_STATE_DIR=$home/state" \
+    -e "CLAUDE_AUTO_NAME=$name" \
+    -e "CLAUDE_AUTO_HOME=$home" \
+    "${args[@]}" 2>>"$log" \
+    || { say "tmux new-session failed"; exit 1; }
+
+  # Seeding is confirmed on the worker's FIRST turn (when $wfile appears); the
+  # supervise loop below flips it. Try briefly here too in case it's fast.
+  for _ in $(seq 1 10); do flip_seeded_if_ready; [ "$seeded" = "true" ] && break; sleep 1; done
+fi
+
+# Start the per-worker event watcher (delivers external events as user turns via
+# session-inject). Self-terminates when the tmux session ends; flock keeps it
+# single-instance across supervisor restarts.
+WATCH="$(dirname "$0")/event-bridge-watch"
+if [ -x "$WATCH" ]; then
+  setsid "$WATCH" "$name" >/dev/null 2>&1 &
+  say "event watcher started"
+fi
+
+# Controlled compaction (H): the brain-checkpoint hook drops a compact_requested
+# flag when the transcript's latest usage exceeds the threshold. Here we honor it
+# by injecting `/compact` (a slash command must be TYPED — a channel body would
+# be treated as data, not parsed). session-inject only types when the TUI is idle
+# and no approval prompt is up, so this can't land mid-turn or over a dialog. A
+# cooldown prevents double-compaction and racing the native auto-compact backstop.
+INJECT="$(dirname "$0")/session-inject"
+COMPACT_FLAG="$home/state/compact_requested"
+COMPACT_COOLDOWN="${CLAUDE_AUTO_COMPACT_COOLDOWN:-900}"
+COMPACT_LAST="$home/state/.last_compact"
+COMPACT_MSG='/compact Preserve verbatim: the mission and operating bounds, the current task state and progress, any open questions, and the immediate next steps.'
+
+maybe_compact() {
+  [ -f "$COMPACT_FLAG" ] || return 0
+  local now last=0
+  now="$(date +%s)"
+  [ -f "$COMPACT_LAST" ] && last="$(cat "$COMPACT_LAST" 2>/dev/null || echo 0)"
+  [ "$last" -eq "$last" ] 2>/dev/null || last=0
+  [ $(( now - last )) -lt "$COMPACT_COOLDOWN" ] && return 0   # cooldown active
+  say "compact_requested set — injecting /compact"
+  if [ -x "$INJECT" ] && "$INJECT" --timeout 120 "$sess" "$COMPACT_MSG" >>"$log" 2>&1; then
+    date +%s > "$COMPACT_LAST"
+    rm -f "$COMPACT_FLAG"
+    say "/compact injected"
+  else
+    say "/compact injection deferred (session busy or inject failed) — will retry"
+  fi
+}
+
+# Block until the session ends. This keeps the systemd unit's main process alive
+# for the worker's lifetime; when claude exits/crashes the loop returns, the unit
+# exits, and Restart=always brings it back (resuming the pinned session).
+while tmux has-session -t "$sess" 2>/dev/null; do
+  flip_seeded_if_ready
+  maybe_compact
+  sleep 5
+done
+say "tmux session $sess ended — exiting (systemd will restart unless stopped)"
+exit 0

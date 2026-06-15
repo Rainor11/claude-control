@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Code autonomous worker "%i"
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN_DIR__/claude-auto-run %i
+Restart=always
+# Minimum delay between relaunches so a worker that dies on startup (auth
+# refresh, bad config) doesn't tight-loop.
+RestartSec=30
+# claude (auth, --resume) and bun (event-bridge channel) must be on PATH.
+Environment=PATH=__BIN_DIR__:%h/.local/bin:%h/.bun/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+# Optional overrides (CLAUDE_BIN, proxy vars, …). Missing file is fine.
+EnvironmentFile=-%h/.config/claude-control/env
+# Per-worker unit log (the worker's own tmux/claude output is in workers/%i/logs/worker.log).
+StandardOutput=append:__CONTROL_DIR__/workers/%i/logs/unit.log
+StandardError=append:__CONTROL_DIR__/workers/%i/logs/unit.err
+
+[Install]
+WantedBy=default.target

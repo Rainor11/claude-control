@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Code autonomous workers reconciler (oneshot)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-auto-reconciler
+Environment=PATH=__BIN_DIR__:%h/.local/bin:%h/.bun/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/workers/reconciler.log
+StandardError=append:__CONTROL_DIR__/workers/reconciler.log

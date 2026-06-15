@@ -1,0 +1,9 @@
+#!/bin/bash
+# timer-tick — trivial heartbeat probe for event-bridge.
+# Prints exactly one unique line per run (timestamped), so the bridge pushes a
+# "tick" every interval. Useful as a demo adapter and to prove "add a new
+# adapter = config only, no core change". Costs 0 AI tokens between ticks only
+# if interval is long; a heartbeat by nature wakes the session each interval.
+set -u
+label="${1:-tick}"
+printf 'heartbeat [%s] @ %s\n' "$label" "$(date -u +%FT%TZ)"

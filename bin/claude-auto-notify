@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# claude-auto-notify <name> — Notification hook for an autonomous worker.
+#
+# Fires when the worker needs operator attention — most importantly when an
+# action outside its allowed set hits a permission prompt and the session is
+# BLOCKED waiting for a yes/no. Sends a one-way Telegram ping so the operator
+# knows to attach and decide. This is the "queue for review" half of bounded
+# autonomy that scales to many workers (a per-worker inline yes/no relay would
+# need a separate bot token per worker — Telegram allows one getUpdates consumer
+# per token, so co-loading the shared telegram channel in every worker conflicts).
+#
+# Throttled (default 60s) so a chatty notification stream doesn't spam. Fail-safe.
+set -u
+
+name="${1:-unknown}"
+[[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || name="unknown"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+THROTTLE="${CLAUDE_AUTO_NOTIFY_THROTTLE:-60}"
+statedir="$CONTROL_DIR/workers/$name/state"
+stamp="$statedir/.last_notify"
+
+{
+  command -v jq >/dev/null 2>&1 || exit 0
+  payload="$(cat 2>/dev/null)"
+  msg="$(printf '%s' "$payload" | jq -r '.message // "needs attention" ' 2>/dev/null \
+        | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
+
+  mkdir -p "$statedir" 2>/dev/null
+  now="$(date +%s)"
+  if [ -f "$stamp" ]; then
+    last="$(cat "$stamp" 2>/dev/null || echo 0)"
+    [ "$last" -eq "$last" ] 2>/dev/null || last=0
+    [ $(( now - last )) -lt "$THROTTLE" ] && exit 0   # throttled
+  fi
+  echo "$now" > "$stamp" 2>/dev/null || true
+
+  [ -x "$TG" ] || exit 0
+  "$TG" "🤖 autoworker \`$name\` needs you: ${msg}
+Attach: tmux attach -t claude-$name" >/dev/null 2>&1 || true
+} 2>/dev/null
+exit 0

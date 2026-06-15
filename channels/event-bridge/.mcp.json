@@ -1,0 +1,13 @@
+{
+  "_comment": "Canonical MCP registration for the event-bridge channel. The carrier (claude-adopt) writes a per-worker copy into the worker's project with EVENT_BRIDGE_CONFIG / EVENT_BRIDGE_STATE_DIR pointing at that worker's files. Launch the session with: claude --dangerously-load-development-channels server:event-bridge (custom channels are not on the official allowlist). Combine with --channels plugin:telegram@claude-plugins-official for chat + permission relay.",
+  "mcpServers": {
+    "event-bridge": {
+      "command": "bun",
+      "args": ["run", "--cwd", "/opt/projects/active/claude-control/channels/event-bridge", "--silent", "start"],
+      "env": {
+        "EVENT_BRIDGE_CONFIG": "/opt/projects/active/claude-control/channels/event-bridge/config.json",
+        "EVENT_BRIDGE_STATE_DIR": "/opt/projects/active/claude-control/channels/event-bridge/state"
+      }
+    }
+  }
+}

@@ -1,0 +1,88 @@
+#!/bin/bash
+# asana-comments — event-bridge probe: print NEW Asana comments (one per line).
+#
+# Single-shot (the bridge loops it on its interval). Mirrors the polling/dedup
+# of server_monitor/asana_reply_watch.sh (the donor) but is source-only: no
+# Telegram, no loop — it just prints new comments for the bridge to push as data.
+#
+# Baseline/dedup: a per-(task,author) baseline file holds the latest seen
+# comment timestamp. First run establishes baseline=now and prints nothing
+# (so a fresh worker is not flooded with history). Later runs print author
+# comments created strictly after baseline, then advance baseline. The bridge
+# also dedups by line hash, so restarts never double-push.
+#
+# Token: ASANA_ACCESS_TOKEN from /home/rainor/server/.env (Bearer via curl
+# --config so it never appears in argv).
+#
+# Usage:
+#   asana-comments --task <gid> [--author <gid>] [--state-dir <dir>] [--project <gid>]
+set -u
+
+ENV_FILE=/home/rainor/server/.env
+STATE_DIR_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)/state"
+
+TASK_GID=""
+AUTHOR_GID=""           # empty = any author
+STATE_DIR="$STATE_DIR_DEFAULT"
+PROJECT_GID=""
+
+die() { echo "asana-comments: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --task) TASK_GID="${2:-}"; shift 2 ;;
+    --author) AUTHOR_GID="${2:-}"; shift 2 ;;
+    --state-dir) STATE_DIR="${2:-}"; shift 2 ;;
+    --project) PROJECT_GID="${2:-}"; shift 2 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) [ -z "$TASK_GID" ] && { TASK_GID="$1"; shift; } || die "unexpected arg: $1" ;;
+  esac
+done
+[ -n "$TASK_GID" ] || die "--task <gid> required"
+command -v jq >/dev/null 2>&1 || die "jq not found"
+
+ASANA_TOKEN=$(grep -E '^ASANA_ACCESS_TOKEN=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+ASANA_TOKEN=${ASANA_TOKEN%\"}; ASANA_TOKEN=${ASANA_TOKEN#\"}
+ASANA_TOKEN=${ASANA_TOKEN%\'}; ASANA_TOKEN=${ASANA_TOKEN#\'}
+ASANA_TOKEN=$(printf '%s' "$ASANA_TOKEN" | tr -d '[:space:]')
+[ -n "$ASANA_TOKEN" ] || die "ASANA_ACCESS_TOKEN empty/missing in $ENV_FILE"
+
+mkdir -p "$STATE_DIR" 2>/dev/null || die "cannot create state dir $STATE_DIR"
+BASE_KEY="$TASK_GID"; [ -n "$AUTHOR_GID" ] && BASE_KEY="${TASK_GID}-${AUTHOR_GID}"
+BASELINE_FILE="${STATE_DIR}/.asana-comments-${BASE_KEY}.baseline"
+
+CURL_CFG=$(mktemp /tmp/.asana-comments-curl.XXXXXX) || die "mktemp curl cfg"
+trap 'rm -f "$CURL_CFG"' EXIT
+chmod 600 "$CURL_CFG"
+printf 'header = "Authorization: Bearer %s"\n' "$ASANA_TOKEN" > "$CURL_CFG"
+
+now_ts() { date -u '+%Y-%m-%dT%H:%M:%S.000Z'; }
+
+# First run: set baseline=now, print nothing.
+if [ ! -f "$BASELINE_FILE" ]; then
+  now_ts > "$BASELINE_FILE"
+  exit 0
+fi
+BASELINE_TS=$(cat "$BASELINE_FILE" 2>/dev/null)
+[ -n "$BASELINE_TS" ] || { BASELINE_TS=$(now_ts); echo "$BASELINE_TS" > "$BASELINE_FILE"; }
+
+resp=$(curl -fsS --max-time 30 --config "$CURL_CFG" \
+  "https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=created_at,created_by.gid,created_by.name,text,type" \
+  2>/dev/null) || exit 0
+printf '%s' "$resp" | jq -e 'has("data")' >/dev/null 2>&1 || exit 0
+
+# Print author comments newer than the WRITE-ONCE baseline. We deliberately do
+# NOT advance the baseline here: dedup-after-delivery is the bridge's job (its
+# per-probe .seen is updated only after a successful inject). If we advanced the
+# baseline on print, an event whose injection later failed (worker busy/blocked)
+# would never be re-printed and would be lost. So we re-print the (small) window
+# of post-baseline author comments each poll; the bridge dedups what it already
+# delivered. The baseline only caps how far back we ever look (set on first run).
+printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" '
+  .data[]
+  | select(.type=="comment")
+  | select(.created_at > $ts)
+  | select($author=="" or (.created_by.gid==$author))
+  | "[asana \(.created_at)] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
+'
+exit 0

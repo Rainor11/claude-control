@@ -1,0 +1,18 @@
+{
+  "_comment": "event-bridge probe config. Copy to config.json (per worker) or point EVENT_BRIDGE_CONFIG at a per-worker file. Each probe: name (unique), cmd (argv array preferred; string runs via sh -c), interval_sec (>=5), source (event_source attr), timeout_sec (kill runaway probe). A probe prints NEW events one per line, nothing when idle. Adding a trigger = a new entry here + a probe script in adapters/. No core change.",
+  "probes": [
+    {
+      "name": "demo-heartbeat",
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/timer-tick", "demo"],
+      "interval_sec": 30,
+      "source": "timer"
+    },
+    {
+      "name": "asana-task-EXAMPLE",
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/asana-comments", "--task", "1215419932736878", "--author", "794146060752"],
+      "interval_sec": 120,
+      "timeout_sec": 40,
+      "source": "asana"
+    }
+  ]
+}

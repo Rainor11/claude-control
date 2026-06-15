@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic reconcile of Claude Code autonomous workers
+
+[Timer]
+# Reconcile a bit after boot (covers the case where an enabled unit failed to
+# come up cleanly after reboot — network/proxy/auth not ready yet) and then
+# every 5 minutes to heal drift between the registry and running units.
+OnActiveSec=90s
+OnUnitActiveSec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

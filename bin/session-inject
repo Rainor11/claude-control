@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# session-inject <tmux-target> <message|-> — type a message into a live Claude
+# Code tmux session as if the operator typed it (a user turn).
+#
+# This is the FALLBACK transport (the primary path for autonomous workers is the
+# event-bridge *channel*, which delivers events without TUI races). send-keys is
+# still needed for two things channels can't do:
+#   1) waking a session that was NOT launched with a channel, and
+#   2) delivering slash commands like `/compact` — a channel body is DATA and is
+#      never parsed as a slash command, but typed input is (Codex).
+#
+# Hardening (Codex review):
+#   - targets a specific pane id (not just a session name);
+#   - refuses to inject while the session is BUSY (working) or showing an
+#     APPROVAL/选 prompt — never type over a permission dialog;
+#   - "settle" check: the pane must be unchanged across two samples;
+#   - per-target flock so concurrent injectors serialize;
+#   - queue-on-busy: retries until --timeout, then fails (does not silently skip);
+#   - multiline/special-char safe via tmux load-buffer + bracketed paste-buffer;
+#   - sanitizes control bytes from the payload;
+#   - verifies the input line cleared after submit (best-effort acceptance check).
+#
+# Usage: session-inject <target> <message>     # message as arg
+#        echo "multi\nline" | session-inject <target> -   # message from stdin
+#        session-inject --timeout 120 <target> -
+#
+# Tunable detection patterns (env, override without code change):
+#   INJECT_BUSY_RE, INJECT_APPROVAL_RE  (extended regex, case-insensitive)
+set -u
+
+TIMEOUT=90
+SETTLE_MS=600
+POLL_MS=1500
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --timeout) TIMEOUT="${2:?}"; shift 2 ;;
+    --settle-ms) SETTLE_MS="${2:?}"; shift 2 ;;
+    --poll-ms) POLL_MS="${2:?}"; shift 2 ;;
+    *) echo "session-inject: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+target="${1:?usage: session-inject [--timeout N] <tmux-target> <message|->}"
+shift
+msg="${1:?usage: session-inject <target> <message|->}"
+[ "$msg" = "-" ] && msg="$(cat)"
+
+command -v tmux >/dev/null 2>&1 || { echo "session-inject: tmux required" >&2; exit 2; }
+tmux has-session -t "$target" 2>/dev/null || { echo "session-inject: no tmux target '$target'" >&2; exit 2; }
+
+# Resolve to a concrete pane id (the active pane of the target's active window).
+pane="$(tmux list-panes -t "$target" -F '#{pane_active} #{pane_id}' 2>/dev/null | awk '$1==1{print $2; exit}')"
+[ -n "$pane" ] || pane="$(tmux list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | head -1)"
+[ -n "$pane" ] || { echo "session-inject: no pane for '$target'" >&2; exit 2; }
+
+BUSY_RE="${INJECT_BUSY_RE:-esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc}"
+APPROVAL_RE="${INJECT_APPROVAL_RE:-Do you want|Would you like|❯ *[0-9]+\.|[0-9]+\. (Yes|No|Allow|Deny)|permission to use|Allow this}"
+
+# sanitize: strip control bytes except \n and \t
+msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037')"
+[ -n "$msg" ] || { echo "session-inject: empty message" >&2; exit 2; }
+
+snapshot() { tmux capture-pane -p -t "$pane" 2>/dev/null; }
+ms_sleep() { local ms="$1"; sleep "$(awk "BEGIN{print $ms/1000}")"; }
+
+# per-target lock so two injectors don't interleave.
+# NOTE: do NOT append `2>/dev/null` to an `exec` redirection — on `exec` with no
+# command the redirection applies to the WHOLE shell permanently, silently
+# swallowing all later stderr (cost us a long debug). Open the fd plainly.
+lockdir="${XDG_RUNTIME_DIR:-/tmp}"
+lockfile="$lockdir/.session-inject.$(printf '%s' "$target" | tr -c 'A-Za-z0-9_-' '_').lock"
+exec 9>"$lockfile" || { echo "session-inject: cannot open lock $lockfile" >&2; exit 1; }
+flock -w "$TIMEOUT" 9 || { echo "session-inject: could not acquire lock for $target within ${TIMEOUT}s" >&2; exit 1; }
+
+deadline=$(( $(date +%s) + TIMEOUT ))
+while :; do
+  now=$(date +%s); [ "$now" -ge "$deadline" ] && { echo "session-inject: $target stayed busy/blocked until timeout (${TIMEOUT}s) — not injected" >&2; exit 1; }
+  pane_txt="$(snapshot)"
+  # tail of the pane is where the state lives. (Both the snapshot here and the
+  # settle re-snapshot below go through command substitution, which strips
+  # trailing blank lines IDENTICALLY — comparing a piped `capture|tail` against a
+  # command-substituted one does NOT, and silently never settles.)
+  tail_txt="$(printf '%s\n' "$pane_txt" | tail -n 12)"
+  if printf '%s\n' "$tail_txt" | grep -qiE "$APPROVAL_RE"; then
+    # An approval/selection prompt is up — NEVER type over it.
+    ms_sleep "$POLL_MS"; continue
+  fi
+  if printf '%s\n' "$tail_txt" | grep -qiE "$BUSY_RE"; then
+    ms_sleep "$POLL_MS"; continue
+  fi
+  # settle: full pane unchanged across the settle window (consistent capture).
+  ms_sleep "$SETTLE_MS"
+  if [ "$pane_txt" != "$(snapshot)" ]; then
+    continue  # changed → not idle yet
+  fi
+  break  # idle + stable
+done
+
+# Deliver: bracketed paste keeps multiline as a single input block, then Enter.
+buf="session-inject-$$"
+printf '%s' "$msg" | tmux load-buffer -b "$buf" - 2>/dev/null || { echo "session-inject: load-buffer failed" >&2; exit 1; }
+tmux paste-buffer -p -d -b "$buf" -t "$pane" 2>/dev/null || { echo "session-inject: paste-buffer failed" >&2; exit 1; }
+# small beat so the TUI registers the paste before Enter
+ms_sleep 250
+tmux send-keys -t "$pane" Enter 2>/dev/null
+
+# best-effort acceptance: the input area should no longer hold our last line
+ms_sleep 400
+after="$(snapshot | tail -n 6)"
+last_line="$(printf '%s' "$msg" | tail -n1)"
+if [ -n "$last_line" ] && printf '%s' "$after" | grep -qF "$last_line"; then
+  echo "session-inject: warning — payload may still be in the input box (not confirmed submitted)" >&2
+fi
+echo "session-inject: delivered to $target ($pane)"
+exit 0

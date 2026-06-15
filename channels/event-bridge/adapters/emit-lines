@@ -1,0 +1,12 @@
+#!/bin/bash
+# emit-lines — emits each non-empty line of <file> as one event.
+# Deterministic: the bridge dedups by exact line hash, so re-runs emit nothing
+# new unless the file gains new lines. Handy as (a) a test adapter for the
+# dedup/restart guarantees and (b) a simple "watch this append-only file" probe.
+#
+# Each line should be unique (include a timestamp/id) if it represents a
+# distinct event — identical lines collapse to one by design.
+set -u
+f="${1:?usage: emit-lines <file>}"
+[ -f "$f" ] || exit 0
+grep -vE '^[[:space:]]*$' -- "$f" || true

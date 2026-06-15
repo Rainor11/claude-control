@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# claude-auto-reconciler — bring running units in line with the registry.
+#
+# The registry (~/.claude-control/autonomous.json) is the source of truth for
+# which workers should be up. Enabled units already auto-start at boot (linger),
+# so this is belt-and-suspenders: it (re)starts any "active" worker that isn't
+# running — covering a post-reboot unit that failed because the network/proxy/
+# auth wasn't ready yet, and any drift. It never force-stops; stopping is
+# explicit via `claude-auto stop`.
+set -u
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+REGISTRY="$CONTROL_DIR/autonomous.json"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+say() { echo "$(ts) reconciler: $*"; }
+
+[ -f "$REGISTRY" ] || { say "no registry at $REGISTRY — nothing to do"; exit 0; }
+command -v jq >/dev/null 2>&1 || { say "jq required"; exit 1; }
+
+mapfile -t actives < <(jq -r '.workers // {} | to_entries[] | select(.value.state=="active") | .key' "$REGISTRY" 2>/dev/null)
+
+[ "${#actives[@]}" -eq 0 ] && { say "no active workers"; exit 0; }
+
+for name in "${actives[@]}"; do
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { say "skip bad name '$name'"; continue; }
+  unit="claude-auto@$name.service"
+  if systemctl --user is-active --quiet "$unit"; then
+    continue
+  fi
+  say "worker '$name' active in registry but unit not running — enable --now"
+  systemctl --user enable --now "$unit" 2>&1 | sed "s/^/$(ts) reconciler[$name]: /" || \
+    say "failed to start $unit"
+done
+
+# Cap worker logs so a noisy/failing probe can't fill the disk over long
+# unattended runs (the control-session logrotate doesn't cover workers/). Use
+# copytruncate (cat > file rewrites the SAME inode) because unit.{log,err} are
+# held open by systemd's append fd — a rename would orphan the inode.
+LOG_MAX_BYTES="${CLAUDE_AUTO_LOG_MAX_BYTES:-2000000}"
+LOG_KEEP_LINES="${CLAUDE_AUTO_LOG_KEEP_LINES:-2000}"
+shopt -s nullglob
+for lf in "$CONTROL_DIR"/workers/*/logs/*.log "$CONTROL_DIR"/workers/*/logs/*.err; do
+  [ -f "$lf" ] || continue
+  sz=$(stat -c %s "$lf" 2>/dev/null || echo 0)
+  [ "$sz" -gt "$LOG_MAX_BYTES" ] || continue
+  t="$(mktemp "$lf.trim.XXXXXX" 2>/dev/null)" || continue
+  if tail -n "$LOG_KEEP_LINES" "$lf" > "$t" 2>/dev/null; then
+    cat "$t" > "$lf" 2>/dev/null && say "trimmed $lf ($sz B → last $LOG_KEEP_LINES lines)"
+  fi
+  rm -f "$t"
+done
+shopt -u nullglob
+exit 0
