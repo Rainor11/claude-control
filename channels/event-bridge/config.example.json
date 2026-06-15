@@ -13,6 +13,20 @@
       "interval_sec": 120,
       "timeout_sec": 40,
       "source": "asana"
+    },
+    {
+      "name": "tg-contact-EXAMPLE",
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/tg-messages", "--contact", "Вова Груздев", "--state-dir", "STATE_DIR_OF_THIS_WORKER", "--lookback-hours", "24"],
+      "interval_sec": 60,
+      "timeout_sec": 30,
+      "source": "telegram"
+    },
+    {
+      "name": "gmail-query-EXAMPLE",
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/gmail-messages", "--query", "from:client@example.com is:unread", "--account", "alp", "--state-dir", "STATE_DIR_OF_THIS_WORKER", "--lookback-hours", "24"],
+      "interval_sec": 120,
+      "timeout_sec": 40,
+      "source": "gmail"
     }
   ]
 }

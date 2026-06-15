@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tg-messages — event-bridge probe: print NEW incoming Telegram messages.
+
+Single-shot (the bridge loops it on its interval). Mirrors the read-only logic of
+server_monitor/tg_wait_message.py (the donor) but is source-only: no loop, no
+Telegram API — it reads the local SQLite the rainor-ai-business listener fills and
+prints new INCOMING messages from one contact/chat, ONE per line, nothing when idle
+(so the worker spends 0 AI tokens until a message actually arrives).
+
+Why local SQLite, not getUpdates: the listener service holds the bot token's
+long-poll monopoly; a second consumer would 409-conflict. Source of truth = the DB.
+
+Baseline / dedup (matches the event-bridge contract, see bin/event-bridge-watch):
+  - The bridge dedups by sha256 of EACH printed line and advances its .seen only
+    AFTER a successful inject. So this probe keeps a WRITE-ONCE baseline and does
+    NOT advance it on print: a message whose injection later fails (worker busy)
+    must be re-printed next poll, or it's lost. The bridge dedups what it delivered.
+  - To keep the reprint window bounded WITHOUT a row LIMIT (a fixed LIMIT + an
+    unmoving baseline would permanently hide events beyond the limit), we bound by
+    TIME: only messages newer than --lookback-hours. The window is bounded by
+    volume-per-lookback, never stalls.
+  - Each line carries the stable row id (`id=<n>`) so two messages with identical
+    text/sender/date don't collapse under the bridge's line-hash dedup.
+  - DB recreation is detected by (st_dev, st_ino): on change we re-baseline (ids may
+    restart below the old baseline, which would otherwise hide everything).
+
+Exit codes: usage/config errors (bad args, missing contacts, bad regex) -> nonzero
+(operator-visible). Transient source errors (DB missing/locked) -> 0 + stderr
+(stderr lands in the worker's event-bridge.log; never wedge the watcher).
+
+Usage:
+  tg-messages --chat-id <int> [--match RE] [--lookback-hours N] [--state-dir DIR]
+  tg-messages --contact "<name|@user>" [--db ...] [--contacts ...]
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import unicodedata
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+# Lone surrogates / odd bytes from message text must not crash stdout.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
+DEFAULT_DB = "/home/rainor/server/services/rainor_ai_business/messages.db"
+DEFAULT_CONTACTS = "/home/rainor/server/services/rainor_ai_business/contacts.json"
+STATE_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
+
+SELECT_COLS = ("id, chat_id, message_id, date, sender_name, sender_username, "
+               "text, media_type, file_name")
+TEXT_LIMIT = 500
+SENDER_LIMIT = 80
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def die_usage(msg):
+    sys.stderr.write("tg-messages: %s\n" % msg)
+    sys.exit(2)
+
+
+def warn_idle(msg):
+    sys.stderr.write("tg-messages: %s\n" % msg)
+    sys.exit(0)
+
+
+def _keep(ch):
+    if ch == " ":
+        return True
+    if ch <= "\x1f":          # C0 controls (incl. \n \r \t)
+        return False
+    if ch == "\x7f":          # DEL
+        return False
+    if "\x80" <= ch <= "\x9f":  # C1 controls (e.g. U+009B CSI)
+        return False
+    return True
+
+
+def sanitize(s, limit):
+    """Collapse all whitespace (incl. newlines), strip control/ANSI/C1 bytes, truncate.
+    Critical: the bridge splits adapter stdout on '\\n', so any newline in an
+    attacker-controlled field would become a SEPARATE injected event."""
+    if not s:
+        return ""
+    s = _ANSI.sub("", s)
+    s = "".join(ch if _keep(ch) else " " for ch in s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:limit]
+
+
+@contextlib.contextmanager
+def state_lock(state_dir, key):
+    """Serialize the cold-start read-decide-write so two concurrent invocations
+    sharing a state dir can't both baseline and suppress an event."""
+    lp = os.path.join(state_dir, ".%s.lock" % key)
+    f = open(lp, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
+
+
+def norm(s):
+    if not s:
+        return ""
+    return unicodedata.normalize("NFKC", s).casefold().strip()
+
+
+def _s(x):
+    return x if isinstance(x, str) else ""
+
+
+def connect_ro(db_path):
+    uri = "file:" + urllib.parse.quote(db_path) + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=3000")
+        conn.execute("PRAGMA query_only=ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
+
+
+def resolve_contact(contacts, query):
+    """name/@user -> chat_id via contacts.json (NFKC casefold). Mirror of donor.
+    Returns int chat_id. Raises ValueError on ambiguous/none."""
+    raw = query.strip()
+    q = norm(raw.lstrip("@"))
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    if not isinstance(contacts, dict):
+        raise ValueError("contacts.json has unexpected shape")
+    exact_user, exact_full, substr = [], [], []
+    for cid, rec in contacts.items():
+        if not isinstance(rec, dict):
+            continue
+        uname = rec.get("username")
+        uname = uname if isinstance(uname, str) else None
+        fn, ln = _s(rec.get("first_name")), _s(rec.get("last_name"))
+        nu = norm((uname or "").lstrip("@"))
+        nfull = norm((fn + " " + ln).strip())
+        if q and nu and nu == q:
+            exact_user.append(cid)
+        if q and nfull and nfull == q:
+            exact_full.append(cid)
+        hay = " ".join(x for x in (norm(fn), norm(ln), nu) if x)
+        if q and q in hay:
+            substr.append(cid)
+    for bucket in (exact_user, exact_full, substr):
+        if len(bucket) == 1:
+            return int(bucket[0])
+        if len(bucket) > 1:
+            raise ValueError("ambiguous contact '%s' (%d matches)" % (query, len(bucket)))
+    raise ValueError("contact '%s' not found" % query)
+
+
+def write_state_atomic(path, obj):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".tgstate.", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    p = argparse.ArgumentParser(description="event-bridge probe: new incoming TG messages")
+    who = p.add_mutually_exclusive_group(required=True)
+    who.add_argument("--chat-id", type=int)
+    who.add_argument("--contact")
+    p.add_argument("--db", default=DEFAULT_DB)
+    p.add_argument("--contacts", default=DEFAULT_CONTACTS)
+    p.add_argument("--state-dir", default=STATE_DIR_DEFAULT)
+    p.add_argument("--match")
+    p.add_argument("--lookback-hours", type=float, default=24.0)
+    args = p.parse_args()
+
+    matcher = None
+    if args.match:
+        try:
+            matcher = re.compile(args.match, re.IGNORECASE)
+        except re.error as e:
+            die_usage("bad --match regex: %s" % e)
+
+    # --- resolve chat_id ---
+    if args.chat_id is not None:
+        chat_id = args.chat_id
+    elif args.contact.strip().lstrip("-").isdigit():
+        chat_id = int(args.contact.strip())  # numeric --contact: no contacts.json needed
+    else:
+        try:
+            with open(args.contacts, "r", encoding="utf-8") as f:
+                contacts = json.load(f)
+        except Exception as e:
+            die_usage("contacts.json unreadable: %s" % e)
+        try:
+            chat_id = resolve_contact(contacts, args.contact)
+        except ValueError as e:
+            die_usage(str(e))
+
+    # --- db fingerprint (transient if missing) ---
+    try:
+        st = os.stat(args.db)
+        fp = [st.st_dev, st.st_ino]
+    except OSError as e:
+        warn_idle("db not available: %s" % e)
+
+    try:
+        os.makedirs(args.state_dir, exist_ok=True)
+    except OSError as e:
+        warn_idle("cannot create state dir: %s" % e)
+    state_path = os.path.join(args.state_dir, ".tg-messages-%d.json" % chat_id)
+
+    try:
+        conn = connect_ro(args.db)
+    except sqlite3.Error as e:
+        warn_idle("db open failed: %s" % e)
+
+    try:
+        # Cold-start decision under a per-chat lock (atomic read-decide-write).
+        with state_lock(args.state_dir, "tg-messages-%d" % chat_id):
+            state = None
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                except Exception:
+                    state = None
+
+            # Current high-water of incoming ids for this chat. Also the reset signal:
+            # if it dropped below the stored baseline, the DB was recreated/rotated even
+            # if the inode was REUSED (fingerprint alone misses inode reuse) — ids only
+            # go backwards on recreation. Mirrors the donor's gmax<start_global_max guard.
+            try:
+                row = conn.execute(
+                    "SELECT MAX(id) AS m FROM messages WHERE chat_id=? AND direction='incoming'",
+                    (chat_id,)).fetchone()
+            except sqlite3.Error as e:
+                warn_idle("db read failed (max id): %s" % e)
+            cur_max = row["m"] or 0
+
+            prior_baseline = state.get("baseline_id") if isinstance(state, dict) else None
+            cold = (not isinstance(state, dict)
+                    or not isinstance(prior_baseline, int)
+                    or state.get("db_fp") != fp                 # explicit recreate (dev/ino changed)
+                    or cur_max < prior_baseline)                # ids went backwards = reset
+
+            if cold:
+                write_state_atomic(state_path, {"baseline_id": cur_max, "db_fp": fp})
+                return  # first run / reset: print nothing
+            baseline = int(prior_baseline)
+
+        # Read-only window query (outside the lock). NULL date is included (not
+        # hidden by 3-valued logic); rows are otherwise bounded by --lookback.
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.lookback_hours)).isoformat()
+        try:
+            rows = conn.execute(
+                "SELECT " + SELECT_COLS + " FROM messages "
+                "WHERE chat_id=? AND direction='incoming' AND id>? "
+                "AND (date IS NULL OR date>=?) "
+                "ORDER BY id ASC",
+                (chat_id, baseline, cutoff)).fetchall()
+        except sqlite3.Error as e:
+            warn_idle("db read failed: %s" % e)
+    finally:
+        conn.close()
+
+    # print new messages (baseline deliberately NOT advanced — bridge dedups)
+    out = []
+    for r in rows:
+        raw_text = r["text"] or ""
+        if matcher is not None and not matcher.search(raw_text):
+            continue
+        sender = r["sender_name"] or (("@" + r["sender_username"]) if r["sender_username"] else str(chat_id))
+        sender = sanitize(sender, SENDER_LIMIT)
+        text = sanitize(raw_text, TEXT_LIMIT)
+        if text:
+            body = text
+        elif r["media_type"]:
+            body = sanitize("[%s %s]" % (r["media_type"], r["file_name"] or ""), TEXT_LIMIT)
+        else:
+            body = "[no text]"
+        out.append("[tg id=%d %s] %s: %s" % (r["id"], sanitize(r["date"], 40), sender, body))
+    if out:
+        sys.stdout.write("\n".join(out) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

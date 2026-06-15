@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""gmail-messages — event-bridge probe: print NEW Gmail messages matching a query.
+
+Single-shot (the bridge loops it on its interval). Source-only, no LLM/MCP: it
+reuses the google-workspace-mcp OAuth credentials (read-only) to call the Gmail
+REST API directly and prints new messages matching a Gmail search query, ONE per
+line, nothing when idle (0 AI tokens until mail actually arrives).
+
+Auth: reads the shared MCP token file (refresh_token) and credentials READ-ONLY —
+it never writes back to the shared tokens.json (that would race the MCP). The
+short-lived access token is cached under the adapter's OWN --state-dir (0600).
+
+Baseline / dedup (event-bridge contract, see bin/event-bridge-watch):
+  - The bridge dedups by sha256 of EACH line, advancing .seen only after a
+    successful inject. So baseline is WRITE-ONCE and NOT advanced on print (a
+    message whose injection fails must be re-printed next poll). The window is
+    bounded by TIME (--lookback-hours), never by a row limit (a fixed limit + an
+    unmoving baseline would permanently hide events beyond it).
+  - Each line carries the stable Gmail message id (`id=<...>`) so identical
+    subjects/snippets don't collapse under line-hash dedup, and the coarse
+    `after:<sec>` query boundary is made exact by id-dedup.
+  - messages.list is paginated; we follow nextPageToken (capped by --max-pages).
+
+Egress: forced DIRECT (no proxy) — Google is reachable directly; the box's proxy
+is for Anthropic egress only. Read-only (messages.list/get): no mailbox changes.
+
+Exit codes: usage/config errors (bad args, missing/!readable creds, revoked token)
+-> nonzero. Transient (network/5xx) -> 0 + stderr (lands in event-bridge.log).
+
+Usage:
+  gmail-messages --query "from:client@x.com" [--account alp|rainor]
+  gmail-messages --query "is:unread label:inbox" --token-file ... --creds-file ...
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import contextlib
+import fcntl
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+# Lone surrogates / odd bytes from message text must not crash stdout.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
+CFG = os.path.expanduser("~/.config/google-workspace-mcp")
+ACCOUNTS = {
+    "alp":    (os.path.join(CFG, "tokens.json"),                 os.path.join(CFG, "credentials.json")),
+    "rainor": (os.path.join(CFG, "profiles/rainor/tokens.json"), os.path.join(CFG, "profiles/rainor/credentials.json")),
+}
+STATE_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
+GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+HTTP_TIMEOUT = 25
+SNIPPET_LIMIT = 400
+HDR_LIMIT = 200
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# Force-direct opener: never route Gmail through the box's Anthropic-egress proxy.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def die_usage(msg):
+    sys.stderr.write("gmail-messages: %s\n" % msg)
+    sys.exit(2)
+
+
+def warn_idle(msg):
+    sys.stderr.write("gmail-messages: %s\n" % msg)
+    sys.exit(0)
+
+
+def _keep(ch):
+    if ch == " ":
+        return True
+    if ch <= "\x1f" or ch == "\x7f" or ("\x80" <= ch <= "\x9f"):
+        return False  # C0 controls, DEL, C1 controls
+    return True
+
+
+def sanitize(s, limit):
+    if not s:
+        return ""
+    s = _ANSI.sub("", s)
+    s = "".join(ch if _keep(ch) else " " for ch in s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:limit]
+
+
+@contextlib.contextmanager
+def state_lock(state_dir, key):
+    """Serialize baseline write-once so two concurrent runs sharing a state dir
+    can't both cold-start and suppress an event."""
+    lp = os.path.join(state_dir, ".%s.lock" % key)
+    f = open(lp, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
+
+
+def http(url, headers=None, data=None, method="GET"):
+    """Return (status, parsed_json|None). Raises urllib.error.URLError on network
+    failure (caller treats as transient). HTTPError is captured -> (code, body)."""
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
+            body = r.read().decode("utf-8", "replace")
+            try:
+                return r.status, (json.loads(body) if body else None)
+            except ValueError:
+                return r.status, None  # malformed body must not crash the probe
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+            parsed = json.loads(body) if body else None
+        except Exception:
+            parsed = None
+        return e.code, parsed
+
+
+def load_creds(token_file, creds_file):
+    try:
+        with open(token_file, "r", encoding="utf-8") as f:
+            tok = json.load(f)
+        refresh_token = tok.get("refresh_token")
+        if not refresh_token:
+            die_usage("no refresh_token in %s" % token_file)
+    except Exception as e:
+        die_usage("token file unreadable (%s): %s" % (token_file, e))
+    try:
+        with open(creds_file, "r", encoding="utf-8") as f:
+            c = json.load(f)
+        c = c.get("installed") or c.get("web") or c  # creds may be wrapped
+        cid, csec = c["client_id"], c["client_secret"]
+        token_uri = c.get("token_uri", "https://oauth2.googleapis.com/token")
+    except Exception as e:
+        die_usage("credentials file unreadable (%s): %s" % (creds_file, e))
+    return refresh_token, cid, csec, token_uri
+
+
+def refresh_access_token(token_uri, cid, csec, refresh_token):
+    """Returns (access_token, expiry_epoch, status). Network error -> URLError
+    (transient, raised). status lets the caller tell revoked (400/401) from a
+    transient token-server failure (429/5xx)."""
+    data = urllib.parse.urlencode({
+        "client_id": cid, "client_secret": csec,
+        "refresh_token": refresh_token, "grant_type": "refresh_token",
+    }).encode("ascii")
+    status, body = http(token_uri, headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        data=data, method="POST")
+    if status == 200 and body and body.get("access_token"):
+        return body["access_token"], time.time() + int(body.get("expires_in", 3600)), 200
+    return None, None, status
+
+
+def get_access_token(cache_path, token_uri, cid, csec, refresh_token, force=False):
+    """Returns (access_token|None, status). status is 200 on cache hit / success,
+    else the token-endpoint HTTP status (for revoked-vs-transient classification)."""
+    if not force and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                c = json.load(f)
+            if c.get("access_token") and c.get("expiry", 0) > time.time() + 60:
+                return c["access_token"], 200
+        except Exception:
+            pass
+    at, exp, status = refresh_access_token(token_uri, cid, csec, refresh_token)
+    if not at:
+        return None, status
+    try:
+        d = os.path.dirname(cache_path)
+        fd, tmp = tempfile.mkstemp(prefix=".gtok.", dir=d)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"access_token": at, "expiry": exp}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass  # cache best-effort; token still usable this run
+    return at, 200
+
+
+def token_or_exit(cache_path, token_uri, cid, csec, refresh_token, force=False):
+    """Get an access token, applying the exit policy: revoked (400/401) -> nonzero
+    (operator must re-auth the MCP); transient token-server failure -> exit 0."""
+    tok, status = get_access_token(cache_path, token_uri, cid, csec, refresh_token, force=force)
+    if tok:
+        return tok
+    if status in (400, 401):
+        die_usage("token rejected (HTTP %s) — re-auth the google-workspace MCP" % status)
+    warn_idle("token refresh transient failure (HTTP %s)" % status)
+
+
+def list_ids(access_token, q, max_pages):
+    """Paginate messages.list. Returns (ids, status). status=401 signals re-auth."""
+    ids, page, pages = [], None, 0
+    hdr = {"Authorization": "Bearer " + access_token}
+    while pages < max_pages:
+        params = {"q": q, "maxResults": "100"}
+        if page:
+            params["pageToken"] = page
+        status, body = http(GMAIL_BASE + "/messages?" + urllib.parse.urlencode(params), headers=hdr)
+        if status == 401:
+            return ids, 401
+        if status != 200 or not body:
+            return ids, status
+        for m in body.get("messages", []) or []:
+            if m.get("id"):
+                ids.append(m["id"])
+        page = body.get("nextPageToken")
+        pages += 1
+        if not page:
+            break
+    return ids, 200
+
+
+def get_meta(access_token, msg_id):
+    """Returns (meta|None, status). status surfaced so the caller can refresh on 401."""
+    hdr = {"Authorization": "Bearer " + access_token}
+    url = (GMAIL_BASE + "/messages/" + urllib.parse.quote(msg_id)
+           + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date")
+    status, body = http(url, headers=hdr)
+    if status != 200 or not body:
+        return None, status
+    headers = {h.get("name", "").lower(): h.get("value", "")
+               for h in (body.get("payload", {}).get("headers", []) or [])}
+    return {
+        "from": headers.get("from", ""),
+        "subject": headers.get("subject", ""),
+        "date": headers.get("date", ""),
+        "snippet": body.get("snippet", ""),
+    }, status
+
+
+def main():
+    p = argparse.ArgumentParser(description="event-bridge probe: new Gmail messages by query")
+    p.add_argument("--query", required=True)
+    p.add_argument("--account", choices=sorted(ACCOUNTS.keys()), default="alp")
+    p.add_argument("--token-file")
+    p.add_argument("--creds-file")
+    p.add_argument("--state-dir", default=STATE_DIR_DEFAULT)
+    p.add_argument("--lookback-hours", type=float, default=24.0)
+    p.add_argument("--max-pages", type=int, default=10)
+    args = p.parse_args()
+
+    token_file = args.token_file or ACCOUNTS[args.account][0]
+    creds_file = args.creds_file or ACCOUNTS[args.account][1]
+    refresh_token, cid, csec, token_uri = load_creds(token_file, creds_file)
+
+    try:
+        os.makedirs(args.state_dir, exist_ok=True)
+    except OSError as e:
+        warn_idle("cannot create state dir: %s" % e)
+
+    acct = re.sub(r"[^A-Za-z0-9_-]", "_", args.account)
+    cache_path = os.path.join(args.state_dir, ".gmail-%s.token" % acct)
+    qhash = hashlib.sha256(args.query.encode("utf-8")).hexdigest()[:12]
+    state_path = os.path.join(args.state_dir, ".gmail-%s-%s.json" % (acct, qhash))
+
+    # baseline write-once (under a per-(account,query) lock: two concurrent runs
+    # must not both cold-start and suppress an event)
+    with state_lock(args.state_dir, "gmail-%s-%s" % (acct, qhash)):
+        if not os.path.exists(state_path):
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".gstate.", dir=args.state_dir)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({"baseline_epoch": int(time.time())}, f)
+                os.replace(tmp, state_path)
+            except Exception as e:
+                warn_idle("cannot write baseline: %s" % e)
+            return  # first run: print nothing
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                baseline = int(json.load(f)["baseline_epoch"])
+        except Exception:
+            warn_idle("baseline unreadable; will re-init next run")
+
+    after = max(baseline, int(time.time() - args.lookback_hours * 3600))
+    q = "%s after:%d" % (args.query, after)
+
+    out = []
+    try:
+        token = token_or_exit(cache_path, token_uri, cid, csec, refresh_token)
+        ids, status = list_ids(token, q, args.max_pages)
+        if status == 401:  # cached token rejected -> force refresh once, retry
+            token = token_or_exit(cache_path, token_uri, cid, csec, refresh_token, force=True)
+            ids, status = list_ids(token, q, args.max_pages)
+        if status == 401:
+            warn_idle("Gmail list 401 after refresh — token likely revoked")
+        if status != 200:
+            warn_idle("Gmail list HTTP %s" % status)
+
+        refreshed = False
+        for mid in ids:
+            meta, mstatus = get_meta(token, mid)
+            if mstatus == 401 and not refreshed:  # token expired mid-loop -> refresh once
+                refreshed = True
+                token = token_or_exit(cache_path, token_uri, cid, csec, refresh_token, force=True)
+                meta, mstatus = get_meta(token, mid)
+            if not meta:
+                if mstatus not in (200, 404):
+                    sys.stderr.write("gmail-messages: get %s -> HTTP %s\n" % (mid, mstatus))
+                continue
+            out.append("[gmail id=%s %s] %s — %s: %s" % (
+                sanitize(mid, 40), sanitize(meta["date"], 40),
+                sanitize(meta["from"], HDR_LIMIT), sanitize(meta["subject"], HDR_LIMIT),
+                sanitize(meta["snippet"], SNIPPET_LIMIT)))
+    except urllib.error.URLError as e:
+        warn_idle("network error: %s" % e)
+
+    if out:
+        sys.stdout.write("\n".join(out) + "\n")
+    # baseline deliberately NOT advanced — bridge dedups delivered lines
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
