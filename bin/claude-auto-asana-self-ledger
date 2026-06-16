@@ -1,0 +1,102 @@
+#!/bin/bash
+# claude-auto-asana-self-ledger — PostToolUse hook (internal helper, NOT on PATH).
+#
+# Defeats the Asana echo-loop. An autonomous worker posts comments AS the human
+# (Maxim) via mcp__asana__asana_create_task_comment / asana_create_task_story.
+# The event-bridge `asana-comments` probe then re-surfaces those same comments and
+# would wake the worker on its OWN output (a paid turn; risk of comment->probe->
+# comment loop). Author-filtering can't help — worker and human share one Asana
+# identity. So this hook records the STORY GID of every comment THIS worker posts
+# into a per-worker ledger; the adapter excludes those GIDs. Human-Maxim and
+# third-party comments carry other GIDs, so they are still delivered.
+#
+# Why a per-worker hook (and NOT the shared MCP server): the asana MCP on :9100 is
+# shared across OpenWebUI / terminal / Cursor / workers. A ledger written there
+# would also suppress the human's OWN manual comments made through that MCP —
+# violating the requirement that human inputs reach the worker. This hook runs
+# inside THIS worker's process, so it records only what THIS worker posted.
+#
+# Contract: PostToolUse hook. stdin = the hook JSON (has .tool_name, .tool_input,
+# .tool_response). $1 = the worker's event-bridge state dir (where the adapter
+# reads the ledger). ALWAYS exits 0 — never blocks the tool. A parse miss is
+# logged (errors log) and tolerated: the worker's own semantic "this is my echo"
+# judgement is the backstop.
+set -u
+
+STATE_DIR="${1:-}"
+[ -n "$STATE_DIR" ] || exit 0
+LEDGER="$STATE_DIR/.asana-self-stories"
+LOCK="$STATE_DIR/.asana-self-stories.lock"
+ERRLOG="$STATE_DIR/asana-self-ledger.errors.log"
+CAP=2000   # keep the last N gids; MUST stay >> adapter fetch window (limit=100)
+
+command -v jq >/dev/null 2>&1 || exit 0
+
+payload="$(cat 2>/dev/null)" || exit 0
+[ -n "$payload" ] || exit 0
+
+# Defensive GID extraction. tool_response may be the raw MCP result object
+# ({content:[{type:text,text:"<json>"}]}), an unwrapped content array, or a JSON
+# string; the inner story json may be {gid} or {data:{gid}}. Pull the first
+# 1..32-digit gid found across all those shapes.
+# NOTE on optional access: `.data.gid?` only guards the final `.gid` — `.data` on
+# a string still throws an UNSUPPRESSED error and aborts the whole generator. Use
+# `.data?.gid?` so the `.data` index is optional too.
+gid="$(printf '%s' "$payload" | jq -er '
+  def gids:
+    ( .gid?, .data?.gid?,
+      ( select(type=="object") | .content[]? | select(.type?=="text") | .text? | fromjson? | (.gid?, .data?.gid?) ),
+      ( select(type=="array")  | .[]?      | select(.type?=="text") | .text? | fromjson? | (.gid?, .data?.gid?) ),
+      ( select(type=="string") | fromjson? | (.gid?, .data?.gid?) ) );
+  [ (.tool_response | gids) ]
+  | map(select(type=="string" and test("^[0-9]{1,32}$")))
+  | first // empty
+' 2>/dev/null)" || gid=""
+
+if [ -z "$gid" ]; then
+  # Self-diagnosing: record the raw payload (truncated) so the real shape is
+  # visible if extraction ever misses. The worker's semantic guard still covers
+  # the functional gap, so this is degraded-not-broken.
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  { printf '[%s] no gid extracted from tool_response; payload head:\n' "$(date -u +%FT%TZ 2>/dev/null)"
+    printf '%s' "$payload" | head -c 2000
+    printf '\n---\n'
+  } >> "$ERRLOG" 2>/dev/null || true
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+# Anti-symlink: ledger/lock must be regular files, never a symlink (a swapped
+# symlink would redirect our writes to an attacker-chosen target).
+for f in "$LEDGER" "$LOCK"; do
+  if [ -L "$f" ]; then
+    { printf '[%s] refusing: %s is a symlink\n' "$(date -u +%FT%TZ 2>/dev/null)" "$f"; } >> "$ERRLOG" 2>/dev/null || true
+    exit 0
+  fi
+done
+[ -e "$LEDGER" ] || { (umask 077; : >> "$LEDGER") 2>/dev/null || exit 0; }
+chmod 600 "$LEDGER" 2>/dev/null || true
+
+# Single-flight append + cap (PostToolUse can fire concurrently for parallel calls).
+exec 9>"$LOCK" 2>/dev/null || exit 0
+flock -w 5 9 2>/dev/null || exit 0
+# Re-check inside the lock: narrows the symlink-swap TOCTOU between the pre-check
+# above and the append below to near-zero (pure bash can't open O_NOFOLLOW).
+if [ -L "$LEDGER" ]; then
+  { printf '[%s] refusing (in-lock): %s is a symlink\n' "$(date -u +%FT%TZ 2>/dev/null)" "$LEDGER"; } >> "$ERRLOG" 2>/dev/null || true
+  exit 0
+fi
+if ! grep -qxF "$gid" "$LEDGER" 2>/dev/null; then
+  printf '%s\n' "$gid" >> "$LEDGER" 2>/dev/null || exit 0
+  lines=$(wc -l < "$LEDGER" 2>/dev/null || echo 0)
+  if [ "${lines:-0}" -gt "$CAP" ]; then
+    tmp="$(mktemp "$STATE_DIR/.ledger.XXXXXX" 2>/dev/null)" && {
+      tail -n "$CAP" "$LEDGER" > "$tmp" 2>/dev/null \
+        && chmod 600 "$tmp" 2>/dev/null \
+        && mv "$tmp" "$LEDGER" 2>/dev/null \
+        || rm -f "$tmp" 2>/dev/null
+    }
+  fi
+fi
+exit 0

@@ -67,9 +67,26 @@ BASELINE_TS=$(cat "$BASELINE_FILE" 2>/dev/null)
 [ -n "$BASELINE_TS" ] || { BASELINE_TS=$(now_ts); echo "$BASELINE_TS" > "$BASELINE_FILE"; }
 
 resp=$(curl -fsS --max-time 30 --config "$CURL_CFG" \
-  "https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=created_at,created_by.gid,created_by.name,text,type" \
+  "https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=gid,created_at,created_by.gid,created_by.name,text,type" \
   2>/dev/null) || exit 0
 printf '%s' "$resp" | jq -e 'has("data")' >/dev/null 2>&1 || exit 0
+
+# Self-echo suppression: the worker posts comments under the SAME Asana identity
+# as the human (Maxim), so we cannot filter by author. Instead, a PostToolUse hook
+# (claude-auto-asana-self-ledger) records the story GID of every comment THIS
+# worker posts into this ledger; we drop those GIDs here. Human-Maxim and
+# third-party comments carry other GIDs → still emitted. The ledger is read into
+# an --arg string (not --rawfile) so a missing/empty ledger just means "exclude
+# nothing" — never a fetch-time failure that would silence real comments.
+SELF_LEDGER="${STATE_DIR}/.asana-self-stories"
+self_gids=""
+if [ -f "$SELF_LEDGER" ] && [ ! -L "$SELF_LEDGER" ]; then
+  # Bound the read (tail, not cat): the hook caps the ledger at 2000 lines, but a
+  # ledger poisoned out-of-band could be huge and make `jq --arg` fail on argument
+  # size → that would silence ALL real comments this poll. 5000 >> hook cap (2000)
+  # >> fetch window (limit=100), so this never drops a legitimately-ledgered GID.
+  self_gids="$(tail -n 5000 "$SELF_LEDGER" 2>/dev/null)"
+fi
 
 # Print author comments newer than the WRITE-ONCE baseline. We deliberately do
 # NOT advance the baseline here: dedup-after-delivery is the bridge's job (its
@@ -78,11 +95,13 @@ printf '%s' "$resp" | jq -e 'has("data")' >/dev/null 2>&1 || exit 0
 # would never be re-printed and would be lost. So we re-print the (small) window
 # of post-baseline author comments each poll; the bridge dedups what it already
 # delivered. The baseline only caps how far back we ever look (set on first run).
-printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" '
-  .data[]
+printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" --arg self "$self_gids" '
+  ($self | split("\n") | map(select(length>0))) as $selfids
+  | .data[]
   | select(.type=="comment")
   | select(.created_at > $ts)
   | select($author=="" or (.created_by.gid==$author))
+  | select(((.gid // "") | tostring) as $g | ($g=="" or ($selfids | index($g) | not)))
   | "[asana \(.created_at)] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
 '
 exit 0

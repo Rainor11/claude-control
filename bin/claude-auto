@@ -295,14 +295,21 @@ cmd_adopt() {
   # and resume; the heartbeat (ops-state + compaction-flag) runs on BOTH Stop
   # (every turn — reliable) and TaskCompleted (explicit milestones; may not fire
   # if the worker uses no tasks, hence Stop is the safety net). Notification → ping.
+  # PostToolUse(ledger): record the story GID of comments THIS worker posts so the
+  # asana-comments probe can drop its own echoes (worker shares the human's Asana
+  # identity, so author-filtering can't). Matcher is a |-alternation of exact tool
+  # names (Claude Code treats [A-Za-z0-9_|]-only matchers as exact, not regex).
   jq -n \
     --argjson allow "$allow_json" --argjson ask "$ask_json" --argjson deny "$deny_json" \
     --arg identity "$BIN_DIR/claude-auto-identity $name" \
     --arg heartbeat "$BIN_DIR/claude-auto-heartbeat $name" \
     --arg notify "$BIN_DIR/claude-auto-notify $name" \
+    --arg ledger "$BIN_DIR/claude-auto-asana-self-ledger $home/state" \
     '{permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
+        PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story",
+                      hooks:[{type:"command", command:$ledger}]}],
         Stop:[{hooks:[{type:"command", command:$heartbeat}]}],
         TaskCompleted:[{hooks:[{type:"command", command:$heartbeat}]}],
         Notification:[{hooks:[{type:"command", command:$notify}]}]
@@ -559,13 +566,19 @@ cmd_upgrade() {
   [ -f "$s" ] || die "upgrade: no settings.json for '$name'"
   local -a changed=()
 
-  # 1) settings.json — SessionStart->identity hook + claude-auto deny (idempotent)
+  # 1) settings.json — SessionStart->identity hook + PostToolUse->self-ledger hook
+  # + claude-auto deny (all idempotent: each added only if not already present).
   local idcmd="$BIN_DIR/claude-auto-identity $name" t
+  local ledgercmd="$BIN_DIR/claude-auto-asana-self-ledger $home/state"
   t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
-  jq --arg idcmd "$idcmd" '
+  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" '
     .hooks = (.hooks // {})
     | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
         then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [{hooks:[{type:"command", command:$idcmd}]}]) end)
+    | .hooks.PostToolUse = (
+        [ (.hooks.PostToolUse // [])[]
+          | select( ([ .hooks[]?.command // empty | select(test("claude-auto-asana-self-ledger")) ] | length) == 0 ) ]
+        + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]}] )
     | .permissions = (.permissions // {})
     | (if ((.permissions.deny // []) | any(. == "Bash(claude-auto:*)"))
         then . else .permissions.deny = ((.permissions.deny // []) + ["Bash(claude-auto:*)"]) end)
@@ -583,6 +596,34 @@ cmd_upgrade() {
       } > "$ct" && mv "$ct" "$c" && changed+=("CLAUDE.md") || { rm -f "$ct"; die "upgrade: CLAUDE.md patch failed"; }
     else
       echo "upgrade: '$name' CLAUDE.md has no '## Mission' anchor — skipped CLAUDE.md (settings still patched)" >&2
+    fi
+  fi
+
+  # 3) event-bridge.config.json — re-normalize so each adapter gets --state-dir
+  # FORCED to this worker's state dir. Workers adopted before --state-dir forcing
+  # have configs without it; the bridge spawns the cmd verbatim, so the asana
+  # adapter would fall back to the SHARED repo state dir and never see the
+  # per-worker self-echo ledger (which the PostToolUse hook writes under
+  # <worker>/state). Idempotent: only rewrites if normalization actually changes
+  # the file. probes_validate_normalize die()s on a bad config (inside $() it just
+  # yields empty+nonzero), so a broken config silently skips this step.
+  local pc="$home/event-bridge.config.json"
+  if [ -f "$pc" ]; then
+    local pnorm pt nprobes
+    if pnorm="$(probes_validate_normalize "$pc" "$home/state" 2>/dev/null)" && [ -n "$pnorm" ]; then
+      pt="$(mktemp "$home/.eb.XXXXXX")" || die "upgrade: mktemp failed"
+      printf '%s\n' "$pnorm" > "$pt"
+      if cmp -s "$pt" "$pc"; then rm -f "$pt"
+      else chmod 600 "$pt" 2>/dev/null||true; mv "$pt" "$pc"; changed+=("event-bridge.config.json"); fi
+    else
+      # Normalization failed (e.g. legacy STRING-form cmd, which the bridge still
+      # runs but probes_validate_normalize rejects). Do NOT fail silently: a probe
+      # left without forced --state-dir uses the SHARED adapter state dir, so the
+      # per-worker self-echo ledger won't apply. Warn only if there ARE probes.
+      nprobes="$(jq '.probes | length' "$pc" 2>/dev/null || echo 0)"
+      if [ "${nprobes:-0}" -gt 0 ]; then
+        echo "upgrade: '$name' WARNING — could not normalize event-bridge.config.json (likely a legacy string-form cmd). Affected probes keep the SHARED state dir, so asana self-echo suppression may NOT apply. Re-create them with array-form cmd via: claude-auto set-probes $name <config.json>" >&2
+      fi
     fi
   fi
 
