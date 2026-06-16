@@ -11,19 +11,52 @@ This builds on claude-control (tmux sessions under `systemd --user` + linger).
 
 | Piece | What it is |
 |-------|-----------|
-| `bin/claude-auto` | Manage workers: `adopt`, `list`, `status`, `stop`, `start`, `remove`, `install-units`. |
+| `bin/claude-auto` | Manage workers: `adopt`, `list`, `status`, `stop`, `start`, `remove`, `install-units`, `get-probes`, `set-probes` (see "Worker identity" + "Changing probes"). |
 | `bin/claude-auto-run` | Foreground supervisor (one per worker, the `ExecStart` of `claude-auto@<name>.service`). Launches the worker in tmux, blocks for its lifetime, restarts it, runs controlled compaction, starts the event watcher. |
-| `bin/event-bridge-watch` | Per-worker event loop: runs the worker's probes and injects new events as user turns. |
+| `bin/claude-auto-identity` | `SessionStart` hook: re-asserts the worker's identity + runtime awareness (and a live probe list + session title) on every start, including `/compact` and resume. See "Worker identity & runtime awareness". |
+| `bin/event-bridge-watch` | Per-worker event loop: runs the worker's probes and injects new events as user turns. **Re-reads `event-bridge.config.json` every tick (~5s)** so a probe change is picked up live, no restart. |
 | `bin/session-inject` | Types a message into a live Claude tmux session as a user turn (hardened idle/approval-aware send-keys). The fallback transport and the `/compact` injector. |
 | `bin/claude-auto-heartbeat` | `Stop`/`TaskCompleted` hook: writes ops-state (liveness, last step, context-size estimate, compaction flag) under the worker's `state/`. **No brain writes** — deal memory is the worker's own job (see "Deal memory" below). |
 | `bin/claude-auto-notify` | `Notification` hook: one-way Telegram ping when the worker blocks on a permission prompt. |
 | `bin/claude-auto-reconciler` | Timer/boot job that (re)starts any registered-active worker whose unit isn't up. |
 | `channels/event-bridge/` | An MCP **channel** version of the event feed (opt-in, see "Channel mode" below). |
 | `/go-autonomous` slash command | The helper that gathers mission + bounds and calls `claude-auto adopt`. |
+| `/worker-probes` slash command | Operator helper to view/add/remove/replace a worker's probes (drives `set-probes`). See "Changing probes". |
 
 State lives in `~/.claude-control/`:
 - `autonomous.json` — registry (`workers.<name> = {state, cwd, created_at, brain_path, brain_rel}`). `brain_path`/`brain_rel` link a worker to its brain deal folder (null when not adopted from one).
 - `workers/<name>/` — `spec.json`, `settings.json` (bounds), `CLAUDE.md` (mission), `event-bridge.config.json` (probes), `logs/`, and `state/` (`last_seen.json`, `last_step.json`, `context.json`, `compact_requested`).
+
+## Worker identity & runtime awareness
+
+A worker is `claude --resume <origin> --fork-session` (first launch), then
+`--resume <W>` on every restart — so it **inherits the origin's chat history**,
+where the assistant discussed "the worker" in the third person and planned what it
+should do. Left uncorrected, on its first turn the worker concludes it *is* the
+origin and refuses its own task; it also doesn't know it has cheap event-bridge
+probes and tries to poll sources itself with the model.
+
+Two layers fix this:
+
+1. **Static (base layer)** — the generated `CLAUDE.md` opens with `## Who you are`
+   ("you are worker `<name>`; the history above is you *before* the fork; you are
+   `<name>`, not the origin") and `## How you are woken` (cheap probes wake you;
+   don't self-poll; the operator owns probe changes). Loaded via
+   `--append-system-prompt`, re-read on every compaction.
+2. **Dynamic (`SessionStart` hook `claude-auto-identity`)** — on **every** start
+   (incl. `/compact` and resume) it emits `additionalContext` re-asserting the
+   identity + awareness **plus the live list of currently-active probes**
+   (name + source only — never raw cmd args), and sets `sessionTitle = <name>` so
+   the worker is labelled in the Claude app. This is the load-bearing fix: when
+   the worker is next woken (by a probe event or you attaching) the correct
+   identity is in context. Verified to survive `/compact` (source=compact).
+
+> **No proactive first turn.** `SessionStart` can also emit an `initialUserMessage`,
+> but it does **not** trigger a turn for a fork/`--resume` session (only a fresh
+> `startup`, which workers never are — confirmed empirically on 2.1.178). Workers
+> are event-driven: they sit idle at zero cost until a probe event or an attach,
+> and identity is correct then. A proactive kickoff would need a `session-inject`
+> nudge from the supervisor — intentionally not done.
 
 ## Turn the current session autonomous
 
@@ -88,12 +121,28 @@ Under the hood (`claude-auto adopt`):
   holds the memory it curated up to its last completed step (seconds/minutes
   behind the transcript — accepted trade-off).
 
-## Adding an event trigger (probe + target + template)
+## Changing probes (what a worker watches)
 
 An **adapter** is just a probe command. A probe is cheap and non-AI: it prints
 **new** events one per line and **nothing when idle** (so the AI session spends
-0 tokens until something actually happens). Add one by editing the worker's
-`~/.claude-control/workers/<name>/event-bridge.config.json`:
+0 tokens until something actually happens).
+
+**Change a worker's probes live, without a re-adopt and without a restart** — the
+watcher re-reads the config every ~5s, and the worker's mission/bounds stay
+untouched:
+
+```bash
+claude-auto get-probes <name>                 # show current probes
+claude-auto set-probes <name> <config.json>   # swap the whole probe set
+```
+
+`set-probes` validates + normalizes the config (see below) and atomically rewrites
+`~/.claude-control/workers/<name>/event-bridge.config.json`. The same path runs at
+`adopt --probe-config`. The operator-facing way is the **`/worker-probes`** slash
+command, which walks you through add/remove/replace with the adapter catalog and
+cost model — **the operator decides the probe set; the worker never drafts its own.**
+
+Config shape (one full probe set, not a diff):
 
 ```json
 { "probes": [
@@ -104,10 +153,16 @@ An **adapter** is just a probe command. A probe is cheap and non-AI: it prints
 ] }
 ```
 
-- `cmd`: argv array (preferred, no shell) or a string (run via `sh -c`).
-- `name`: unique; dedup state is per-probe.
-- `interval_sec`: poll cadence (min 5).
-- `source`: shown to the worker as `event_source`.
+- `cmd`: **argv array only** — a string `cmd` (run via `sh -c`) is rejected by the
+  validator. `cmd[0]`'s basename must be an executable adapter in
+  `channels/event-bridge/adapters/` (path canonicalized, blocks `../`).
+- `name`: unique (and unique once sanitized — it's the dedup-state key). `[A-Za-z0-9_.-]`.
+- `source`: shown to the worker as `event_source`; restricted charset (keeps the
+  injected frame one clean line).
+- `interval_sec`: poll cadence (min 5). `timeout_sec`: 1..300 (default 30).
+- `--state-dir`: **don't set it** — `set-probes`/`adopt` force it to the worker's
+  own `state/` for stateful adapters (gmail/tg/asana), so several workers can't
+  collide in the shared adapters state dir. Any supplied `--state-dir` is replaced.
 
 Each new line is injected into the worker as:
 ```
@@ -152,7 +207,10 @@ Bounds are **two layers**, both authored by `/go-autonomous`:
    via `--append-system-prompt`.
 
 **Self-protection (automatic):** the worker is denied write/edit to its own
-`workers/<name>/` and to `~/.claude-control/` so it cannot rewrite its own bounds.
+`workers/<name>/` and to `~/.claude-control/`, plus `Bash(claude-auto:*)` (so it
+can't drive the carrier to widen its own feed), so it cannot rewrite its own
+bounds. NB: this stops easy/accidental self-reconfiguration, not a determined
+same-user subprocess — see "Known limitations".
 
 **Inviolable across compaction:** bounds do not live in the chat history (which
 compaction summarizes). `settings.json` rules are mechanical (unaffected by

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# claude-auto-identity <name> — SessionStart hook for an autonomous worker.
+#
+# Purpose: a worker is `claude --resume <origin> --fork-session` (first launch),
+# then `--resume <W>` on every restart. It therefore inherits the ORIGIN's chat
+# history, where the assistant discussed "the worker" in the third person and
+# planned what it should do. Without correction, on its first turn the worker
+# concludes it IS the origin and refuses its own task; it also doesn't know it
+# has cheap event-bridge probes and tries to self-poll sources with the model.
+#
+# This SessionStart hook injects, on EVERY start (startup|resume|compact|clear):
+#   - additionalContext : authoritative identity ("you are <name>, the history
+#                         above is you BEFORE the fork") + runtime awareness
+#                         (cheap probes wake you; don't self-poll; the LIVE active
+#                         probe list; the operator owns probe changes).
+#   - sessionTitle      : <name> (so the worker is labelled in the Claude app).
+#
+# additionalContext is the load-bearing fix: when the worker is next woken (by a
+# probe event or the operator attaching) it has the correct identity in context.
+# Verified working in e2e (worker self-identifies; survives /compact source=compact).
+#
+# NOTE on initialUserMessage: SessionStart can emit one, but it does NOT trigger a
+# turn for a session started via --resume/--fork-session (confirmed empirically on
+# 2.1.178) — so we don't use it. Workers are event-driven: they wake on a probe
+# event or operator attach, and identity is correct then. (A proactive first-turn
+# would need a send-keys nudge from the supervisor; intentionally not done here.)
+#
+# The IDENTITY prose also lives statically in the worker's CLAUDE.md
+# (--append-system-prompt) as the stronger base layer; this hook reinforces it
+# and adds the LIVE probe list (which a static file can't keep current).
+#
+# Output contract: stdout must be EXACTLY one hookSpecificOutput JSON object and
+# nothing else (any stray stdout corrupts the hook). Debug goes to a log file.
+# Fail-safe: any error exits 0 (a SessionStart hook must never wedge launch).
+set -u
+
+name="${1:-}"
+# Never wedge launch: a bad name just yields no output (exit 0).
+[[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+home="$CONTROL_DIR/workers/$name"
+config="$home/event-bridge.config.json"
+logf="$home/logs/identity.log"
+
+# Drain stdin (the hook payload: {hook_event_name, source, session_id, ...}).
+# additionalContext is injected for ALL sources so identity survives /compact and
+# resume — but read `source` for the debug log.
+payload="$(cat 2>/dev/null || true)"
+source="$(printf '%s' "$payload" | jq -r '.source // "?"' 2>/dev/null || echo '?')"
+
+# Active probes — NAME + SOURCE ONLY. Never echo raw cmd args (gmail queries,
+# contacts, task ids are sensitive routing) — just enough for the worker to know
+# what's watching it so it doesn't self-poll those same sources.
+probes_block=""
+if [ -f "$config" ]; then
+  probes_block="$(jq -r '.probes[]? | "- \(.name) [\(.source // "probe")]"' "$config" 2>/dev/null || true)"
+fi
+[ -n "$probes_block" ] || probes_block="(none active right now — you wake only when the operator attaches or sets a probe)"
+
+ctx="$(cat <<EOF
+[autonomous-worker identity & runtime — injected by the carrier; authoritative, overrides any contrary impression from the history above]
+
+WHO YOU ARE
+You are the autonomous worker "$name". You were created by forking a planning/origin
+session, so the conversation history above may contain an assistant that talks about
+"the worker" in the third person and plans what it should do. That assistant is YOU,
+before the fork. You are now "$name" — the worker itself, not the origin. Act on the
+mission as "$name"; do not wait for, defer to, or impersonate the origin session.
+
+HOW YOU ARE WOKEN (event-bridge)
+Cheap external probes watch sources for you and inject a turn tagged
+"[event-bridge | source=... ]" ONLY when a real event happens — at zero model cost
+while idle. Do NOT poll those sources yourself with the model (no repeated "let me
+check the inbox / Asana" loops); the probes already do that for free and will wake you.
+
+Your active probes right now:
+$probes_block
+
+Probe types your operator can enable: gmail (email query), asana (task comments),
+telegram (messages from a contact), timer (periodic tick).
+
+Changing which probes run is the OPERATOR's job (the /worker-probes tool). Do NOT draft
+your own probe config, re-adopt command, or otherwise try to change what you monitor or
+your own bounds. If you think a probe should change, just say so in your output and let
+the operator act.
+EOF
+)"
+
+# Best-effort debug log (NOT stdout).
+{ mkdir -p "$home/logs" 2>/dev/null && \
+  printf '%s source=%s probes=[%s]\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$source" \
+    "$(printf '%s' "$probes_block" | tr '\n' ';')" >> "$logf" 2>/dev/null; } || true
+
+# Emit exactly one JSON object on stdout. jq --arg guarantees correct escaping.
+jq -n --arg ctx "$ctx" --arg title "$name" \
+  '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$ctx, sessionTitle:$title}}' 2>/dev/null || exit 0
+exit 0

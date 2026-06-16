@@ -14,6 +14,10 @@
 #   stop     stop + disable a worker's unit (keeps files)
 #   start    (re)start a worker's unit
 #   remove   stop, disable, and delete a worker's files + registry entry
+#   get-probes <name>                 print the worker's current event-bridge probes
+#   set-probes <name> <config.json>   swap the worker's probes live (no re-adopt,
+#                                     no restart; watcher reloads in ~5s). Driven by
+#                                     the /worker-probes operator skill.
 #   install-units  (re)render the systemd templates + enable the reconciler timer
 #
 # adopt is normally invoked by the /go-autonomous slash command, which gathers
@@ -99,6 +103,14 @@ cmd_adopt() {
   [ -d "$cwd" ] || die "adopt: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"  # absolutize
 
+  # Validate + normalize the probe config NOW (fail fast, before creating any
+  # files) through the SAME hardening as set-probes — adopt must NOT be a bypass
+  # that raw-copies an arbitrary config into the live event feed.
+  local probes_json='{"probes":[]}'
+  if [ -n "$probe_config" ]; then
+    probes_json="$(probes_validate_normalize "$probe_config" "$WORKERS_DIR/$name/state")" || exit 1
+  fi
+
   # Remote Control (worker visible in claude.ai/code + Claude app). Preflight:
   # an inference-only token (CLAUDE_CODE_OAUTH_TOKEN / setup-token) CANNOT establish
   # Remote Control — the worker would fail at launch and look like a crash-loop.
@@ -174,6 +186,26 @@ cmd_adopt() {
     echo "You are running UNATTENDED as an autonomous worker. The operator checks in"
     echo "occasionally; between check-ins you act on your own within the bounds below."
     echo
+    echo "## Who you are (read this first)"
+    echo
+    echo "You are the autonomous worker \`$name\`, created by forking a planning/origin"
+    echo "session. The conversation history may show an assistant discussing \"the worker\""
+    echo "in the third person and planning what it should do — that assistant is YOU,"
+    echo "before the fork. You are \`$name\` now: the worker itself, not the origin. Act on"
+    echo "the mission as \`$name\`; never wait for, defer to, or impersonate the origin."
+    echo
+    echo "## How you are woken (event-bridge)"
+    echo
+    echo "Cheap external probes watch sources for you and wake you with a turn tagged"
+    echo "\`[event-bridge | source=… ]\` ONLY when a real event happens — at zero model cost"
+    echo "while idle. Do NOT poll those sources yourself with the model (no repeated \"let me"
+    echo "check the inbox / Asana\" loops); the probes do it for free and will wake you. Probe"
+    echo "types the operator can enable: gmail, asana, telegram, timer. The exact set active"
+    echo "right now is shown to you at session start. Changing probes is the OPERATOR's job"
+    echo "(the \`/worker-probes\` tool) — do NOT draft your own probe config or re-adopt"
+    echo "command, and never change what you monitor or your own bounds. Recommend changes in"
+    echo "your output and let the operator act."
+    echo
     echo "## Mission"
     echo
     [ -n "$mtext" ] && echo "$mtext" || echo "(no mission set — ask the operator before acting)"
@@ -212,12 +244,8 @@ cmd_adopt() {
     fi
   } > "$home/CLAUDE.md"
 
-  # event-bridge probe config
-  if [ -n "$probe_config" ]; then
-    cp "$probe_config" "$home/event-bridge.config.json"
-  else
-    echo '{"probes":[]}' > "$home/event-bridge.config.json"
-  fi
+  # event-bridge probe config (validated + normalized above; --state-dir forced)
+  printf '%s\n' "$probes_json" > "$home/event-bridge.config.json"
 
   # Events are delivered by event-bridge-watch (send-keys), not a channel, so no
   # per-worker MCP config is needed. The probe list lives in event-bridge.config.json.
@@ -230,23 +258,33 @@ cmd_adopt() {
   # the real absolute path). These deny the Edit/Write tools and recognized Bash
   # file commands (cat/sed/…) on the worker's own config; arbitrary subprocesses
   # (a python/node script) are NOT covered — that needs the OS sandbox.
+  # `Bash(claude-auto:*)` keeps the worker from driving the carrier (e.g. running
+  # `claude-auto set-probes` on itself to widen its own feed). NOTE: this and the
+  # Edit/Write denies are NOT a hard boundary — a same-user subprocess (python -c,
+  # tee, a redirect) can still mutate $home; closing that needs an OS sandbox.
+  # They stop the easy/accidental self-reconfiguration, not a determined one.
   local deny_json allow_json ask_json
   deny_json=$(printf '%s\n' "${deny[@]:-}" \
     "Edit(//${home#/}/**)" "Write(//${home#/}/**)" \
     "Edit(//${CONTROL_DIR#/}/**)" "Write(//${CONTROL_DIR#/}/**)" \
+    "Bash(claude-auto:*)" \
     | sed '/^$/d' | jq -R . | jq -s .)
   allow_json=$(printf '%s\n' "${allow[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)
   ask_json=$(printf '%s\n' "${ask[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)
 
-  # Hooks: the heartbeat (ops-state + compaction-flag) runs on BOTH Stop (every
-  # turn — reliable) and TaskCompleted (explicit task milestones; may not fire if
-  # the worker uses no tasks, hence Stop is the safety net). Notification → ping.
+  # Hooks: SessionStart (claude-auto-identity) re-asserts identity + runtime
+  # awareness (+ live probe list, session title) on every start, incl. /compact
+  # and resume; the heartbeat (ops-state + compaction-flag) runs on BOTH Stop
+  # (every turn — reliable) and TaskCompleted (explicit milestones; may not fire
+  # if the worker uses no tasks, hence Stop is the safety net). Notification → ping.
   jq -n \
     --argjson allow "$allow_json" --argjson ask "$ask_json" --argjson deny "$deny_json" \
+    --arg identity "$BIN_DIR/claude-auto-identity $name" \
     --arg heartbeat "$BIN_DIR/claude-auto-heartbeat $name" \
     --arg notify "$BIN_DIR/claude-auto-notify $name" \
     '{permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
+        SessionStart:[{hooks:[{type:"command", command:$identity}]}],
         Stop:[{hooks:[{type:"command", command:$heartbeat}]}],
         TaskCompleted:[{hooks:[{type:"command", command:$heartbeat}]}],
         Notification:[{hooks:[{type:"command", command:$notify}]}]
@@ -283,7 +321,9 @@ EOF
 }
 
 # ---- lifecycle -------------------------------------------------------------
-worker_exists() { [ -d "$WORKERS_DIR/$1" ]; }
+# Validate the name BEFORE using it in a path: a name like `..` would otherwise
+# pass `-d` and let set-probes/remove/etc. traverse outside WORKERS_DIR.
+worker_exists() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] && [ -d "$WORKERS_DIR/$1" ]; }
 
 cmd_list() {
   ensure_registry
@@ -381,6 +421,108 @@ cmd_remove() {
   echo "worker '$name' removed"
 }
 
+# ---- probes (operator-managed event feed) ----------------------------------
+# Adapters that keep per-target dedup/baseline state; we force --state-dir to the
+# worker's own state dir so several workers don't collide in the shared
+# adapters/state dir (and a crafted config can't redirect that state elsewhere).
+STATEFUL_ADAPTERS_RE='(gmail-messages|tg-messages|asana-comments)'
+
+# probes_validate_normalize <infile> <statedir>  — print a HARDENED, normalized
+# probe config to stdout, or `die`. Shared by BOTH `adopt --probe-config` and
+# `set-probes` so neither path can smuggle an arbitrary recurring shell job into
+# event-bridge-watch (which runs string `cmd` via `sh -c`). Rules: .probes must be
+# an array; each probe cmd MUST be an argv array (string cmd rejected); cmd[0]'s
+# basename must be an executable adapter in channels/event-bridge/adapters/;
+# name/source restricted charsets; unique name AND sanitized ident (the .seen
+# key); interval>=5, timeout 1..300. Normalization: cmd[0] -> canonical adapter
+# path (blocks ../), STATE_DIR_OF_THIS_WORKER -> statedir, and for stateful
+# adapters --state-dir is FORCED to statedir (any supplied one is dropped).
+probes_validate_normalize() {
+  local infile="$1" statedir="$2"
+  local adapters_dir="$EB_DIR/adapters"
+  [ -d "$adapters_dir" ] || die "probes: adapters dir missing ($adapters_dir)"
+  [ -f "$infile" ] || die "probes: config file not found: $infile"
+  jq -e . "$infile" >/dev/null 2>&1 || die "probes: $infile is not valid JSON"
+  jq -e '.probes | type=="array"' "$infile" >/dev/null 2>&1 || die "probes: .probes must be an array"
+
+  local n; n="$(jq '.probes | length' "$infile")"
+  local i seen_idents=""
+  for (( i=0; i<n; i++ )); do
+    local p name_i id_i src exe base iv tmo
+    p="$(jq -c ".probes[$i]" "$infile")"
+    name_i="$(jq -r '.name // empty' <<<"$p")"
+    [ -n "$name_i" ] || die "probes: probe #$i has no name"
+    [[ "$name_i" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "probes: bad probe name '$name_i' (use [a-zA-Z0-9_.-])"
+    id_i="$(printf '%s' "$name_i" | tr -c 'A-Za-z0-9_-' '_')"  # the .seen key
+    case " $seen_idents " in *" $id_i "*) die "probes: duplicate probe name/ident '$name_i'";; esac
+    seen_idents="$seen_idents $id_i"
+    src="$(jq -r '.source // ""' <<<"$p")"
+    [[ "$src" =~ ^[a-zA-Z0-9_.-]*$ ]] || die "probes: probe '$name_i' source has illegal chars (the event frame must stay one clean line)"
+    jq -e '.cmd | type=="array"' <<<"$p" >/dev/null 2>&1 \
+      || die "probes: probe '$name_i' cmd must be an array (string cmd is not allowed)"
+    jq -e '.cmd | length>0' <<<"$p" >/dev/null 2>&1 || die "probes: probe '$name_i' cmd is empty"
+    exe="$(jq -r '.cmd[0] // empty' <<<"$p")"
+    [ -n "$exe" ] || die "probes: probe '$name_i' has empty cmd[0]"
+    base="$(basename "$exe")"
+    # -f AND -x: a bare basename like "" → "." would pass a dir-only -x check.
+    { [ -f "$adapters_dir/$base" ] && [ -x "$adapters_dir/$base" ]; } \
+      || die "probes: probe '$name_i' uses unknown adapter '$base' (allowed: $(ls "$adapters_dir" 2>/dev/null | tr '\n' ' '))"
+    iv="$(jq -r '.interval_sec // 60' <<<"$p")"
+    { [[ "$iv" =~ ^[0-9]+$ ]] && [ "$iv" -ge 5 ]; } || die "probes: probe '$name_i' interval_sec must be integer >=5"
+    tmo="$(jq -r '.timeout_sec // 30' <<<"$p")"
+    { [[ "$tmo" =~ ^[0-9]+$ ]] && [ "$tmo" -ge 1 ] && [ "$tmo" -le 300 ]; } || die "probes: probe '$name_i' timeout_sec must be integer 1..300"
+  done
+
+  # `split | map(select(length>0)) | last` matches basename even for a trailing
+  # slash (so cmd[0]="x/" canonicalizes to "$ad/x", agreeing with the -f check).
+  jq --arg sd "$statedir" --arg ad "$adapters_dir" --arg re "$STATEFUL_ADAPTERS_RE" '
+    .probes |= map(
+      (.cmd[0] |= ($ad + "/" + (split("/") | map(select(length>0)) | last)))
+      | .cmd |= map(if . == "STATE_DIR_OF_THIS_WORKER" then $sd else . end)
+      | (if (.cmd[0] | test($re))
+          then .cmd |= (
+                 ( . as $a | [ range(0;length) as $i
+                   | select( ($a[$i] != "--state-dir") and (($i==0) or ($a[$i-1] != "--state-dir")) )
+                   | $a[$i] ] )
+                 + ["--state-dir", $sd] )
+          else . end)
+    )
+  ' "$infile" || die "probes: normalization failed"
+}
+
+cmd_get_probes() {
+  local name="${1:?usage: get-probes <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  local cfg="$WORKERS_DIR/$name/event-bridge.config.json"
+  [ -f "$cfg" ] && jq . "$cfg" || echo '{"probes":[]}'
+}
+
+# set-probes <name> <config.json> — swap ONLY the worker's event-bridge probe set,
+# WITHOUT a re-adopt and WITHOUT re-typing bounds (mission/settings stay put).
+# event-bridge-watch re-reads the config every ~5s, so the change is live with no
+# restart. Validation/normalization is shared with adopt (probes_validate_normalize).
+cmd_set_probes() {
+  local name="${1:?usage: set-probes <name> <config.json>}"
+  local infile="${2:-}"
+  [ -n "$infile" ] || die "usage: set-probes <name> <config.json>"
+  worker_exists "$name" || die "no worker '$name'"
+  local home="$WORKERS_DIR/$name" statedir="$WORKERS_DIR/$name/state"
+  local normalized; normalized="$(probes_validate_normalize "$infile" "$statedir")" || exit 1
+
+  mkdir -p "$statedir"
+  local cfg="$home/event-bridge.config.json" t
+  t="$(mktemp "$home/.eb.XXXXXX")" || die "set-probes: mktemp failed"
+  ( umask 077; printf '%s\n' "$normalized" > "$t" ) || { rm -f "$t"; die "set-probes: write failed"; }
+  jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "set-probes: normalized config invalid"; }
+  chmod 600 "$t" 2>/dev/null || true
+  mv "$t" "$cfg" || { rm -f "$t"; die "set-probes: mv failed"; }
+
+  local count; count="$(jq '.probes | length' "$cfg")"
+  echo "set-probes: '$name' now has $count probe(s); event-bridge-watch reloads within ~5s (no restart)."
+  systemctl --user is-active --quiet "claude-auto@$name.service" \
+    || echo "  note: worker is not running — the new config applies on next start."
+}
+
 # ---- dispatch --------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "$sub" in
@@ -390,6 +532,8 @@ case "$sub" in
   stop) cmd_stop "$@" ;;
   start) cmd_start "$@" ;;
   remove) cmd_remove "$@" ;;
+  get-probes) cmd_get_probes "$@" ;;
+  set-probes) cmd_set_probes "$@" ;;
   install-units) cmd_install_units ;;
   ""|-h|--help) sed -n '1,40p' "$0" | sed 's/^# \?//' ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
