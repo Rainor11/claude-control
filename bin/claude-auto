@@ -295,21 +295,25 @@ cmd_adopt() {
   # and resume; the heartbeat (ops-state + compaction-flag) runs on BOTH Stop
   # (every turn — reliable) and TaskCompleted (explicit milestones; may not fire
   # if the worker uses no tasks, hence Stop is the safety net). Notification → ping.
-  # PostToolUse(ledger): record the story GID of comments THIS worker posts so the
-  # asana-comments probe can drop its own echoes (worker shares the human's Asana
-  # identity, so author-filtering can't). Matcher is a |-alternation of exact tool
-  # names (Claude Code treats [A-Za-z0-9_|]-only matchers as exact, not regex).
+  # PostToolUse(ledger): record the id of every Asana comment / Gmail message THIS
+  # worker posts so the asana-comments / gmail-messages probes can drop their own
+  # echoes (worker shares the human's Asana identity AND Gmail mailbox, so author/
+  # sender-filtering can't). Matcher is a |-alternation of exact tool names (Claude
+  # Code treats [A-Za-z0-9_|]-only matchers as exact, not regex).
   jq -n \
     --argjson allow "$allow_json" --argjson ask "$ask_json" --argjson deny "$deny_json" \
     --arg identity "$BIN_DIR/claude-auto-identity $name" \
     --arg heartbeat "$BIN_DIR/claude-auto-heartbeat $name" \
     --arg notify "$BIN_DIR/claude-auto-notify $name" \
     --arg ledger "$BIN_DIR/claude-auto-asana-self-ledger $home/state" \
+    --arg gledger "$BIN_DIR/claude-auto-gmail-self-ledger $home/state" \
     '{permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
         PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story",
-                      hooks:[{type:"command", command:$ledger}]}],
+                      hooks:[{type:"command", command:$ledger}]},
+                     {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email",
+                      hooks:[{type:"command", command:$gledger}]}],
         Stop:[{hooks:[{type:"command", command:$heartbeat}]}],
         TaskCompleted:[{hooks:[{type:"command", command:$heartbeat}]}],
         Notification:[{hooks:[{type:"command", command:$notify}]}]
@@ -566,19 +570,24 @@ cmd_upgrade() {
   [ -f "$s" ] || die "upgrade: no settings.json for '$name'"
   local -a changed=()
 
-  # 1) settings.json — SessionStart->identity hook + PostToolUse->self-ledger hook
-  # + claude-auto deny (all idempotent: each added only if not already present).
+  # 1) settings.json — SessionStart->identity hook + PostToolUse->self-ledger hooks
+  # (Asana + Gmail) + claude-auto deny (all idempotent: each added only if not
+  # already present). The PostToolUse rebuild is path-aware: it drops ANY existing
+  # asana/gmail self-ledger entries (even stale-path ones from an older adopt) and
+  # re-adds both with the current absolute paths.
   local idcmd="$BIN_DIR/claude-auto-identity $name" t
   local ledgercmd="$BIN_DIR/claude-auto-asana-self-ledger $home/state"
+  local gledgercmd="$BIN_DIR/claude-auto-gmail-self-ledger $home/state"
   t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
-  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" '
+  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" '
     .hooks = (.hooks // {})
     | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
         then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [{hooks:[{type:"command", command:$idcmd}]}]) end)
     | .hooks.PostToolUse = (
         [ (.hooks.PostToolUse // [])[]
-          | select( ([ .hooks[]?.command // empty | select(test("claude-auto-asana-self-ledger")) ] | length) == 0 ) ]
-        + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]}] )
+          | select( ([ .hooks[]?.command // empty | select(test("claude-auto-(asana|gmail)-self-ledger")) ] | length) == 0 ) ]
+        + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]},
+           {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$gledgercmd}]}] )
     | .permissions = (.permissions // {})
     | (if ((.permissions.deny // []) | any(. == "Bash(claude-auto:*)"))
         then . else .permissions.deny = ((.permissions.deny // []) + ["Bash(claude-auto:*)"]) end)

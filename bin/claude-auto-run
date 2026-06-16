@@ -21,6 +21,13 @@ set -u
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 WORKERS_DIR="$CONTROL_DIR/workers"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+# Default model for workers: force the 1M-context Opus variant. A forked/resumed
+# session otherwise inherits the model its transcript was saved with (256k Opus),
+# and a manual picker change does NOT survive restart (resume re-applies the saved
+# model). So pin the model explicitly on every launch — `--model` is the highest-
+# priority override after managed settings. Override per-worker via spec.json
+# .model, or globally via CLAUDE_AUTO_DEFAULT_MODEL.
+DEFAULT_MODEL="${CLAUDE_AUTO_DEFAULT_MODEL:-opus[1m]}"
 
 name="${1:?usage: claude-auto-run <name>}"
 [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "claude-auto-run: bad name '$name'" >&2; exit 2; }
@@ -111,7 +118,7 @@ else
   # unattended restart. (Channel mode is kept in channels/event-bridge for when
   # the preview gate is lifted.)
   [ -s "$home/CLAUDE.md" ] && args+=( --append-system-prompt "$(cat "$home/CLAUDE.md")" )
-  [ -n "$model" ] && args+=( --model "$model" )
+  args+=( --model "${model:-$DEFAULT_MODEL}" )
   # Remote Control: expose this durable session to claude.ai/code + the Claude app.
   # It's a flag on the same interactive session, so --resume/--settings/mission all
   # still apply (durability kept). TTY is provided by tmux. Name defaults to worker.

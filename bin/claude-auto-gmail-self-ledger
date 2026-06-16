@@ -1,0 +1,134 @@
+#!/bin/bash
+# claude-auto-gmail-self-ledger — PostToolUse hook (internal helper, NOT on PATH).
+#
+# Defeats the Gmail echo-loop. An autonomous worker shares ONE Gmail mailbox with
+# the human operator and can SEND mail via mcp__google-workspace__send_email. The
+# event-bridge `gmail-messages` probe polls that SAME mailbox by a search query;
+# when the query is subject/content-based (not sender-scoped), the worker's OWN
+# sent reply (same subject) matches and gets re-injected — waking the worker on its
+# own output (a paid turn; risk of send->probe->send loop). Sender-filtering can't
+# help: worker and human share the mailbox, and a `from:` query is only safe when
+# it targets a THIRD party. So this hook records the Gmail message id of every mail
+# THIS worker sends into a per-worker, per-account ledger; the adapter excludes
+# those ids. The human's own sends and third-party replies (even in the SAME
+# thread) carry OTHER message ids, so they are still delivered.
+#
+# Mirror of claude-auto-asana-self-ledger (kept a SEPARATE binary on purpose — no
+# shared code, so a change to one can't silently break the other).
+#
+# Why a per-worker hook (and NOT the shared MCP server): the google-workspace MCP
+# is shared across OpenWebUI / terminal / Cursor / workers. A ledger written there
+# would also suppress the human's OWN manual sends — violating the requirement that
+# human inputs reach the worker. This hook runs inside THIS worker's process, so it
+# records only what THIS worker sent.
+#
+# Contract: PostToolUse hook. stdin = the hook JSON (.tool_name, .tool_input,
+# .tool_response). $1 = the worker's event-bridge state dir. The account (alp vs
+# rainor) is derived from .tool_name and namespaces the ledger file, matching the
+# adapter's --account. ALWAYS exits 0 — never blocks the tool. A parse miss is
+# logged and tolerated: the worker's semantic "this is my echo" judgement and the
+# adapter's freshness grace are the backstops.
+set -u
+
+STATE_DIR="${1:-}"
+[ -n "$STATE_DIR" ] || exit 0
+ERRLOG="$STATE_DIR/gmail-self-ledger.errors.log"
+CAP=2000   # last N ids (ALL worker sends, not just query-matching ones)
+
+command -v jq >/dev/null 2>&1 || exit 0
+
+payload="$(cat 2>/dev/null)" || exit 0
+[ -n "$payload" ] || exit 0
+
+# Account namespacing: mcp__google-workspace-rainor__* -> rainor mailbox/profile,
+# mcp__google-workspace__* (no suffix) -> default "alp". A flat cross-mailbox ledger
+# is practically safe (Gmail ids aren't promised globally unique), but namespacing
+# is cheap and removes even the theoretical cross-mailbox collision.
+tool="$(printf '%s' "$payload" | jq -r '.tool_name // empty' 2>/dev/null)" || tool=""
+case "$tool" in
+  *google-workspace-rainor*) account="rainor" ;;
+  *)                         account="alp" ;;
+esac
+# Sanitize identically to the adapter (re.sub(r"[^A-Za-z0-9_-]","_")).
+account="$(printf '%s' "$account" | tr -c 'A-Za-z0-9_-' '_')"
+LEDGER="$STATE_DIR/.gmail-self-messages-$account"
+LOCK="$STATE_DIR/.gmail-self-messages-$account.lock"
+
+# Defensive id extraction. tool_response may be the full MCP result object
+# ({content:[{type:text,text:"...Message ID: <id>..."}], structuredContent:{id,...}}),
+# an unwrapped content array, or a bare string. Two string sub-shapes matter:
+#   (a) the human text "...Message ID: <id>..."  -> regex it out;
+#   (b) JSON SERIALIZED as a string, e.g. "{\"id\":\"<id>\",\"labelIds\":[...]}"
+#       (or the whole result object stringified) -> fromjson then read .id /
+#       .structuredContent.id / .data.id. (Claude Code may hand tool_response in
+#       either form; the Asana hook handles the analogous case with fromjson?.)
+# TOON output mode DROPS structuredContent, leaving only the text — case (a) covers
+# that. NOTE (Asana lesson): `.data.id?` only guards the final `.id` — `.data` on a
+# string still throws an UNSUPPRESSED error; use `.data?.id?`. `select(type=="object")`
+# before `.content?[]?` so a bare string/array root doesn't error. `scan()` returns
+# an ARRAY per match (capture group), empty (no error) on non-match -> take `.[0]`.
+# `fromjson?` yields nothing on non-JSON text. Gmail list ids are lowercase hex —
+# downcase before validating/storing.
+gid="$(printf '%s' "$payload" | jq -er '
+  def ids_from_text:
+    strings
+    | ( ( scan("Message ID:[[:space:]]*([0-9a-fA-F]{6,40})") | .[0] ),
+        ( fromjson? | (.structuredContent?.id?, .id?, .data?.id?) ) );
+  def ids:
+    ( .structuredContent?.id?,
+      .id?,
+      .data?.id?,
+      ( select(type=="object") | .content?[]? | .text? | ids_from_text ),
+      ( select(type=="array")  | .[]?         | .text? | ids_from_text ),
+      ( select(type=="string") | ids_from_text ) );
+  [ ( (.tool_response? // .) | ids ) ]
+  | map(select(type=="string") | ascii_downcase | select(test("^[0-9a-f]{6,40}$")))
+  | first // empty
+' 2>/dev/null)" || gid=""
+
+if [ -z "$gid" ]; then
+  # Self-diagnosing: record the raw payload (truncated) so the real shape is visible
+  # if extraction ever misses. The semantic guard + adapter grace still cover the
+  # functional gap, so this is degraded-not-broken.
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  { printf '[%s] no message id from tool_response (tool=%s); payload head:\n' "$(date -u +%FT%TZ 2>/dev/null)" "$tool"
+    printf '%s' "$payload" | head -c 2000
+    printf '\n---\n'
+  } >> "$ERRLOG" 2>/dev/null || true
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+# Anti-symlink: ledger/lock must be regular files, never a symlink (a swapped
+# symlink would redirect our writes to an attacker-chosen target).
+for f in "$LEDGER" "$LOCK"; do
+  if [ -L "$f" ]; then
+    { printf '[%s] refusing: %s is a symlink\n' "$(date -u +%FT%TZ 2>/dev/null)" "$f"; } >> "$ERRLOG" 2>/dev/null || true
+    exit 0
+  fi
+done
+[ -e "$LEDGER" ] || { (umask 077; : >> "$LEDGER") 2>/dev/null || exit 0; }
+chmod 600 "$LEDGER" 2>/dev/null || true
+
+# Single-flight append + cap (PostToolUse can fire concurrently for parallel calls).
+exec 9>"$LOCK" 2>/dev/null || exit 0
+flock -w 5 9 2>/dev/null || exit 0
+# Re-check inside the lock: narrows the symlink-swap TOCTOU to near-zero.
+if [ -L "$LEDGER" ]; then
+  { printf '[%s] refusing (in-lock): %s is a symlink\n' "$(date -u +%FT%TZ 2>/dev/null)" "$LEDGER"; } >> "$ERRLOG" 2>/dev/null || true
+  exit 0
+fi
+if ! grep -qxF "$gid" "$LEDGER" 2>/dev/null; then
+  printf '%s\n' "$gid" >> "$LEDGER" 2>/dev/null || exit 0
+  lines=$(wc -l < "$LEDGER" 2>/dev/null || echo 0)
+  if [ "${lines:-0}" -gt "$CAP" ]; then
+    tmp="$(mktemp "$STATE_DIR/.gledger.XXXXXX" 2>/dev/null)" && {
+      tail -n "$CAP" "$LEDGER" > "$tmp" 2>/dev/null \
+        && chmod 600 "$tmp" 2>/dev/null \
+        && mv "$tmp" "$LEDGER" 2>/dev/null \
+        || rm -f "$tmp" 2>/dev/null
+    }
+  fi
+fi
+exit 0

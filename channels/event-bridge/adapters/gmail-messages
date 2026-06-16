@@ -33,6 +33,7 @@ Usage:
   gmail-messages --query "is:unread label:inbox" --token-file ... --creds-file ...
 """
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -94,6 +95,38 @@ def sanitize(s, limit):
     s = "".join(ch if _keep(ch) else " " for ch in s)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:limit]
+
+
+def load_self_ids(state_dir, account):
+    """Read the per-(worker,account) self-send ledger written by the
+    claude-auto-gmail-self-ledger PostToolUse hook: lowercase Gmail message ids the
+    worker itself SENT. The adapter excludes these so the worker is never woken by
+    its OWN outgoing mail (the echo-loop). The human's own sends and third-party
+    replies carry OTHER ids and are still delivered. Fail-open (unreadable/missing
+    -> empty set): a ledger glitch must not silently swallow real mail — the
+    freshness grace + the worker's semantic judgement are the backstops. Skips a
+    symlinked ledger (matches the hook's anti-symlink stance). Tail-bounded so a
+    huge ledger can't blow up time/memory."""
+    path = os.path.join(state_dir, ".gmail-self-messages-%s" % account)
+    out = set()
+    try:
+        if not os.path.exists(path) or os.path.islink(path):
+            return set()
+        # Size guard: a corrupted/runaway ledger must not stall the probe. Normal
+        # size is ~2000 ids * ~17 bytes ~= 34 KB; 10 MB is a generous sanity cap.
+        if os.path.getsize(path) > 10_000_000:
+            return set()
+        # Memory-bounded tail: deque(maxlen) keeps only the last N lines even if the
+        # file iterator is long (f.readlines()[-N:] would materialize the WHOLE file
+        # first — not actually tail-bounded).
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for ln in collections.deque(f, maxlen=5000):
+                s = ln.strip().lower()
+                if s:
+                    out.add(s)
+    except OSError:
+        return set()
+    return out
 
 
 @contextlib.contextmanager
@@ -243,6 +276,8 @@ def get_meta(access_token, msg_id):
         "subject": headers.get("subject", ""),
         "date": headers.get("date", ""),
         "snippet": body.get("snippet", ""),
+        "internalDate": body.get("internalDate", ""),   # epoch ms (str) — for grace
+        "labelIds": body.get("labelIds", []) or [],      # SENT marks our own outgoing
     }, status
 
 
@@ -255,6 +290,11 @@ def main():
     p.add_argument("--state-dir", default=STATE_DIR_DEFAULT)
     p.add_argument("--lookback-hours", type=float, default=24.0)
     p.add_argument("--max-pages", type=int, default=10)
+    # Race grace: defer emitting SENT messages newer than this many seconds, giving
+    # the self-send ledger (written by the PostToolUse hook just after send_email)
+    # time to land before this independent poller could surface the worker's own
+    # mail. Only SENT mail is delayed; incoming mail is never held. 0 disables.
+    p.add_argument("--grace-seconds", type=float, default=15.0)
     args = p.parse_args()
 
     token_file = args.token_file or ACCOUNTS[args.account][0]
@@ -292,6 +332,9 @@ def main():
     after = max(baseline, int(time.time() - args.lookback_hours * 3600))
     q = "%s after:%d" % (args.query, after)
 
+    self_ids = load_self_ids(args.state_dir, acct)  # worker's own sent-mail ids
+    now_epoch = time.time()
+
     out = []
     try:
         token = token_or_exit(cache_path, token_uri, cid, csec, refresh_token)
@@ -306,6 +349,10 @@ def main():
 
         refreshed = False
         for mid in ids:
+            # Echo suppression: skip mail THIS worker sent (recorded by the
+            # PostToolUse hook). Human + third-party mail carry other ids -> pass.
+            if mid.lower() in self_ids:
+                continue
             meta, mstatus = get_meta(token, mid)
             if mstatus == 401 and not refreshed:  # token expired mid-loop -> refresh once
                 refreshed = True
@@ -315,6 +362,18 @@ def main():
                 if mstatus not in (200, 404):
                     sys.stderr.write("gmail-messages: get %s -> HTTP %s\n" % (mid, mstatus))
                 continue
+            # Race grace (Codex): the ledger is written just after send_email, but
+            # this poller is independent — a just-sent message can be searchable
+            # before the ledger lands. Defer SENT mail younger than --grace-seconds;
+            # baseline isn't advanced on print, so it's reconsidered next poll (by
+            # which time the ledger has it). Incoming mail (no SENT label) is never
+            # delayed. A human's own send is merely delayed ~grace, not lost.
+            if args.grace_seconds > 0 and "SENT" in meta.get("labelIds", []):
+                try:
+                    if int(meta["internalDate"]) / 1000.0 > (now_epoch - args.grace_seconds):
+                        continue
+                except (ValueError, TypeError, KeyError):
+                    pass
             out.append("[gmail id=%s %s] %s — %s: %s" % (
                 sanitize(mid, 40), sanitize(meta["date"], 40),
                 sanitize(meta["from"], HDR_LIMIT), sanitize(meta["subject"], HDR_LIMIT),
