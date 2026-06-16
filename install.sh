@@ -187,11 +187,14 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-control-run claude-control-logrotate \
+for script in claude-rc claude-auto claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-url-notify; do
   install_script "$script"
 done
+# NB: only `claude-auto` (the worker management CLI) goes on PATH. Its internal
+# helpers (claude-auto-run/-identity/-heartbeat/-notify/-reconciler) are invoked
+# by the systemd units/hooks via absolute path and stay out of PATH on purpose.
 
 # --- runtime files (examples, idempotent) -----------------------------------
 

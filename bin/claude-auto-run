@@ -122,11 +122,18 @@ else
   say "launching: ${seeded:+resume }$session_id mode=$mode cwd=$cwd"
   # tmux -e passes env with NO shell parsing (robust). Worker-scoped env points
   # event-bridge at this worker's probe config + dedup state.
+  # Suppress the interactive "resume from summary / full / don't ask" prompt that
+  # claude shows for a large/old session on --resume. A headless worker has no one
+  # to answer it and would WEDGE on every restart/reboot once its session grows.
+  # Push both thresholds out of reach so the worker always resumes FULL (no context
+  # loss) non-interactively; unbounded growth is handled by controlled compaction.
   tmux new-session -d -s "$sess" -c "$cwd" \
     -e "EVENT_BRIDGE_CONFIG=$home/event-bridge.config.json" \
     -e "EVENT_BRIDGE_STATE_DIR=$home/state" \
     -e "CLAUDE_AUTO_NAME=$name" \
     -e "CLAUDE_AUTO_HOME=$home" \
+    -e "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=999999999" \
+    -e "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=999999999" \
     "${args[@]}" 2>>"$log" \
     || { say "tmux new-session failed"; exit 1; }
 

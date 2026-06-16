@@ -18,6 +18,9 @@
 #   set-probes <name> <config.json>   swap the worker's probes live (no re-adopt,
 #                                     no restart; watcher reloads in ~5s). Driven by
 #                                     the /worker-probes operator skill.
+#   upgrade <name>                    retrofit an existing worker to the current
+#                                     template (identity hook + CLAUDE.md sections)
+#                                     without re-adopt; restarts (resumes same session)
 #   install-units  (re)render the systemd templates + enable the reconciler timer
 #
 # adopt is normally invoked by the /go-autonomous slash command, which gathers
@@ -27,7 +30,13 @@
 #       [--probe-config <json>] [--mode acceptEdits] [--model <m>]
 set -u
 
-BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve through symlinks: claude-auto is symlinked into ~/.local/bin (PATH), but
+# BIN_DIR must point at the REPO bin/ — its siblings (claude-auto-run, -identity,
+# -heartbeat, -notify, -reconciler) are NOT on PATH, and `install-units` renders
+# __BIN_DIR__ into the unit files from here. A naive dirname "$0" would yield the
+# symlink dir and break both.
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 REPO_DIR="$(cd "$BIN_DIR/.." && pwd)"
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 WORKERS_DIR="$CONTROL_DIR/workers"
@@ -39,6 +48,34 @@ die() { echo "claude-auto: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 have jq || die "jq required"
 ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Identity + event-bridge awareness sections for a worker's CLAUDE.md (the STATIC
+# base layer; the dynamic, live-probe-list version is the SessionStart hook
+# claude-auto-identity). Shared by `adopt` (fresh worker) and `upgrade` (retrofit
+# an existing worker). $1 = worker name. Backticks are escaped for echo.
+emit_identity_sections() {
+  local name="$1"
+  echo "## Who you are (read this first)"
+  echo
+  echo "You are the autonomous worker \`$name\`, created by forking a planning/origin"
+  echo "session. The conversation history may show an assistant discussing \"the worker\""
+  echo "in the third person and planning what it should do — that assistant is YOU,"
+  echo "before the fork. You are \`$name\` now: the worker itself, not the origin. Act on"
+  echo "the mission as \`$name\`; never wait for, defer to, or impersonate the origin."
+  echo
+  echo "## How you are woken (event-bridge)"
+  echo
+  echo "Cheap external probes watch sources for you and wake you with a turn tagged"
+  echo "\`[event-bridge | source=… ]\` ONLY when a real event happens — at zero model cost"
+  echo "while idle. Do NOT poll those sources yourself with the model (no repeated \"let me"
+  echo "check the inbox / Asana\" loops); the probes do it for free and will wake you. Probe"
+  echo "types the operator can enable: gmail, asana, telegram, timer. The exact set active"
+  echo "right now is shown to you at session start. Changing probes is the OPERATOR's job"
+  echo "(the \`/worker-probes\` tool) — do NOT draft your own probe config or re-adopt"
+  echo "command, and never change what you monitor or your own bounds. Recommend changes in"
+  echo "your output and let the operator act."
+  echo
+}
 
 ensure_registry() {
   mkdir -p "$CONTROL_DIR" "$WORKERS_DIR"
@@ -186,26 +223,7 @@ cmd_adopt() {
     echo "You are running UNATTENDED as an autonomous worker. The operator checks in"
     echo "occasionally; between check-ins you act on your own within the bounds below."
     echo
-    echo "## Who you are (read this first)"
-    echo
-    echo "You are the autonomous worker \`$name\`, created by forking a planning/origin"
-    echo "session. The conversation history may show an assistant discussing \"the worker\""
-    echo "in the third person and planning what it should do — that assistant is YOU,"
-    echo "before the fork. You are \`$name\` now: the worker itself, not the origin. Act on"
-    echo "the mission as \`$name\`; never wait for, defer to, or impersonate the origin."
-    echo
-    echo "## How you are woken (event-bridge)"
-    echo
-    echo "Cheap external probes watch sources for you and wake you with a turn tagged"
-    echo "\`[event-bridge | source=… ]\` ONLY when a real event happens — at zero model cost"
-    echo "while idle. Do NOT poll those sources yourself with the model (no repeated \"let me"
-    echo "check the inbox / Asana\" loops); the probes do it for free and will wake you. Probe"
-    echo "types the operator can enable: gmail, asana, telegram, timer. The exact set active"
-    echo "right now is shown to you at session start. Changing probes is the OPERATOR's job"
-    echo "(the \`/worker-probes\` tool) — do NOT draft your own probe config or re-adopt"
-    echo "command, and never change what you monitor or your own bounds. Recommend changes in"
-    echo "your output and let the operator act."
-    echo
+    emit_identity_sections "$name"
     echo "## Mission"
     echo
     [ -n "$mtext" ] && echo "$mtext" || echo "(no mission set — ask the operator before acting)"
@@ -523,6 +541,61 @@ cmd_set_probes() {
     || echo "  note: worker is not running — the new config applies on next start."
 }
 
+# upgrade <name> — retrofit an EXISTING worker to the current template WITHOUT a
+# re-adopt (which would re-fork the origin and lose the worker's accumulated
+# conversation). Idempotently: (1) wire the SessionStart identity hook into
+# settings.json + add the Bash(claude-auto:*) deny; (2) insert the static
+# Who-you-are / How-you-are-woken sections into CLAUDE.md. Settings + system
+# prompt are read at LAUNCH, so applying them needs a real relaunch of `claude` —
+# a plain `systemctl restart` is NOT enough (the tmux session survives it). So we
+# stop+start, which kills the tmux session and brings up a fresh `claude --resume
+# <W>` (SAME session id → full context preserved; the identity hook then fires).
+# Only restarts if something actually changed (no needless interruption).
+cmd_upgrade() {
+  local name="${1:?usage: upgrade <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  local home="$WORKERS_DIR/$name"
+  local s="$home/settings.json" c="$home/CLAUDE.md"
+  [ -f "$s" ] || die "upgrade: no settings.json for '$name'"
+  local -a changed=()
+
+  # 1) settings.json — SessionStart->identity hook + claude-auto deny (idempotent)
+  local idcmd="$BIN_DIR/claude-auto-identity $name" t
+  t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
+  jq --arg idcmd "$idcmd" '
+    .hooks = (.hooks // {})
+    | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
+        then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [{hooks:[{type:"command", command:$idcmd}]}]) end)
+    | .permissions = (.permissions // {})
+    | (if ((.permissions.deny // []) | any(. == "Bash(claude-auto:*)"))
+        then . else .permissions.deny = ((.permissions.deny // []) + ["Bash(claude-auto:*)"]) end)
+  ' "$s" > "$t" 2>/dev/null && jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "upgrade: settings.json patch failed"; }
+  if cmp -s "$t" "$s"; then rm -f "$t"; else chmod 600 "$t" 2>/dev/null||true; mv "$t" "$s"; changed+=("settings.json"); fi
+
+  # 2) CLAUDE.md — insert identity/awareness sections before the first "## Mission"
+  # (idempotent: skip if already present). Two awk passes avoid -v escaping.
+  if [ -f "$c" ] && ! grep -q '^## Who you are' "$c"; then
+    if grep -q '^## Mission' "$c"; then
+      local ct; ct="$(mktemp "$home/.cm.XXXXXX")" || die "upgrade: mktemp failed"
+      { awk '/^## Mission/{exit} {print}' "$c"
+        emit_identity_sections "$name"
+        awk '/^## Mission/{p=1} p' "$c"
+      } > "$ct" && mv "$ct" "$c" && changed+=("CLAUDE.md") || { rm -f "$ct"; die "upgrade: CLAUDE.md patch failed"; }
+    else
+      echo "upgrade: '$name' CLAUDE.md has no '## Mission' anchor — skipped CLAUDE.md (settings still patched)" >&2
+    fi
+  fi
+
+  if [ "${#changed[@]}" -eq 0 ]; then
+    echo "upgrade: '$name' already up to date — nothing changed, no restart."
+    return 0
+  fi
+  echo "upgrade: '$name' patched (${changed[*]}). Restarting to apply (resumes the SAME session — context preserved)…"
+  cmd_stop "$name"  >/dev/null
+  cmd_start "$name" >/dev/null
+  echo "upgrade: '$name' done — SessionStart identity hook now active; reconnect: tmux attach -t claude-$name"
+}
+
 # ---- dispatch --------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "$sub" in
@@ -534,6 +607,7 @@ case "$sub" in
   remove) cmd_remove "$@" ;;
   get-probes) cmd_get_probes "$@" ;;
   set-probes) cmd_set_probes "$@" ;;
+  upgrade) cmd_upgrade "$@" ;;
   install-units) cmd_install_units ;;
   ""|-h|--help) sed -n '1,40p' "$0" | sed 's/^# \?//' ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
