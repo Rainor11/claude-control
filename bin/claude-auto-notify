@@ -36,7 +36,21 @@ stamp="$statedir/.last_notify"
   echo "$now" > "$stamp" 2>/dev/null || true
 
   [ -x "$TG" ] || exit 0
-  "$TG" "🤖 autoworker \`$name\` needs you: ${msg}
-Attach: tmux attach -t claude-$name" >/dev/null 2>&1 || true
+
+  # Friendly Russian framing. Claude Code's raw .message is English ("Claude is
+  # waiting for your input" / "Claude needs your permission to use <tool>").
+  # Translate the two common cases; fall back to the raw text for anything else.
+  case "$msg" in
+    *"waiting for your input"*)  human="Ждёт твоего ответа в чате" ;;
+    *"permission"*|*"approve"*)  human="Просит разрешение на действие — нужно подтвердить или отклонить" ;;
+    *)                           human="$msg" ;;
+  esac
+
+  "$TG" "🤖 Агент «$name» ждёт тебя
+
+⏳ ${human}
+
+👉 Открыть: tmux attach -t claude-$name
+   (выйти из окна: Ctrl-b, затем d)" >/dev/null 2>&1 || true
 } 2>/dev/null
 exit 0
