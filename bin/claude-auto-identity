@@ -81,10 +81,20 @@ $probes_block
 Probe types your operator can enable: gmail (email query), asana (task comments),
 telegram (messages from a contact), timer (periodic tick).
 
-Changing which probes run is the OPERATOR's job (the /worker-probes tool). Do NOT draft
-your own probe config, re-adopt command, or otherwise try to change what you monitor or
-your own bounds. If you think a probe should change, just say so in your output and let
-the operator act.
+You MAY manage YOUR OWN sensors with the claude-auto-self-probes tool (changes only what
+wakes you — applies within ~5s, no restart; the operator is pinged on every change):
+  claude-auto-self-probes list
+  claude-auto-self-probes retime <name> <seconds>      # change a probe's polling period
+  claude-auto-self-probes remove <name>                # drop a sensor you no longer need
+  claude-auto-self-probes add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H]
+  claude-auto-self-probes add --type tg    --name N --chat-id <id>
+  claude-auto-self-probes add --type asana --name N --task <gid> [--author <gid>]
+  claude-auto-self-probes add --type timer --name N --label <label>
+This only changes YOUR OWN probes — you cannot touch other workers' sensors. Adding a
+probe gives you a new DATA FEED, not new powers: acting on what a probe brings is STILL
+gated by your allow/ask permissions. You CANNOT change your own permissions (allow/ask/
+deny) — that stays the operator's job; if you need a permission widened, say so in your
+output. (The `emit-lines` file-watch adapter is operator-only.)
 EOF
 )"
 

@@ -140,6 +140,21 @@ cmd_adopt() {
   [ -d "$cwd" ] || die "adopt: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"  # absolutize
 
+  # Fail fast if --cwd doesn't match the project the ORIGIN session lives in. The
+  # worker boots via `claude --resume <origin> --fork-session`, which resolves the
+  # origin transcript by project = encoded(cwd). A wrong --cwd → resume can't find
+  # it → claude exits instantly → the unit crash-loops (NRestarts climbs, tmux never
+  # holds). Locate the origin transcript by its globally-unique id (slug-agnostic),
+  # then compare the cwd RECORDED in it (authoritative) to --cwd. Missing-cwd in an
+  # old transcript: skip the compare (can't validate) but still require it to exist.
+  local _otrans _ocwd
+  _otrans="$(ls -1 "$HOME/.claude/projects"/*/"$session.jsonl" 2>/dev/null | head -1)"
+  [ -n "$_otrans" ] || die "adopt: origin session '$session' not found under ~/.claude/projects — wrong id, or it never ran on this machine?"
+  _ocwd="$(jq -r 'select(.cwd != null) | .cwd' "$_otrans" 2>/dev/null | head -1)"
+  if [ -n "$_ocwd" ] && [ "$_ocwd" != "$cwd" ]; then
+    die "adopt: --cwd '$cwd' != the origin session's cwd '$_ocwd'. Pass --cwd matching where the origin ran (resume resolves the fork by project=cwd)."
+  fi
+
   # Validate + normalize the probe config NOW (fail fast, before creating any
   # files) through the SAME hardening as set-probes — adopt must NOT be a bypass
   # that raw-copies an arbitrary config into the live event feed.
@@ -285,9 +300,19 @@ cmd_adopt() {
   deny_json=$(printf '%s\n' "${deny[@]:-}" \
     "Edit(//${home#/}/**)" "Write(//${home#/}/**)" \
     "Edit(//${CONTROL_DIR#/}/**)" "Write(//${CONTROL_DIR#/}/**)" \
-    "Bash(claude-auto:*)" \
+    "Edit(//${REPO_DIR#/}/**)" "Write(//${REPO_DIR#/}/**)" \
+    "Bash(claude-auto:*)" "Bash(tmux:*)" \
     | sed '/^$/d' | jq -R . | jq -s .)
-  allow_json=$(printf '%s\n' "${allow[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)
+  # Bash(claude-auto-self-probes:*): the worker MAY manage its OWN sensors (probes)
+  # — list/retime/remove/add the gmail|tg|asana|timer adapters — via the narrow
+  # self-probes tool (own-worker-only by /proc identity; never touches settings.json
+  # permissions; emit-lines is operator-only). `Bash(claude-auto:*)` stays denied (word
+  # boundary → does NOT match `claude-auto-self-probes`). `Bash(tmux:*)` denied so the
+  # worker can't forge the identity cross-check. Repo Edit/Write denied (the tool +
+  # adapters are the TCB — defense in depth; not a hard fence vs raw subprocess).
+  allow_json=$(printf '%s\n' "${allow[@]:-}" \
+    "Bash(claude-auto-self-probes:*)" \
+    | sed '/^$/d' | jq -R . | jq -s .)
   ask_json=$(printf '%s\n' "${ask[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)
 
   # Hooks: SessionStart (claude-auto-identity) re-asserts identity + runtime
@@ -300,6 +325,11 @@ cmd_adopt() {
   # echoes (worker shares the human's Asana identity AND Gmail mailbox, so author/
   # sender-filtering can't). Matcher is a |-alternation of exact tool names (Claude
   # Code treats [A-Za-z0-9_|]-only matchers as exact, not regex).
+  # enableAllProjectMcpServers: auto-approve the cwd's .mcp.json servers so an
+  # UNATTENDED worker never wedges on the interactive "N new MCP servers found"
+  # modal (which blocks the main loop + Remote Control registration on every
+  # start/reboot — nobody is there to press Enter). Server-enable is NOT tool-allow:
+  # MCP tool calls are still gated by permissions.allow/ask/deny below.
   jq -n \
     --argjson allow "$allow_json" --argjson ask "$ask_json" --argjson deny "$deny_json" \
     --arg identity "$BIN_DIR/claude-auto-identity $name" \
@@ -307,7 +337,8 @@ cmd_adopt() {
     --arg notify "$BIN_DIR/claude-auto-notify $name" \
     --arg ledger "$BIN_DIR/claude-auto-asana-self-ledger $home/state" \
     --arg gledger "$BIN_DIR/claude-auto-gmail-self-ledger $home/state" \
-    '{permissions:{allow:$allow, ask:$ask, deny:$deny},
+    '{enableAllProjectMcpServers: true,
+      permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
         PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story",
@@ -536,9 +567,20 @@ cmd_set_probes() {
   [ -n "$infile" ] || die "usage: set-probes <name> <config.json>"
   worker_exists "$name" || die "no worker '$name'"
   local home="$WORKERS_DIR/$name" statedir="$WORKERS_DIR/$name/state"
+  mkdir -p "$statedir"
+  # Shared RMW lock — also taken by claude-auto-self-probes, so an operator change
+  # and a worker self-change can't lose each other's updates. Skipped when the
+  # caller (self-probes) already holds it (a nested reopen would self-deadlock).
+  if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
+    # Acquire the shared RMW lock. If we can open it but can't acquire within 10s,
+    # someone else (a worker self-probe) is mid-change — FAIL rather than clobber.
+    # If we can't even open the lock file (rare), proceed best-effort.
+    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
+      flock -w 10 8 2>/dev/null || die "set-probes: busy (a probe change is in progress) — retry"
+    fi
+  fi
   local normalized; normalized="$(probes_validate_normalize "$infile" "$statedir")" || exit 1
 
-  mkdir -p "$statedir"
   local cfg="$home/event-bridge.config.json" t
   t="$(mktemp "$home/.eb.XXXXXX")" || die "set-probes: mktemp failed"
   ( umask 077; printf '%s\n' "$normalized" > "$t" ) || { rm -f "$t"; die "set-probes: write failed"; }
@@ -579,8 +621,9 @@ cmd_upgrade() {
   local ledgercmd="$BIN_DIR/claude-auto-asana-self-ledger $home/state"
   local gledgercmd="$BIN_DIR/claude-auto-gmail-self-ledger $home/state"
   t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
-  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" '
-    .hooks = (.hooks // {})
+  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" --arg repo "${REPO_DIR#/}" '
+    .enableAllProjectMcpServers = true
+    | .hooks = (.hooks // {})
     | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
         then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [{hooks:[{type:"command", command:$idcmd}]}]) end)
     | .hooks.PostToolUse = (
@@ -589,8 +632,13 @@ cmd_upgrade() {
         + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]},
            {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$gledgercmd}]}] )
     | .permissions = (.permissions // {})
-    | (if ((.permissions.deny // []) | any(. == "Bash(claude-auto:*)"))
-        then . else .permissions.deny = ((.permissions.deny // []) + ["Bash(claude-auto:*)"]) end)
+    | .permissions.deny = ((.permissions.deny // []) + ([
+          "Bash(claude-auto:*)", "Bash(tmux:*)",
+          ("Edit(//" + $repo + "/**)"), ("Write(//" + $repo + "/**)")
+        ] - (.permissions.deny // [])))
+    | .permissions.allow = ((.permissions.allow // []) + ([
+          "Bash(claude-auto-self-probes:*)"
+        ] - (.permissions.allow // [])))
   ' "$s" > "$t" 2>/dev/null && jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "upgrade: settings.json patch failed"; }
   if cmp -s "$t" "$s"; then rm -f "$t"; else chmod 600 "$t" 2>/dev/null||true; mv "$t" "$s"; changed+=("settings.json"); fi
 

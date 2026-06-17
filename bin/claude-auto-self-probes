@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# claude-auto-self-probes — let an autonomous worker manage ITS OWN event-bridge
+# probes (sensors) from inside its session: list / retime / remove / add.
+#
+# DESIGN (Codex-reviewed). What this does NOT let a worker do, by construction:
+#   * touch ANOTHER worker's probes — identity is derived from the ANCESTOR
+#     `claude` worker process's /proc environ (which the worker cannot forge),
+#     NOT from the inheritable CLAUDE_AUTO_NAME env (a worker could prefix
+#     `CLAUDE_AUTO_NAME=other ...`); cross-checked against the tmux session name.
+#   * change its permission gates — this writes ONLY event-bridge.config.json
+#     (probes), never settings.json. allow/ask/deny stay operator-only.
+#   * read arbitrary local files into context — `add` builds the adapter argv
+#     itself from typed params (forces --state-dir, never accepts --db /
+#     --creds-file / --token-file / --contacts), and only whitelisted SENSOR
+#     adapters (gmail/tg/asana/timer) may be added. The file-read adapter
+#     `emit-lines` is operator-only.
+#
+# Validation + atomic write + live reload are reused from `claude-auto set-probes`
+# (probes_validate_normalize). event-bridge-watch re-reads the config every ~5s,
+# so changes are live with NO restart. Every change pings the operator on Telegram.
+set -u
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CLAUDE_AUTO="$SELF_DIR/claude-auto"               # absolute sibling (not via PATH)
+ADAPTERS_DIR="$(cd "$SELF_DIR/.." 2>/dev/null && pwd)/channels/event-bridge/adapters"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+# Trusted claude install tree. HARDCODED on purpose (NOT $HOME / NOT an env var):
+# identity is accepted only when the ancestor's real exe lives here, so a worker
+# cannot redirect the check by setting HOME/env. A worker wrapping the call in
+# bash/python/sqlite gets an ancestor whose exe is the interpreter (outside this
+# tree) → rejected. (A worker with arbitrary code-exec in its allow list could
+# still defeat any same-user fence — the documented OS-sandbox ceiling.)
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"
+
+# Self-service policy bounds (operator via `claude-auto set-probes` is unbounded).
+MAX_PROBES=12              # ceiling on total probes per worker
+MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
+MAX_INTERVAL=604800        # 1 week
+MAX_LOOKBACK=336           # hours (14 days)
+WL_ADD='gmail tg asana timer'   # adapter TYPES a worker may ADD (NOT emit-lines)
+
+die() { echo "self-probes: $*" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || die "jq required"
+
+# ---- identity (spoof-resistant) -------------------------------------------
+# Walk the PPID chain to the worker's `claude` process — the one whose cmdline
+# carries `--resume` (a worker-spawned shell can fake CLAUDE_AUTO_NAME in its own
+# env, but cannot fabricate a `claude --resume` ancestor). Read THAT process's
+# CLAUDE_AUTO_NAME from /proc (own-user → readable; the worker cannot rewrite an
+# ancestor's environ).
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    # An ancestor qualifies only if it (1) has `--resume` as a standalone argv
+    # element AND (2) its REAL exe is inside the trusted claude tree (kernel-set,
+    # unfakeable via argv[0]/exec -a). This is what makes a bash/python/sqlite
+    # wrapper carrying a forged `--resume` + CLAUDE_AUTO_NAME fail to qualify.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+NAME="$(resolve_name)" || die "cannot determine worker identity (no ancestor 'claude --resume' with CLAUDE_AUTO_NAME) — run this from inside a worker session"
+[[ "$NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || die "resolved worker name '$NAME' has illegal chars"
+HOME_DIR="$CONTROL_DIR/workers/$NAME"
+CFG="$HOME_DIR/event-bridge.config.json"
+STATE_DIR="$HOME_DIR/state"
+[ -d "$HOME_DIR" ] || die "worker '$NAME' has no home ($HOME_DIR)"
+
+# Cross-check against the tmux session name when reachable (defense in depth; the
+# worker is also denied `tmux`). Mismatch ⇒ refuse. Unreachable ⇒ rely on /proc.
+_sess="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+if [ -n "$_sess" ] && [ "$_sess" != "claude-$NAME" ]; then
+  die "tmux session '$_sess' != expected 'claude-$NAME' — refusing (identity mismatch)"
+fi
+
+# ---- helpers ---------------------------------------------------------------
+LOCK="$STATE_DIR/.probes-rmw.lock"   # shared with claude-auto set-probes
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# Fail CLOSED on a present-but-unreadable config (don't silently treat damage as
+# empty — that would let `add` replace a malformed config with just the new probe).
+current_probes() {
+  [ -f "$CFG" ] || { echo '[]'; return 0; }
+  jq -ce '.probes // []' "$CFG" 2>/dev/null || die "current config unreadable/invalid ($CFG) — refusing to modify; operator should fix it"
+}
+
+# Take the shared RMW lock (also honored by `claude-auto set-probes`) for the whole
+# read→mutate→write, so a worker self-change and an operator set-probes can't clobber
+# each other. One-shot process: the lock auto-releases on exit.
+take_lock() {
+  exec 8>"$LOCK" 2>/dev/null || die "lock open failed"
+  flock -w 10 8 2>/dev/null || die "busy (another probe change in progress) — retry"
+}
+
+valid_interval() {
+  local iv="$1"
+  [[ "$iv" =~ ^[1-9][0-9]*$ ]] || die "interval must be a positive integer (seconds, no leading zeros)"
+  [ "$iv" -ge "$MIN_INTERVAL" ] || die "interval too small: min for self-service is ${MIN_INTERVAL}s (operator can set lower)"
+  [ "$iv" -le "$MAX_INTERVAL" ] || die "interval too large: max ${MAX_INTERVAL}s"
+}
+
+notify() {  # best-effort, sanitized (no raw args); never blocks the change
+  local msg="$1"
+  [ -x "$TG" ] || return 0
+  "$TG" "🔧 Датчики воркера «$NAME»: $msg" >/dev/null 2>&1 || true
+}
+
+# Apply a new probes array (compact JSON) via the operator validator. flock covers
+# the whole read-modify-write so concurrent self/operator changes can't lose updates.
+apply_probes() {
+  local new_arr="$1" action="$2"
+  printf '%s' "$new_arr" | jq -e 'type=="array"' >/dev/null 2>&1 || die "internal: new probes not an array"
+  local n; n="$(printf '%s' "$new_arr" | jq 'length')"
+  [ "$n" -le "$MAX_PROBES" ] || die "too many probes ($n > $MAX_PROBES) — remove one first"
+  local tmp; tmp="$(mktemp "$HOME_DIR/.sp.XXXXXX")" || die "mktemp failed"
+  printf '%s\n' "$new_arr" | jq '{probes: .}' > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "build config failed"; }
+  # We already hold the shared lock (take_lock). Tell set-probes to skip re-locking
+  # the SAME lock (a nested reopen would self-deadlock). Only this trusted binary
+  # sets the flag; the worker cannot call set-probes directly (claude-auto denied).
+  if CLAUDE_AUTO_PROBES_LOCKED=1 "$CLAUDE_AUTO" set-probes "$NAME" "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    notify "$action"
+    echo "OK: $action. Активные датчики:"; cmd_list
+  else
+    rm -f "$tmp"
+    die "set-probes rejected the change (validation failed) — config unchanged"
+  fi
+}
+
+# ---- subcommands -----------------------------------------------------------
+cmd_list() {  # redacted: name/source/adapter/interval only — no queries/ids/args
+  current_probes | jq -r '
+    if length==0 then "  (датчиков нет)"
+    else .[] | "  • " + (.name // "?") + "  [" + (.source // "?") + "/"
+               + ((.cmd[0] // "" | split("/") | last)) + "]  interval="
+               + ((.interval_sec // "?")|tostring) + "s"
+    end'
+}
+
+cmd_retime() {
+  local name="${1:-}" iv="${2:-}"
+  [ -n "$name" ] && [ -n "$iv" ] || die "usage: retime <probe-name> <interval-seconds>"
+  valid_interval "$iv"
+  take_lock
+  local cur; cur="$(current_probes)"
+  printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null 2>&1 || die "no probe named '$name' (see: list)"
+  local new; new="$(printf '%s' "$cur" | jq -c --arg n "$name" --argjson iv "$iv" 'map(if .name==$n then .interval_sec=$iv else . end)')"
+  apply_probes "$new" "перенастроен интервал '$name' → ${iv}s"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: remove <probe-name>"
+  take_lock
+  local cur; cur="$(current_probes)"
+  printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null 2>&1 || die "no probe named '$name' (see: list)"
+  local new; new="$(printf '%s' "$cur" | jq -c --arg n "$name" 'map(select(.name != $n))')"
+  apply_probes "$new" "удалён датчик '$name'"
+}
+
+# add: build the adapter argv ourselves from typed params (NEVER a raw cmd).
+cmd_add() {
+  local type="" name="" query="" account="alp" chat_id="" task="" author="" label="" lookback="" interval=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type) type="${2:-}"; shift 2 ;;
+      --name) name="${2:-}"; shift 2 ;;
+      --query) query="${2:-}"; shift 2 ;;
+      --account) account="${2:-}"; shift 2 ;;
+      --chat-id) chat_id="${2:-}"; shift 2 ;;
+      --task) task="${2:-}"; shift 2 ;;
+      --author) author="${2:-}"; shift 2 ;;
+      --label) label="${2:-}"; shift 2 ;;
+      --lookback-hours) lookback="${2:-}"; shift 2 ;;
+      --interval) interval="${2:-}"; shift 2 ;;
+      *) die "add: unknown option '$1'" ;;
+    esac
+  done
+  case " $WL_ADD " in *" $type "*) ;; *) die "add: --type must be one of: $WL_ADD (emit-lines is operator-only)";; esac
+  [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "add: --name required, chars [a-zA-Z0-9_.-]"
+  take_lock
+  current_probes | jq -e --arg n "$name" 'any(.[]; .name==$n) | not' >/dev/null 2>&1 || die "add: probe '$name' already exists (remove it first)"
+
+  # interval default per type + floor
+  [ -n "$interval" ] || { [ "$type" = timer ] && interval=86400 || interval=3600; }
+  valid_interval "$interval"
+  if [ -n "$lookback" ]; then
+    printf '%s' "$lookback" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "add: --lookback-hours must be a number"
+    awk -v l="$lookback" -v m="$MAX_LOOKBACK" 'BEGIN{exit !(l<=m)}' || die "add: --lookback-hours max $MAX_LOOKBACK"
+  fi
+
+  local adapter source cmd_json
+  case "$type" in
+    gmail)
+      [ -n "$query" ] || die "add gmail: --query required"
+      # Reject control chars / newlines in the query: event-bridge-watch rebuilds
+      # argv per cmd element, so a newline-laden value would split into EXTRA argv
+      # (e.g. inject --token-file/--creds-file into gmail-messages). A Gmail search
+      # query never needs control chars. (event-bridge-watch is also NUL-hardened.)
+      # NOTE: `grep '[[:cntrl:]]'` does NOT catch newlines (grep is line-oriented —
+      # a newline is the line separator, never seen as in-line content). Use a bash
+      # glob over the control-char ranges, which matches the WHOLE string incl. \n.
+      case "$query" in
+        *[$'\001'-$'\037']*|*$'\177'*) die "add gmail: --query must not contain control characters or newlines" ;;
+      esac
+      case "$account" in alp|rainor) ;; *) die "add gmail: --account must be alp or rainor";; esac
+      adapter="$ADAPTERS_DIR/gmail-messages"; source="gmail"
+      cmd_json="$(jq -nc --arg a "$adapter" --arg q "$query" --arg acc "$account" \
+        --arg lb "${lookback:-72}" --arg sd "$STATE_DIR" \
+        '[$a,"--query",$q,"--account",$acc,"--lookback-hours",$lb,"--state-dir",$sd]')" ;;
+    tg)
+      printf '%s' "$chat_id" | grep -qE '^-?[0-9]+$' || die "add tg: --chat-id <numeric> required"
+      adapter="$ADAPTERS_DIR/tg-messages"; source="telegram"
+      cmd_json="$(jq -nc --arg a "$adapter" --arg c "$chat_id" \
+        --arg lb "${lookback:-48}" --arg sd "$STATE_DIR" \
+        '[$a,"--chat-id",$c,"--lookback-hours",$lb,"--state-dir",$sd]')" ;;
+    asana)
+      printf '%s' "$task" | grep -qE '^[0-9]+$' || die "add asana: --task <numeric gid> required"
+      adapter="$ADAPTERS_DIR/asana-comments"; source="asana"
+      if [ -n "$author" ]; then
+        printf '%s' "$author" | grep -qE '^[0-9]+$' || die "add asana: --author must be a numeric gid"
+        cmd_json="$(jq -nc --arg a "$adapter" --arg t "$task" --arg au "$author" --arg sd "$STATE_DIR" \
+          '[$a,"--task",$t,"--author",$au,"--state-dir",$sd]')"
+      else
+        cmd_json="$(jq -nc --arg a "$adapter" --arg t "$task" --arg sd "$STATE_DIR" \
+          '[$a,"--task",$t,"--state-dir",$sd]')"
+      fi ;;
+    timer)
+      [[ "$label" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "add timer: --label required, chars [a-zA-Z0-9_.-]"
+      adapter="$ADAPTERS_DIR/timer-tick"; source="timer"
+      cmd_json="$(jq -nc --arg a "$adapter" --arg l "$label" '[$a,$l]')" ;;
+  esac
+  # realpath guard: the constructed adapter must be a regular (non-symlink) file
+  # in the trusted adapters dir (TCB), not a swapped symlink.
+  [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ] || die "add: adapter '$adapter' missing / not a regular executable"
+
+  local probe new
+  probe="$(jq -nc --arg n "$name" --arg s "$source" --argjson iv "$interval" --argjson c "$cmd_json" \
+    '{name:$n, source:$s, interval_sec:$iv, cmd:$c}')"
+  new="$(current_probes | jq -c --argjson p "$probe" '. + [$p]')"
+  apply_probes "$new" "добавлен датчик '$name' ($source, interval ${interval}s)"
+}
+
+# ---- dispatch --------------------------------------------------------------
+sub="${1:-}"; shift || true
+case "$sub" in
+  list)   cmd_list ;;
+  retime) cmd_retime "$@" ;;
+  remove) cmd_remove "$@" ;;
+  add)    cmd_add "$@" ;;
+  ""|-h|--help)
+    cat <<USAGE
+claude-auto-self-probes — управление СВОИМИ датчиками (event-bridge probes).
+Действует только на текущего воркера; разрешения (allow/ask/deny) не меняет.
+Каждое изменение уведомляет оператора. Применяется за ~5с без рестарта.
+
+  list
+  retime <имя> <интервал-сек>         (мин ${MIN_INTERVAL}с)
+  remove <имя>
+  add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S]
+  add --type tg    --name N --chat-id <id> [--lookback-hours H] [--interval S]
+  add --type asana --name N --task <gid> [--author <gid>] [--interval S]
+  add --type timer --name N --label <label> [--interval S]
+USAGE
+    ;;
+  *) die "unknown subcommand '$sub' (try --help)" ;;
+esac

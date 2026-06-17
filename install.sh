@@ -187,14 +187,16 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-auto claude-control-run claude-control-logrotate \
+for script in claude-rc claude-auto claude-auto-self-probes claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-url-notify; do
   install_script "$script"
 done
-# NB: only `claude-auto` (the worker management CLI) goes on PATH. Its internal
-# helpers (claude-auto-run/-identity/-heartbeat/-notify/-reconciler) are invoked
-# by the systemd units/hooks via absolute path and stay out of PATH on purpose.
+# NB: `claude-auto` (operator worker-management CLI) and `claude-auto-self-probes`
+# (worker self-manages its OWN sensors; must be on PATH so the `Bash(claude-auto-self-probes:*)`
+# allow rule matches the bare command) go on PATH. Internal helpers
+# (claude-auto-run/-identity/-heartbeat/-notify/-reconciler) are invoked by the
+# systemd units/hooks via absolute path and stay out of PATH on purpose.
 
 # --- runtime files (examples, idempotent) -----------------------------------
 
