@@ -38,7 +38,7 @@ MAX_PROBES=12              # ceiling on total probes per worker
 MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
 MAX_INTERVAL=604800        # 1 week
 MAX_LOOKBACK=336           # hours (14 days)
-WL_ADD='gmail tg asana timer'   # adapter TYPES a worker may ADD (NOT emit-lines)
+WL_ADD='gmail tg asana timer date-gate'   # adapter TYPES a worker may ADD (NOT emit-lines)
 REASON=""                       # optional operator-facing reason (--reason) for a change
 
 die() { echo "self-probes: $*" >&2; exit 1; }
@@ -190,19 +190,27 @@ cmd_remove() {
 
 # add: build the adapter argv ourselves from typed params (NEVER a raw cmd).
 cmd_add() {
-  local type="" name="" query="" account="alp" chat_id="" task="" author="" label="" lookback="" interval=""
+  local type="" name="" query="" account="alp" chat_id="" task="" author="" label="" lookback="" interval="" gate="" message=""
+  # Every value-taking flag consumes its value with the SAME guarded pattern as
+  # --reason: `shift; [ $# -gt 0 ] && shift || true`. A bare `shift 2` on a trailing
+  # valueless flag (e.g. `... --message`) fails ("count out of range") but leaves $#
+  # unchanged under `set -u`/no-`set -e` → the while loop spins forever. The guard
+  # shifts the flag, then the value only if one is present (a missing value is then
+  # caught by the per-type required-arg checks below).
   while [ $# -gt 0 ]; do
     case "$1" in
-      --type) type="${2:-}"; shift 2 ;;
-      --name) name="${2:-}"; shift 2 ;;
-      --query) query="${2:-}"; shift 2 ;;
-      --account) account="${2:-}"; shift 2 ;;
-      --chat-id) chat_id="${2:-}"; shift 2 ;;
-      --task) task="${2:-}"; shift 2 ;;
-      --author) author="${2:-}"; shift 2 ;;
-      --label) label="${2:-}"; shift 2 ;;
-      --lookback-hours) lookback="${2:-}"; shift 2 ;;
-      --interval) interval="${2:-}"; shift 2 ;;
+      --type) type="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --name) name="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --query) query="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --account) account="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --chat-id) chat_id="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --task) task="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --author) author="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --label) label="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --lookback-hours) lookback="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --interval) interval="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --at) gate="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --message) message="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --reason) REASON="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       *) die "add: unknown option '$1'" ;;
     esac
@@ -260,6 +268,26 @@ cmd_add() {
       [[ "$label" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "add timer: --label required, chars [a-zA-Z0-9_.-]"
       adapter="$ADAPTERS_DIR/timer-tick"; source="timer"
       cmd_json="$(jq -nc --arg a "$adapter" --arg l "$label" '[$a,$l]')" ;;
+    date-gate)
+      # One-shot reminder at a date: date-gate stays silent until the gate date, then
+      # emits the message once (bridge dedups by line hash). Stateless → NO --state-dir.
+      printf '%s' "$gate" | grep -qE '^[0-9]{8}$' || die "add date-gate: --at <YYYYMMDD> (exactly 8 digits) required"
+      date -d "${gate:0:4}-${gate:4:2}-${gate:6:2}" >/dev/null 2>&1 || die "add date-gate: --at '$gate' is not a valid calendar date"
+      # Reject a past gate: it would fire immediately on the next poll (no future event
+      # to wait for) — almost always a mistake. Today is allowed (= wake on next poll).
+      [ "$gate" -ge "$(date +%Y%m%d)" ] || die "add date-gate: --at '$gate' is in the past"
+      [ -n "$message" ] || die "add date-gate: --message required (the reminder text you'll be woken with)"
+      # The message is emitted VERBATIM as the event line and is also a cmd argv element;
+      # event-bridge-watch rebuilds argv line-by-line (mapfile/jq -r .cmd[]). A control
+      # char / newline would split the line → corrupt the single-line event frame. A
+      # reminder never needs them. (Same guard as gmail --query; matches the WHOLE string
+      # incl. \n via a bash glob, since grep is line-oriented and never sees a newline.)
+      case "$message" in
+        *[$'\001'-$'\037']*|*$'\177'*) die "add date-gate: --message must not contain control characters or newlines" ;;
+      esac
+      message="${message:0:500}"   # bound the event frame; bash substring is char-safe in UTF-8
+      adapter="$ADAPTERS_DIR/date-gate"; source="date-gate"
+      cmd_json="$(jq -nc --arg a "$adapter" --arg g "$gate" --arg m "$message" '[$a,$g,$m]')" ;;
   esac
   # realpath guard: the constructed adapter must be a regular (non-symlink) file
   # in the trusted adapters dir (TCB), not a swapped symlink.
@@ -289,10 +317,16 @@ claude-auto-self-probes — управление СВОИМИ датчиками
   list
   retime <имя> <интервал-сек> [--reason "..."]        (мин ${MIN_INTERVAL}с)
   remove <имя> [--reason "..."]
-  add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S] [--reason "..."]
-  add --type tg    --name N --chat-id <id> [--lookback-hours H] [--interval S] [--reason "..."]
-  add --type asana --name N --task <gid> [--author <gid>] [--interval S] [--reason "..."]
-  add --type timer --name N --label <label> [--interval S] [--reason "..."]
+  add --type gmail     --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S] [--reason "..."]
+  add --type tg        --name N --chat-id <id> [--lookback-hours H] [--interval S] [--reason "..."]
+  add --type asana     --name N --task <gid> [--author <gid>] [--interval S] [--reason "..."]
+  add --type date-gate --name N --at <YYYYMMDD> --message "..." [--interval S] [--reason "..."]
+        разовое напоминание к дате — будит ОДИН раз на/после даты, потом молчит.
+        ПРЕДПОЧТИТЕЛЬНО для напоминаний «сделать X к <дате>». После срабатывания
+        (увидишь probe=<имя> в теге пробуждения) — remove, чтобы освободить слот.
+  add --type timer     --name N --label <label> [--interval S] [--reason "..."]
+        повторяющийся тик — будит и тратит токены КАЖДЫЙ интервал; только для
+        НАСТОЯЩЕЙ повторяющейся работы, не для разовой даты (для неё — date-gate).
 USAGE
     ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;

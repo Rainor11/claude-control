@@ -78,9 +78,18 @@ emit_identity_sections() {
   echo "  claude-auto-self-probes list"
   echo "  claude-auto-self-probes retime <name> <seconds> [--reason \"...\"]"
   echo "  claude-auto-self-probes remove <name> [--reason \"...\"]"
-  echo "  claude-auto-self-probes add --type gmail|tg|asana|timer --name N … [--reason \"...\"]"
+  echo "  claude-auto-self-probes add --type gmail|tg|asana --name N … [--reason \"...\"]"
+  echo "  claude-auto-self-probes add --type date-gate --name N --at <YYYYMMDD> --message \"…\"   # one-shot reminder at a date"
+  echo "  claude-auto-self-probes add --type timer     --name N --label <label>                  # recurring tick"
   echo "Add \`--reason \"…\"\` so the operator sees WHY. This touches only YOUR probes — never"
   echo "another worker's. (The \`emit-lines\` file-watch adapter is operator-only.)"
+  echo
+  echo "Scheduling — which to use:"
+  echo "- A one-shot reminder \"do X by <date>\" → \`date-gate\`: it wakes you ONCE on that day"
+  echo "  then stays silent (cheap). After it fires you'll see \`probe=<name>\` in the wake tag —"
+  echo "  \`remove\` it then to free a slot, and give each reminder a UNIQUE name."
+  echo "- \`timer\` ONLY for genuinely RECURRING work: it wakes you (and spends tokens) on EVERY"
+  echo "  interval. Do NOT use a timer to fake a one-off deadline — use \`date-gate\` for that."
   echo
   echo "## How you run (auto mode)"
   echo
