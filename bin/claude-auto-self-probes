@@ -39,6 +39,7 @@ MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
 MAX_INTERVAL=604800        # 1 week
 MAX_LOOKBACK=336           # hours (14 days)
 WL_ADD='gmail tg asana timer'   # adapter TYPES a worker may ADD (NOT emit-lines)
+REASON=""                       # optional operator-facing reason (--reason) for a change
 
 die() { echo "self-probes: $*" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || die "jq required"
@@ -131,8 +132,13 @@ apply_probes() {
   # sets the flag; the worker cannot call set-probes directly (claude-auto denied).
   if CLAUDE_AUTO_PROBES_LOCKED=1 "$CLAUDE_AUTO" set-probes "$NAME" "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"
-    notify "$action"
-    echo "OK: $action. Активные датчики:"; cmd_list
+    local note="$action"
+    if [ -n "$REASON" ]; then
+      local r; r="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
+      [ -n "$r" ] && note="$action — причина: $r"
+    fi
+    notify "$note"
+    echo "OK: $note. Активные датчики:"; cmd_list
   else
     rm -f "$tmp"
     die "set-probes rejected the change (validation failed) — config unchanged"
@@ -150,8 +156,14 @@ cmd_list() {  # redacted: name/source/adapter/interval only — no queries/ids/a
 }
 
 cmd_retime() {
-  local name="${1:-}" iv="${2:-}"
-  [ -n "$name" ] && [ -n "$iv" ] || die "usage: retime <probe-name> <interval-seconds>"
+  local name="" iv=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) REASON="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      *) if [ -z "$name" ]; then name="$1"; elif [ -z "$iv" ]; then iv="$1"; else die "retime: unexpected arg '$1'"; fi; shift ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$iv" ] || die "usage: retime <probe-name> <interval-seconds> [--reason \"...\"]"
   valid_interval "$iv"
   take_lock
   local cur; cur="$(current_probes)"
@@ -161,8 +173,14 @@ cmd_retime() {
 }
 
 cmd_remove() {
-  local name="${1:-}"
-  [ -n "$name" ] || die "usage: remove <probe-name>"
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) REASON="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      *) if [ -z "$name" ]; then name="$1"; else die "remove: unexpected arg '$1'"; fi; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: remove <probe-name> [--reason \"...\"]"
   take_lock
   local cur; cur="$(current_probes)"
   printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null 2>&1 || die "no probe named '$name' (see: list)"
@@ -185,6 +203,7 @@ cmd_add() {
       --label) label="${2:-}"; shift 2 ;;
       --lookback-hours) lookback="${2:-}"; shift 2 ;;
       --interval) interval="${2:-}"; shift 2 ;;
+      --reason) REASON="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       *) die "add: unknown option '$1'" ;;
     esac
   done
@@ -265,14 +284,15 @@ case "$sub" in
 claude-auto-self-probes — управление СВОИМИ датчиками (event-bridge probes).
 Действует только на текущего воркера; разрешения (allow/ask/deny) не меняет.
 Каждое изменение уведомляет оператора. Применяется за ~5с без рестарта.
+Везде можно добавить [--reason "почему"] — причина попадёт в уведомление оператору.
 
   list
-  retime <имя> <интервал-сек>         (мин ${MIN_INTERVAL}с)
-  remove <имя>
-  add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S]
-  add --type tg    --name N --chat-id <id> [--lookback-hours H] [--interval S]
-  add --type asana --name N --task <gid> [--author <gid>] [--interval S]
-  add --type timer --name N --label <label> [--interval S]
+  retime <имя> <интервал-сек> [--reason "..."]        (мин ${MIN_INTERVAL}с)
+  remove <имя> [--reason "..."]
+  add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S] [--reason "..."]
+  add --type tg    --name N --chat-id <id> [--lookback-hours H] [--interval S] [--reason "..."]
+  add --type asana --name N --task <gid> [--author <gid>] [--interval S] [--reason "..."]
+  add --type timer --name N --label <label> [--interval S] [--reason "..."]
 USAGE
     ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;

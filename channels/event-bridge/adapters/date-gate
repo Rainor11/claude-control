@@ -1,0 +1,10 @@
+#!/bin/bash
+# date-gate — emits <message> once on/after <YYYYMMDD>, nothing before.
+# Date-gated reminder probe: before the gate date prints nothing (no event);
+# on/after it prints a constant line, which the bridge dedups by hash → fires
+# exactly once. Adapter contract: positional args, event lines to stdout, exit 0.
+set -u
+gate="${1:?usage: date-gate <YYYYMMDD> <message...>}"; shift
+msg="$*"
+[ "$(date +%Y%m%d)" -ge "$gate" ] && printf '%s\n' "$msg"
+exit 0

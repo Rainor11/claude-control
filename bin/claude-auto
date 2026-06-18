@@ -55,6 +55,9 @@ ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 # an existing worker). $1 = worker name. Backticks are escaped for echo.
 emit_identity_sections() {
   local name="$1"
+  # Awareness block is wrapped in markers so `upgrade` can REPLACE it in place
+  # (refresh stale prose) without touching the worker's Mission below it.
+  echo "<!-- BEGIN worker-awareness -->"
   echo "## Who you are (read this first)"
   echo
   echo "You are the autonomous worker \`$name\`, created by forking a planning/origin"
@@ -68,13 +71,38 @@ emit_identity_sections() {
   echo "Cheap external probes watch sources for you and wake you with a turn tagged"
   echo "\`[event-bridge | source=… ]\` ONLY when a real event happens — at zero model cost"
   echo "while idle. Do NOT poll those sources yourself with the model (no repeated \"let me"
-  echo "check the inbox / Asana\" loops); the probes do it for free and will wake you. Probe"
-  echo "types the operator can enable: gmail, asana, telegram, timer. The exact set active"
-  echo "right now is shown to you at session start. Changing probes is the OPERATOR's job"
-  echo "(the \`/worker-probes\` tool) — do NOT draft your own probe config or re-adopt"
-  echo "command, and never change what you monitor or your own bounds. Recommend changes in"
-  echo "your output and let the operator act."
+  echo "check the inbox / Asana\" loops); the probes do it for free and will wake you."
   echo
+  echo "You MAY manage YOUR OWN sensors with \`claude-auto-self-probes\` (changes only what"
+  echo "wakes you; applies in ~5s, no restart; the operator is pinged on every change):"
+  echo "  claude-auto-self-probes list"
+  echo "  claude-auto-self-probes retime <name> <seconds> [--reason \"...\"]"
+  echo "  claude-auto-self-probes remove <name> [--reason \"...\"]"
+  echo "  claude-auto-self-probes add --type gmail|tg|asana|timer --name N … [--reason \"...\"]"
+  echo "Add \`--reason \"…\"\` so the operator sees WHY. This touches only YOUR probes — never"
+  echo "another worker's. (The \`emit-lines\` file-watch adapter is operator-only.)"
+  echo
+  echo "## How you run (auto mode)"
+  echo
+  echo "You run in the \`auto\` permission mode: a safety classifier auto-approves routine"
+  echo "work, so you ACT without asking on most things, and it blocks clearly dangerous"
+  echo "actions (data exfiltration, mass deletion, prod deploys, force-push). On top of that"
+  echo "your operator's deny rules (\`rm -rf\`, \`sudo\`, reading secrets) and ask rules still"
+  echo "apply — those are the hard fence."
+  echo "- Reaching a person OUTSIDE this server — an email, or a Telegram message to ANYONE"
+  echo "  other than your operator — is gated and will PAUSE for the operator to approve."
+  echo "  Don't try to route around it (e.g. by calling an API from a script)."
+  echo "- You CANNOT change your own permissions (allow/ask/deny) — operator-only. If you"
+  echo "  need one widened, say so in your output."
+  echo
+  echo "## Reaching your operator"
+  echo
+  echo "Finishing a turn or going idle no longer pings the operator. If you genuinely need"
+  echo "them — a product decision, a blocker, or a reminder you must deliver — say it"
+  echo "explicitly (absolute path; delivers ONLY to the operator, no other recipient):"
+  echo "  /opt/projects/active/claude-control/bin/claude-auto-tg \"your message\""
+  echo
+  echo "<!-- END worker-awareness -->"
 }
 
 ensure_registry() {
@@ -112,7 +140,7 @@ cmd_install_units() {
 
 # ---- adopt -----------------------------------------------------------------
 cmd_adopt() {
-  local session="" cwd="" name="" mode="acceptEdits" mission="" mission_file="" probe_config="" model=""
+  local session="" cwd="" name="" mode="auto" mission="" mission_file="" probe_config="" model=""
   local remote_control=false rc_name=""
   local -a allow=() ask=() deny=()
   while [ $# -gt 0 ]; do
@@ -297,12 +325,20 @@ cmd_adopt() {
   # tee, a redirect) can still mutate $home; closing that needs an OS sandbox.
   # They stop the easy/accidental self-reconfiguration, not a determined one.
   local deny_json allow_json ask_json
+  # Baseline deny (always added). In `auto` mode the classifier blocks generic danger,
+  # but the HARD, business-specific fence is these deny rules — they apply in auto too
+  # (and auto by default would even allow reading .env + using the matching API, so the
+  # secret-read denies are mandatory, not optional). Self-protection denies (own home /
+  # control dir / repo, claude-auto, tmux) keep the worker from rewriting its own bounds.
   deny_json=$(printf '%s\n' "${deny[@]:-}" \
+    "Bash(sudo:*)" "Bash(rm -rf:*)" "Bash(rm -fr:*)" \
+    "Read(/home/rainor/.ssh/**)" "Read(**/.env*)" "Read(**/secrets/**)" \
+    "Read(**/credentials*.json)" "Read(**/id_rsa*)" "Read(/home/rainor/.aws/**)" \
     "Edit(//${home#/}/**)" "Write(//${home#/}/**)" \
     "Edit(//${CONTROL_DIR#/}/**)" "Write(//${CONTROL_DIR#/}/**)" \
     "Edit(//${REPO_DIR#/}/**)" "Write(//${REPO_DIR#/}/**)" \
     "Bash(claude-auto:*)" "Bash(tmux:*)" \
-    | sed '/^$/d' | jq -R . | jq -s .)
+    | sed '/^$/d' | jq -R . | jq -s 'unique')
   # Bash(claude-auto-self-probes:*): the worker MAY manage its OWN sensors (probes)
   # — list/retime/remove/add the gmail|tg|asana|timer adapters — via the narrow
   # self-probes tool (own-worker-only by /proc identity; never touches settings.json
@@ -310,10 +346,23 @@ cmd_adopt() {
   # boundary → does NOT match `claude-auto-self-probes`). `Bash(tmux:*)` denied so the
   # worker can't forge the identity cross-check. Repo Edit/Write denied (the tool +
   # adapters are the TCB — defense in depth; not a hard fence vs raw subprocess).
+  # allow: self-probes (sensor self-management) + claude-auto-tg (worker→operator TG;
+  # ABSOLUTE path only so a `PATH=…` swap can't satisfy the rule). In auto these narrow
+  # allows pre-approve, bypassing the classifier (intended for these trusted helpers).
   allow_json=$(printf '%s\n' "${allow[@]:-}" \
     "Bash(claude-auto-self-probes:*)" \
-    | sed '/^$/d' | jq -R . | jq -s .)
-  ask_json=$(printf '%s\n' "${ask[@]:-}" | sed '/^$/d' | jq -R . | jq -s .)
+    "Bash(${BIN_DIR}/claude-auto-tg:*)" \
+    | sed '/^$/d' | jq -R . | jq -s 'unique')
+  # Baseline ask (always added): the narrow operator-approval gate on client-facing
+  # outbound — email + general telegram_notify.sh (to ANY recipient) + git push. ask
+  # rules still prompt in auto mode. (claude-auto-tg is NOT here → it reaches only the
+  # operator and runs free.)
+  ask_json=$(printf '%s\n' "${ask[@]:-}" \
+    "mcp__google-workspace__send_email" "mcp__google-workspace-rainor__send_email" \
+    "mcp__google-workspace__draft_email" "mcp__google-workspace-rainor__draft_email" \
+    "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)" \
+    "Bash(git push:*)" \
+    | sed '/^$/d' | jq -R . | jq -s 'unique')
 
   # Hooks: SessionStart (claude-auto-identity) re-asserts identity + runtime
   # awareness (+ live probe list, session title) on every start, incl. /compact
@@ -384,6 +433,24 @@ EOF
 # Validate the name BEFORE using it in a path: a name like `..` would otherwise
 # pass `-d` and let set-probes/remove/etc. traverse outside WORKERS_DIR.
 worker_exists() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] && [ -d "$WORKERS_DIR/$1" ]; }
+
+# Heuristic: is the worker's TUI mid-turn / showing a permission prompt? Used by
+# `upgrade` to DEFER a stop/start restart so we don't kill tmux during a tool call
+# (Codex). Conservative: only the clear "busy" markers (turn running / approval
+# dialog). Not running ⇒ not busy. Capture failure ⇒ assume busy (safer).
+worker_busy() {
+  local sess="claude-$1" pane tailn
+  tmux has-session -t "$sess" 2>/dev/null || return 1
+  pane="$(tmux capture-pane -pt "$sess" 2>/dev/null)" || return 0   # capture failed ⇒ assume busy (safer)
+  # Turn running, an approval/elicitation dialog, or a startup modal anywhere on screen.
+  printf '%s' "$pane" | grep -qiE 'esc to interrupt|Do you want to|Allow .* to (run|use|edit|create|read)|trust (this )?(folder|directory)|new MCP server|resume .*session|Continue\?' && return 0
+  # Unsent operator input: a live prompt line "❯ <text>" near the bottom (check only the
+  # last few non-empty lines to avoid matching scrolled-back history). Conservative:
+  # false "busy" just DEFERS the restart; far better than killing tmux and losing input.
+  tailn="$(printf '%s' "$pane" | grep -vE '^[[:space:]]*$' | tail -4)"
+  printf '%s' "$tailn" | grep -qE '❯[[:space:]]+[^[:space:]]' && return 0
+  return 1
+}
 
 cmd_list() {
   ensure_registry
@@ -608,9 +675,28 @@ cmd_upgrade() {
   local name="${1:?usage: upgrade <name>}"
   worker_exists "$name" || die "no worker '$name'"
   local home="$WORKERS_DIR/$name"
-  local s="$home/settings.json" c="$home/CLAUDE.md"
+  local s="$home/settings.json" c="$home/CLAUDE.md" spec="$home/spec.json"
   [ -f "$s" ] || die "upgrade: no settings.json for '$name'"
   local -a changed=()
+
+  # Preflight (Codex C): refuse to patch+restart into a crash-loop.
+  #  - `auto` mode needs a working CLI/account; a broken `claude` would tight-loop.
+  #  - existing settings/spec must be valid JSON (we patch them).
+  #  - the worker must be seeded OR have a transcript, else `--resume` re-forks /
+  #    crash-loops on restart.
+  have claude || die "upgrade: 'claude' not on PATH — aborting"
+  claude --version >/dev/null 2>&1 || die "upgrade: 'claude --version' failed — aborting (auto mode would crash-loop)"
+  jq -e . "$s" >/dev/null 2>&1 || die "upgrade: existing settings.json is invalid for '$name' — fix it first"
+  if [ -f "$spec" ]; then
+    jq -e . "$spec" >/dev/null 2>&1 || die "upgrade: existing spec.json is invalid for '$name' — fix it first"
+    local _seeded _sid
+    _seeded="$(jq -r '.seeded // false' "$spec" 2>/dev/null)"
+    _sid="$(jq -r '.session_id // empty' "$spec" 2>/dev/null)"
+    if [ "$_seeded" != "true" ]; then
+      [ -n "$_sid" ] && [ -n "$(ls -1 "$HOME/.claude/projects"/*/"$_sid.jsonl" 2>/dev/null | head -1)" ] \
+        || die "upgrade: '$name' not seeded and no worker transcript — refusing (restart would re-fork / crash-loop)"
+    fi
+  fi
 
   # 1) settings.json — SessionStart->identity hook + PostToolUse->self-ledger hooks
   # (Asana + Gmail) + claude-auto deny (all idempotent: each added only if not
@@ -621,7 +707,8 @@ cmd_upgrade() {
   local ledgercmd="$BIN_DIR/claude-auto-asana-self-ledger $home/state"
   local gledgercmd="$BIN_DIR/claude-auto-gmail-self-ledger $home/state"
   t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
-  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" --arg repo "${REPO_DIR#/}" '
+  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" \
+     --arg repo "${REPO_DIR#/}" --arg bin "$BIN_DIR" --arg whome "${home#/}" --arg cdir "${CONTROL_DIR#/}" '
     .enableAllProjectMcpServers = true
     | .hooks = (.hooks // {})
     | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
@@ -634,25 +721,78 @@ cmd_upgrade() {
     | .permissions = (.permissions // {})
     | .permissions.deny = ((.permissions.deny // []) + ([
           "Bash(claude-auto:*)", "Bash(tmux:*)",
+          "Bash(sudo:*)", "Bash(rm -rf:*)", "Bash(rm -fr:*)",
+          "Read(/home/rainor/.ssh/**)", "Read(**/.env*)", "Read(**/secrets/**)",
+          "Read(**/credentials*.json)", "Read(**/id_rsa*)", "Read(/home/rainor/.aws/**)",
+          ("Edit(//" + $whome + "/**)"), ("Write(//" + $whome + "/**)"),
+          ("Edit(//" + $cdir + "/**)"), ("Write(//" + $cdir + "/**)"),
           ("Edit(//" + $repo + "/**)"), ("Write(//" + $repo + "/**)")
         ] - (.permissions.deny // [])))
     | .permissions.allow = ((.permissions.allow // []) + ([
-          "Bash(claude-auto-self-probes:*)"
+          "Bash(claude-auto-self-probes:*)",
+          ("Bash(" + $bin + "/claude-auto-tg:*)")
         ] - (.permissions.allow // [])))
+    | .permissions.ask = ((.permissions.ask // []) + ([
+          "mcp__google-workspace__send_email", "mcp__google-workspace-rainor__send_email",
+          "mcp__google-workspace__draft_email", "mcp__google-workspace-rainor__draft_email",
+          "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)",
+          "Bash(git push:*)"
+        ] - (.permissions.ask // [])))
   ' "$s" > "$t" 2>/dev/null && jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "upgrade: settings.json patch failed"; }
   if cmp -s "$t" "$s"; then rm -f "$t"; else chmod 600 "$t" 2>/dev/null||true; mv "$t" "$s"; changed+=("settings.json"); fi
 
-  # 2) CLAUDE.md — insert identity/awareness sections before the first "## Mission"
-  # (idempotent: skip if already present). Two awk passes avoid -v escaping.
-  if [ -f "$c" ] && ! grep -q '^## Who you are' "$c"; then
-    if grep -q '^## Mission' "$c"; then
-      local ct; ct="$(mktemp "$home/.cm.XXXXXX")" || die "upgrade: mktemp failed"
-      { awk '/^## Mission/{exit} {print}' "$c"
-        emit_identity_sections "$name"
-        awk '/^## Mission/{p=1} p' "$c"
-      } > "$ct" && mv "$ct" "$c" && changed+=("CLAUDE.md") || { rm -f "$ct"; die "upgrade: CLAUDE.md patch failed"; }
+  # 2) CLAUDE.md — REFRESH the awareness block (Codex: marker-based, fail-closed).
+  # The block is wrapped in <!-- BEGIN/END worker-awareness -->. Replace in place if
+  # markers exist; migrate a legacy unmarked "## Who you are …" (up to "## Mission");
+  # else insert before "## Mission". NEVER touch the worker's Mission. Malformed
+  # markers (exactly one / duplicated) ⇒ skip the refresh (don't risk clobbering).
+  # awk reads the fresh block from a temp file (no -v multiline escaping issues).
+  if [ -f "$c" ]; then
+    local nb ne ct cf cmode="skip"
+    # NB: grep -c prints "0" AND exits 1 on zero matches, so `|| echo 0` would yield
+    # "0\n0" (→ neither "0" nor "1" → false "broken"). Swallow the exit with `|| true`;
+    # grep's own "0"/"N" on stdout is what we capture. Default empty (file error) to 0.
+    nb="$(grep -c '<!-- BEGIN worker-awareness -->' "$c" 2>/dev/null || true)"; nb="${nb:-0}"
+    ne="$(grep -c '<!-- END worker-awareness -->' "$c" 2>/dev/null || true)"; ne="${ne:-0}"
+    if [ "$nb" = 1 ] && [ "$ne" = 1 ]; then cmode="markers"
+    elif [ "$nb" = 0 ] && [ "$ne" = 0 ]; then
+      if grep -q '^## Who you are' "$c"; then cmode="legacy"
+      elif grep -q '^## Mission' "$c"; then cmode="insert"
+      else cmode="none"; fi
+    else cmode="broken"; fi
+
+    if [ "$cmode" = none ] || [ "$cmode" = broken ]; then
+      echo "upgrade: '$name' CLAUDE.md — skipped awareness refresh (cmode=$cmode; no safe anchor / malformed markers). settings & spec still patched." >&2
     else
-      echo "upgrade: '$name' CLAUDE.md has no '## Mission' anchor — skipped CLAUDE.md (settings still patched)" >&2
+      cf="$(mktemp "$home/.cf.XXXXXX")" || die "upgrade: mktemp failed"
+      emit_identity_sections "$name" > "$cf"
+      ct="$(mktemp "$home/.cm.XXXXXX")" || die "upgrade: mktemp failed"
+      case "$cmode" in
+        markers)
+          awk 'NR==FNR{repl=repl $0 ORS; next}
+               /<!-- BEGIN worker-awareness -->/{printf "%s", repl; inblk=1; next}
+               /<!-- END worker-awareness -->/{if(inblk){inblk=0; next} else {print; next}}
+               inblk{next} {print}' "$cf" "$c" > "$ct" ;;
+        legacy)
+          awk 'NR==FNR{repl=repl $0 ORS; next}
+               /^## Who you are/ && !done {printf "%s", repl; done=1; inblk=1; next}
+               inblk && /^## Mission/ {inblk=0}
+               inblk{next} {print}' "$cf" "$c" > "$ct" ;;
+        insert)
+          awk 'NR==FNR{repl=repl $0 ORS; next}
+               /^## Mission/ && !done {printf "%s", repl; done=1}
+               {print}' "$cf" "$c" > "$ct" ;;
+      esac
+      rm -f "$cf"
+      # Fail-closed: result non-empty, Mission preserved, exactly one marker pair.
+      if [ -s "$ct" ] && grep -q '^## Mission' "$ct" \
+         && [ "$(grep -c '<!-- BEGIN worker-awareness -->' "$ct" 2>/dev/null)" = 1 ] \
+         && [ "$(grep -c '<!-- END worker-awareness -->' "$ct" 2>/dev/null)" = 1 ]; then
+        if cmp -s "$ct" "$c"; then rm -f "$ct"; else chmod 600 "$ct" 2>/dev/null||true; mv "$ct" "$c"; changed+=("CLAUDE.md"); fi
+      else
+        rm -f "$ct"
+        echo "upgrade: '$name' CLAUDE.md — refresh produced an unsafe result (Mission/markers check failed); left unchanged." >&2
+      fi
     fi
   fi
 
@@ -684,14 +824,44 @@ cmd_upgrade() {
     fi
   fi
 
+  # 4) spec.json — permission_mode → auto. LAST (Codex C transactional order): flip
+  # the mode only AFTER settings/CLAUDE patched OK, so a failed fence patch can never
+  # leave spec=auto with a stale fence on the next launch.
+  if [ -f "$spec" ]; then
+    local cur_mode; cur_mode="$(jq -r '.permission_mode // ""' "$spec" 2>/dev/null)"
+    if [ "$cur_mode" != "auto" ]; then
+      local st; st="$(mktemp "$home/.spec.XXXXXX")" || die "upgrade: mktemp failed"
+      if jq '.permission_mode="auto"' "$spec" > "$st" 2>/dev/null && jq -e . "$st" >/dev/null 2>&1; then
+        chmod 600 "$st" 2>/dev/null||true; mv "$st" "$spec"; changed+=("spec.json:mode=auto")
+      else rm -f "$st"; die "upgrade: spec.json permission_mode patch failed"; fi
+    fi
+  fi
+
   if [ "${#changed[@]}" -eq 0 ]; then
     echo "upgrade: '$name' already up to date — nothing changed, no restart."
     return 0
   fi
+
+  # Restart applies launch-time changes (--settings, spec permission_mode, CLAUDE.md
+  # --append-system-prompt). Idle-check (Codex C): don't kill tmux mid-turn or over a
+  # permission prompt. If busy, leave the files patched (they apply on the next
+  # natural/operator restart) and tell the operator — never restart a busy worker.
+  if worker_busy "$name"; then
+    echo "upgrade: '$name' patched (${changed[*]}), but the worker is BUSY (mid-turn / permission prompt)."
+    echo "         Restart DEFERRED — re-run 'claude-auto upgrade $name' when idle (or it applies on the next restart)."
+    return 0
+  fi
   echo "upgrade: '$name' patched (${changed[*]}). Restarting to apply (resumes the SAME session — context preserved)…"
   cmd_stop "$name"  >/dev/null
-  cmd_start "$name" >/dev/null
-  echo "upgrade: '$name' done — SessionStart identity hook now active; reconnect: tmux attach -t claude-$name"
+  # Verify the restart actually came up — cmd_start marks the registry active before
+  # `systemctl enable --now`, so don't claim success blindly (Codex). A failed start
+  # leaves the worker DOWN; surface it instead of falsely reporting done.
+  if ! cmd_start "$name" >/dev/null 2>&1 || ! systemctl --user is-active --quiet "claude-auto@$name.service"; then
+    echo "upgrade: '$name' ERROR — files patched but the worker did NOT come back up. It may be DOWN." >&2
+    echo "         Check: journalctl --user -u claude-auto@$name -n 50" >&2
+    return 1
+  fi
+  echo "upgrade: '$name' done (auto mode + refreshed bounds/awareness). reconnect: tmux attach -t claude-$name"
 }
 
 # ---- dispatch --------------------------------------------------------------

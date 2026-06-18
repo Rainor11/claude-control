@@ -187,16 +187,19 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-auto claude-auto-self-probes claude-control-run claude-control-logrotate \
+for script in claude-rc claude-auto claude-auto-self-probes claude-auto-tg claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-url-notify; do
   install_script "$script"
 done
 # NB: `claude-auto` (operator worker-management CLI) and `claude-auto-self-probes`
 # (worker self-manages its OWN sensors; must be on PATH so the `Bash(claude-auto-self-probes:*)`
-# allow rule matches the bare command) go on PATH. Internal helpers
-# (claude-auto-run/-identity/-heartbeat/-notify/-reconciler) are invoked by the
-# systemd units/hooks via absolute path and stay out of PATH on purpose.
+# allow rule matches the bare command) go on PATH. `claude-auto-tg` (worker→operator
+# Telegram notify) is symlinked for operator convenience, but a worker is allowed it by
+# its ABSOLUTE repo path only — `Bash(<repo>/bin/claude-auto-tg:*)` — so a `PATH=…` swap
+# can't satisfy the allow rule. Internal helpers (claude-auto-run/-identity/-heartbeat/
+# -notify/-reconciler) are invoked by the systemd units/hooks via absolute path and stay
+# out of PATH on purpose.
 
 # --- runtime files (examples, idempotent) -----------------------------------
 

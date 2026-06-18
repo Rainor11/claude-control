@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# claude-auto-tg — let an autonomous worker notify the OPERATOR on Telegram.
+#
+# Operator-only BY CONSTRUCTION:
+#   * recipient (operator chat_id) and notifier path are HARDCODED here — a worker
+#     supplies ONLY the message text and cannot redirect the recipient;
+#   * the message is passed to telegram_notify.sh as a SINGLE argv element, and that
+#     script's arg parser breaks on the first non-flag (so a message containing
+#     "--chat-id 999" is treated as text, never re-parsed into flags);
+#   * the notifier is an ABSOLUTE path, not taken from $PATH or env, so a worker
+#     cannot swap it via `PATH=/evil claude-auto-tg ...` or CLAUDE_AUTO_TG=…
+#
+# Use it for autonomous reminders and escalations to the operator (idle/turn-finish
+# no longer pings — claude-auto-notify only forwards real permission blocks). To reach
+# ANY OTHER person, use telegram_notify.sh directly — that path is in `ask`, so the
+# operator approves it; this primitive deliberately cannot.
+#
+# Allow it in a worker by its ABSOLUTE path only:
+#   Bash(/opt/projects/active/claude-control/bin/claude-auto-tg:*)
+set -u
+
+OPERATOR_CHAT_ID="128989844"                                   # rainor — hardcoded
+TG="/home/rainor/server/server_monitor/telegram_notify.sh"     # absolute — NOT $PATH/env
+
+[ -x "$TG" ] || { echo "claude-auto-tg: notifier unavailable ($TG)" >&2; exit 1; }
+
+# Everything passed is the message body. We do NOT parse flags: the worker controls
+# text only, never the recipient or notifier.
+msg="$*"
+[ -n "$msg" ] || { echo "claude-auto-tg: usage: claude-auto-tg <message…>" >&2; exit 2; }
+
+# Best-effort worker label for the operator (NOT security-critical: the recipient is
+# fixed regardless of what the label says).
+name="${CLAUDE_AUTO_NAME:-}"
+case "$name" in ""|*[!a-zA-Z0-9_-]*) name="worker" ;; esac
+
+# Sanitize control chars (keep tab/newline/CR), cap length well under Telegram's limit.
+msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037' | cut -c1-3500)"
+
+# Single quoted argv element → telegram_notify.sh sees it as the message, never flags.
+exec "$TG" --chat-id "$OPERATOR_CHAT_ID" "🤖 Воркер «$name»:
+$msg"

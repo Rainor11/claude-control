@@ -90,11 +90,25 @@ wakes you — applies within ~5s, no restart; the operator is pinged on every ch
   claude-auto-self-probes add --type tg    --name N --chat-id <id>
   claude-auto-self-probes add --type asana --name N --task <gid> [--author <gid>]
   claude-auto-self-probes add --type timer --name N --label <label>
-This only changes YOUR OWN probes — you cannot touch other workers' sensors. Adding a
-probe gives you a new DATA FEED, not new powers: acting on what a probe brings is STILL
-gated by your allow/ask permissions. You CANNOT change your own permissions (allow/ask/
-deny) — that stays the operator's job; if you need a permission widened, say so in your
-output. (The `emit-lines` file-watch adapter is operator-only.)
+This only changes YOUR OWN probes — you cannot touch other workers' sensors. Add
+\`--reason "…"\` to any change so the operator sees WHY. Adding a probe gives you a new
+DATA FEED, not new powers. (The \`emit-lines\` file-watch adapter is operator-only.)
+
+HOW YOU RUN (auto mode)
+You run in the "auto" permission mode: a safety classifier auto-approves routine work, so
+you ACT without asking on most things, and it blocks clearly dangerous actions (data
+exfiltration, mass deletion, prod deploys, force-push). On top of that your operator's
+deny rules (rm -rf, sudo, reading secrets) and ask rules still apply — those are the hard
+fence. Reaching a person OUTSIDE this server — an email, or a Telegram message to ANYONE
+other than your operator — is gated and will PAUSE for operator approval; don't route
+around it (e.g. by calling an API from a script). You CANNOT change your own permissions
+(allow/ask/deny) — operator-only; if you need one widened, say so in your output.
+
+REACHING YOUR OPERATOR
+Finishing a turn or going idle no longer pings the operator. If you genuinely need them —
+a product decision, a blocker, or a reminder you must deliver — say it explicitly
+(absolute path; delivers ONLY to the operator, no other recipient):
+  /opt/projects/active/claude-control/bin/claude-auto-tg "your message"
 EOF
 )"
 

@@ -25,13 +25,32 @@ stamp="$statedir/.last_notify"
   payload="$(cat 2>/dev/null)"
   msg="$(printf '%s' "$payload" | jq -r '.message // "needs attention" ' 2>/dev/null \
         | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
+  ntype="$(printf '%s' "$payload" | jq -r '.notification_type // empty' 2>/dev/null)"
+
+  # Forward ONLY notifications that need operator action. Primary signal is the
+  # structured notification_type; matching on it (not English .message text) is
+  # robust to wording changes. FAIL-OPEN: an unknown/missing type is forwarded
+  # (a stray ping beats swallowing a real block). The text fallback covers the
+  # idle case if the type field is absent on this build. Suppression happens
+  # BEFORE the throttle stamp so a suppressed idle never throttles a later block.
+  # force=1 ⇒ action REQUIRED (a real permission block / the worker is asking the
+  # operator). These bypass the throttle entirely — a real block must NEVER be dropped
+  # because some other notification fired in the last THROTTLE seconds (Codex). Only
+  # the fail-open "unknown" class is throttled (anti-spam).
+  force=0
+  case "$ntype" in
+    idle_prompt|auth_success|elicitation_complete|elicitation_response) exit 0 ;;  # no action needed → suppress
+    permission_prompt|elicitation_dialog) force=1 ;;                               # real block / worker asks → ALWAYS notify
+    "") case "$msg" in *"waiting for your input"*|*"is waiting"*) exit 0 ;; esac ;; # untyped idle → suppress
+    *) : ;;                                                                         # unknown type → notify (fail-open, throttled)
+  esac
 
   mkdir -p "$statedir" 2>/dev/null
   now="$(date +%s)"
-  if [ -f "$stamp" ]; then
+  if [ "$force" != 1 ] && [ -f "$stamp" ]; then
     last="$(cat "$stamp" 2>/dev/null || echo 0)"
     [ "$last" -eq "$last" ] 2>/dev/null || last=0
-    [ $(( now - last )) -lt "$THROTTLE" ] && exit 0   # throttled
+    [ $(( now - last )) -lt "$THROTTLE" ] && exit 0   # throttled (only non-action-required)
   fi
   echo "$now" > "$stamp" 2>/dev/null || true
 

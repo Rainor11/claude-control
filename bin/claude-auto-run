@@ -41,6 +41,10 @@ j() { jq -r "$1" "$spec"; }
 session_id="$(j '.session_id')"
 origin_id="$(j '.origin_id // empty')"
 cwd="$(j '.cwd')"
+# Fallback is the SAFE mode, NOT auto (Codex): a spec missing permission_mode must
+# not silently launch in auto WITHOUT the deny/ask fence. `auto` is set EXPLICITLY by
+# adopt (default) and upgrade — always together with the fence. So a malformed/legacy
+# spec falls back to acceptEdits, never to an unfenced auto.
 mode="$(j '.permission_mode // "acceptEdits"')"
 seeded="$(j '.seeded // false')"
 model="$(j '.model // empty')"
