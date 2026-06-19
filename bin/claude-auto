@@ -92,6 +92,14 @@ emit_identity_sections() {
   echo "- \`timer\` ONLY for genuinely RECURRING work: it wakes you (and spends tokens) on EVERY"
   echo "  interval. Do NOT use a timer to fake a one-off deadline — use \`date-gate\` for that."
   echo
+  echo "## Working calendar"
+  echo
+  echo "Assume business days Mon–Fri, working hours 09:00–19:00 MSK (the server clock is MSK)."
+  echo "- Compute deadlines and \"in N days\" in BUSINESS days — skip Sat/Sun, so a date-gate/timer"
+  echo "  reminder lands on a weekday in-hours, not a weekend (\"by Friday\", \"in 2 working days\")."
+  echo "- Don't schedule outgoing messages to PEOPLE (email/TG) for weekends or outside 09:00–19:00 —"
+  echo "  defer to the next business window. Internal work and probes run anytime."
+  echo
   echo "## How you run (auto mode)"
   echo
   echo "You run in the \`auto\` permission mode: a safety classifier auto-approves routine"
@@ -871,21 +879,29 @@ cmd_upgrade() {
     fi
   fi
 
-  if [ "${#changed[@]}" -eq 0 ]; then
+  # A restart is OWED if we changed launch-time files now, OR a previous upgrade patched
+  # them but DEFERRED the restart (worker was busy) and left this marker. Without the
+  # marker, a re-run after a deferred restart sees "nothing changed" and never completes
+  # the restart, leaving the LIVE session on the old mode/bounds (observed on SM-APP).
+  local pending="$home/state/.restart_pending"
+  if [ "${#changed[@]}" -eq 0 ] && [ ! -f "$pending" ]; then
     echo "upgrade: '$name' already up to date — nothing changed, no restart."
     return 0
   fi
+  local why="${changed[*]:-restart owed from a previously deferred upgrade}"
 
   # Restart applies launch-time changes (--settings, spec permission_mode, CLAUDE.md
   # --append-system-prompt). Idle-check (Codex C): don't kill tmux mid-turn or over a
-  # permission prompt. If busy, leave the files patched (they apply on the next
-  # natural/operator restart) and tell the operator — never restart a busy worker.
+  # permission prompt. If busy, leave the files patched + DROP a restart_pending marker
+  # so a later upgrade (or the next natural restart) completes it — never restart a busy worker.
   if worker_busy "$name"; then
-    echo "upgrade: '$name' patched (${changed[*]}), but the worker is BUSY (mid-turn / permission prompt)."
-    echo "         Restart DEFERRED — re-run 'claude-auto upgrade $name' when idle (or it applies on the next restart)."
+    mkdir -p "$home/state" 2>/dev/null || true
+    : > "$pending" 2>/dev/null || true
+    echo "upgrade: '$name' patched (${why}), but the worker is BUSY (mid-turn / permission prompt)."
+    echo "         Restart DEFERRED (marked pending) — re-run 'claude-auto upgrade $name' when idle; it will finish the restart."
     return 0
   fi
-  echo "upgrade: '$name' patched (${changed[*]}). Restarting to apply (resumes the SAME session — context preserved)…"
+  echo "upgrade: '$name' applying (${why}). Restarting (resumes the SAME session — context preserved)…"
   cmd_stop "$name"  >/dev/null
   # Verify the restart actually came up — cmd_start marks the registry active before
   # `systemctl enable --now`, so don't claim success blindly (Codex). A failed start
@@ -895,7 +911,41 @@ cmd_upgrade() {
     echo "         Check: journalctl --user -u claude-auto@$name -n 50" >&2
     return 1
   fi
+  rm -f "$pending" 2>/dev/null || true   # restart completed → clear the pending marker
   echo "upgrade: '$name' done (auto mode + refreshed bounds/awareness). reconnect: tmux attach -t claude-$name"
+}
+
+usage() {
+  cat <<'USAGE'
+claude-auto — управление автономными Claude-воркерами.
+
+Воркер — форкнутая Claude-сессия в durable tmux под systemd (claude-auto@<имя>):
+переживает выход из сессии, краш и ребут. У каждого свои рамки (allow/ask/deny +
+CLAUDE.md) и свой поток событий (датчики event-bridge).
+
+ОБЗОР И СТАТУС
+  overview                     все воркеры разом: статус юнита, бюджет контекста, датчики
+  list                         список воркеров + состояние юнита
+  status <имя>                 детали одного: spec + юнит + tmux + свежесть памяти
+
+ДАТЧИКИ (за чем воркер следит)
+  get-probes <имя>             показать датчики воркера
+  set-probes <имя> <config>    заменить набор датчиков живьём (без рестарта, ~5с)
+
+ЖИЗНЕННЫЙ ЦИКЛ
+  start <имя>                  запустить / поднять юнит
+  stop <имя>                   остановить + отключить юнит (файлы сохраняются)
+  upgrade <имя>                подтянуть воркера к текущему шаблону (auto mode,
+                               awareness, забор) без re-adopt; рестарт с resume —
+                               контекст и датчики целы
+  remove <имя>                 остановить и УДАЛИТЬ файлы воркера + запись в реестре
+  adopt …                      создать и запустить воркера (бэкенд /go-autonomous)
+  install-units                перегенерировать systemd-шаблоны + reconciler-таймер
+
+Воркеров обычно создаёт слэш-команда /go-autonomous (собирает миссию и рамки
+allow/ask/deny), смену датчиков — /worker-probes.
+Подробности и архитектура: server_docs/tools/claude_control.md
+USAGE
 }
 
 # ---- dispatch --------------------------------------------------------------
@@ -912,6 +962,6 @@ case "$sub" in
   set-probes) cmd_set_probes "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
   install-units) cmd_install_units ;;
-  ""|-h|--help) sed -n '1,40p' "$0" | sed 's/^# \?//' ;;
+  ""|-h|--help) usage ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
 esac
