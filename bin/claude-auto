@@ -10,6 +10,7 @@
 # Subcommands:
 #   adopt    create + launch a worker from an existing session id   (the helper backend)
 #   list     list workers and unit status
+#   overview one-screen status of ALL workers: unit state + context budget + probes
 #   status   show one worker (spec + unit + tmux)
 #   stop     stop + disable a worker's unit (keeps files)
 #   start    (re)start a worker's unit
@@ -473,6 +474,30 @@ cmd_list() {
   done
 }
 
+# overview — ONE screen for all workers: live unit state + context budget + active
+# probes. Read-only aggregate of the registry + each worker's state/context.json
+# (written by claude-auto-heartbeat) + event-bridge.config.json. No mutation.
+cmd_overview() {
+  # Strictly read-only: do NOT ensure_registry (it would create state for a viewer).
+  # Surface a missing/corrupt registry instead of silently printing an empty list.
+  [ -f "$REGISTRY" ] || { echo "overview: реестр не найден ($REGISTRY) — воркеров нет"; return 0; }
+  jq -e . "$REGISTRY" >/dev/null 2>&1 || die "overview: реестр повреждён/нечитаем ($REGISTRY) — почини его вручную"
+  printf '%-20s %-7s %-13s %s\n' NAME STATE CONTEXT PROBES
+  jq -r '.workers // {} | keys[]' "$REGISTRY" | sort |
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    local dot unit ctx="n/a" probes="(нет)" cj cfg
+    if systemctl --user is-active --quiet "claude-auto@$n.service"; then dot="●"; unit="up"; else dot="○"; unit="down"; fi
+    cj="$WORKERS_DIR/$n/state/context.json"
+    [ -f "$cj" ] && ctx="$(jq -r 'if (.ctx_tokens!=null and .threshold!=null) then "\((.ctx_tokens/1000)|floor)k/\((.threshold/1000)|floor)k" else "n/a" end' "$cj" 2>/dev/null)"
+    [ -n "$ctx" ] || ctx="n/a"
+    cfg="$WORKERS_DIR/$n/event-bridge.config.json"
+    [ -f "$cfg" ] && probes="$(jq -r '[.probes[]? | "\(.name)[\(.source // "?")]"] | join(", ")' "$cfg" 2>/dev/null)"
+    [ -n "$probes" ] || probes="(нет)"
+    printf '%-20s %s %-5s %-13s %s\n' "$n" "$dot" "$unit" "$ctx" "$probes"
+  done
+}
+
 # Live deal-memory freshness — NO stored counter. Compare the worker transcript's
 # mtime against the newest mtime of the deal's memory files: if the transcript has
 # advanced well past the last memory edit, the worker is doing steps without
@@ -878,6 +903,7 @@ sub="${1:-}"; shift || true
 case "$sub" in
   adopt) cmd_adopt "$@" ;;
   list) cmd_list ;;
+  overview) cmd_overview ;;
   status) cmd_status "$@" ;;
   stop) cmd_stop "$@" ;;
   start) cmd_start "$@" ;;
