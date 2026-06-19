@@ -34,7 +34,7 @@ TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"
 
 # Self-service policy bounds (operator via `claude-auto set-probes` is unbounded).
-MAX_PROBES=12              # ceiling on total probes per worker
+MAX_PROBES=20              # ceiling on total probes per worker
 MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
 MAX_INTERVAL=604800        # 1 week
 MAX_LOOKBACK=336           # hours (14 days)
