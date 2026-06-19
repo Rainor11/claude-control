@@ -100,6 +100,13 @@ emit_identity_sections() {
   echo "- Don't schedule outgoing messages to PEOPLE (email/TG) for weekends or outside 09:00–19:00 —"
   echo "  defer to the next business window. Internal work and probes run anytime."
   echo
+  echo "## Calling Codex (escalation)"
+  echo
+  echo "Run Codex ONLY via the bounded wrapper \`codex_rescue.sh\` — it returns in ~80s and"
+  echo "auto-cancels a job older than 1h; poll it with its \`await\`. NEVER run raw \`codex\` /"
+  echo "\`codex exec\` (denied), NEVER \`status --wait\`, NEVER launch Codex as an unbounded"
+  echo "run_in_background task — that wedged a worker for 8h. Canonical call: codex-escalation skill."
+  echo
   echo "## How you run (auto mode)"
   echo
   echo "You run in the \`auto\` permission mode: a safety classifier auto-approves routine"
@@ -355,8 +362,13 @@ cmd_adopt() {
     "Edit(//${home#/}/**)" "Write(//${home#/}/**)" \
     "Edit(//${CONTROL_DIR#/}/**)" "Write(//${CONTROL_DIR#/}/**)" \
     "Edit(//${REPO_DIR#/}/**)" "Write(//${REPO_DIR#/}/**)" \
-    "Bash(claude-auto:*)" "Bash(tmux:*)" \
+    "Bash(claude-auto:*)" "Bash(tmux:*)" "Bash(codex:*)" \
     | sed '/^$/d' | jq -R . | jq -s 'unique')
+  # Bash(codex:*): raw Codex CLI has NO request timeout (a worker once hung 8h on a raw
+  # background Codex). Deny it so the ONLY path is the bounded `bash …/codex_rescue.sh …`
+  # wrapper (starts with `bash`, not `codex` → unaffected; it caps job lifetime). Prefix
+  # match only — `node …/codex-companion.mjs status --wait` / abs-path codex aren't caught
+  # here; awareness + the auto classifier cover those.
   # Bash(claude-auto-self-probes:*): the worker MAY manage its OWN sensors (probes)
   # — list/retime/remove/add the gmail|tg|asana|timer adapters — via the narrow
   # self-probes tool (own-worker-only by /proc identity; never touches settings.json
@@ -762,7 +774,7 @@ cmd_upgrade() {
            {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$gledgercmd}]}] )
     | .permissions = (.permissions // {})
     | .permissions.deny = ((.permissions.deny // []) + ([
-          "Bash(claude-auto:*)", "Bash(tmux:*)",
+          "Bash(claude-auto:*)", "Bash(tmux:*)", "Bash(codex:*)",
           "Bash(sudo:*)", "Bash(rm -rf:*)", "Bash(rm -fr:*)",
           "Read(/home/rainor/.ssh/**)", "Read(**/.env*)", "Read(**/secrets/**)",
           "Read(**/credentials*.json)", "Read(**/id_rsa*)", "Read(/home/rainor/.aws/**)",
