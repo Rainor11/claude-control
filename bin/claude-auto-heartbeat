@@ -30,6 +30,9 @@ name="${1:-unknown}"
 
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 THRESHOLD="${CLAUDE_AUTO_COMPACT_THRESHOLD:-700000}"
+# Validate once: a non-numeric env would break the `-gt` test AND the --argjson
+# write below, silently disabling both compaction and context.json.
+case "$THRESHOLD" in ''|*[!0-9]*) THRESHOLD=700000 ;; esac
 STATE_DIR="$CONTROL_DIR/workers/$name/state"
 
 command -v jq >/dev/null 2>&1 || exit 0
@@ -41,17 +44,24 @@ tpath="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)
 cwd="$(printf '%s' "$payload"   | jq -r '.cwd // empty'            2>/dev/null)"
 
 # --- concern 1: controlled compaction (runs FIRST, fully independent) --------
-# Estimate the CURRENT context from the transcript's latest model-request usage
-# (input + cache_read + cache_creation). NOT the transcript file size, which is
-# cumulative and would stay large after a compaction (re-triggering forever).
+# Estimate the CURRENT context from the transcript's latest NON-ZERO model-request
+# usage (input + cache_read + cache_creation). NOT the transcript file size, which
+# is cumulative and would stay large after a compaction (re-triggering forever).
+# Why non-zero, not just the last value: the latest assistant record often carries
+# an all-zero usage block — a failed API turn (e.g. a 401 auth flap), a remote-
+# control reconnect, or an interrupted/synthetic turn. A real model round-trip
+# always spends input tokens, so usage-sum==0 means "no real request happened on
+# this line". Plain `tail -1` latched onto those zeros and reported 0/n-a for
+# healthy workers; `max` is also wrong (it sticks at the pre-compaction peak).
+# fromjson? makes parsing tolerant of an occasional malformed transcript line.
 write_compaction() {
   [ -n "$tpath" ] && [ -f "$tpath" ] || return 0
   mkdir -p "$STATE_DIR" 2>/dev/null || return 0
   local ctx
   ctx="$(tail -n 600 "$tpath" 2>/dev/null \
-    | jq -rc 'select(.type=="assistant") | .message.usage
-              | ((.input_tokens//0) + (.cache_read_input_tokens//0) + (.cache_creation_input_tokens//0))' 2>/dev/null \
-    | tail -1)"
+    | jq -Rrc 'fromjson? | select(.type=="assistant") | .message.usage
+               | ((.input_tokens//0) + (.cache_read_input_tokens//0) + (.cache_creation_input_tokens//0))' 2>/dev/null \
+    | awk '$1+0>0{v=$1} END{if(v!="")print v}')"
   [ -n "$ctx" ] && [ "$ctx" -eq "$ctx" ] 2>/dev/null || return 0
   # Flag FIRST and independently — a later context.json failure must not skip it.
   if [ "$ctx" -gt "$THRESHOLD" ]; then
@@ -85,7 +95,7 @@ write_last_step() {
   # Collapse newlines INSIDE jq so each assistant text is one output line; then
   # tail -1 grabs the whole last message (not just its last physical line).
   excerpt="$(tail -n 600 "$tpath" 2>/dev/null \
-    | jq -rc 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | (.text | gsub("[\r\n]+";" "))' 2>/dev/null \
+    | jq -Rrc 'fromjson? | select(.type=="assistant") | .message.content[]? | select(.type=="text") | (.text | gsub("[\r\n]+";" "))' 2>/dev/null \
     | tail -1)"
   excerpt="$(printf '%s' "$excerpt" | tr -d '\000-\010\013\014\016-\037' | tr '\n\r\t' '   ' | cut -c1-600)"
   local t; t="$(mktemp "$STATE_DIR/.step.XXXXXX" 2>/dev/null)" || return 0
