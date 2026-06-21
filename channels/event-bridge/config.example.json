@@ -9,14 +9,14 @@
     },
     {
       "name": "asana-task-EXAMPLE",
-      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/asana-comments", "--task", "1215419932736878", "--author", "794146060752"],
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/asana-comments", "--task", "ASANA_TASK_GID", "--author", "ASANA_AUTHOR_GID"],
       "interval_sec": 120,
       "timeout_sec": 40,
       "source": "asana"
     },
     {
       "name": "tg-contact-EXAMPLE",
-      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/tg-messages", "--contact", "Вова Груздев", "--state-dir", "STATE_DIR_OF_THIS_WORKER", "--lookback-hours", "24"],
+      "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/tg-messages", "--contact", "CONTACT_NAME", "--state-dir", "STATE_DIR_OF_THIS_WORKER", "--lookback-hours", "24"],
       "interval_sec": 60,
       "timeout_sec": 30,
       "source": "telegram"

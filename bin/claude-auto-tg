@@ -2,8 +2,9 @@
 # claude-auto-tg — let an autonomous worker notify the OPERATOR on Telegram.
 #
 # Operator-only BY CONSTRUCTION:
-#   * recipient (operator chat_id) and notifier path are HARDCODED here — a worker
-#     supplies ONLY the message text and cannot redirect the recipient;
+#   * recipient (operator chat_id) is read from a FIXED absolute file (the operator's
+#     server .env), and the notifier path is HARDCODED — NOT from $PATH/env/argv — so a
+#     worker supplies ONLY the message text and cannot redirect the recipient;
 #   * the message is passed to telegram_notify.sh as a SINGLE argv element, and that
 #     script's arg parser breaks on the first non-flag (so a message containing
 #     "--chat-id 999" is treated as text, never re-parsed into flags);
@@ -19,9 +20,14 @@
 #   Bash(/opt/projects/active/claude-control/bin/claude-auto-tg:*)
 set -u
 
-OPERATOR_CHAT_ID="128989844"                                   # rainor — hardcoded
+# Recipient = the operator's OWN Telegram chat. Read it from the operator's server .env
+# (fixed absolute path, NOT $PATH/env/argv) so a worker still cannot redirect it — a
+# plain env var would be worker-overridable and break the operator-only guarantee.
+OPERATOR_ENV="/home/rainor/server/.env"
+OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
 TG="/home/rainor/server/server_monitor/telegram_notify.sh"     # absolute — NOT $PATH/env
 
+[ -n "$OPERATOR_CHAT_ID" ] || { echo "claude-auto-tg: operator chat_id unavailable ($OPERATOR_ENV)" >&2; exit 1; }
 [ -x "$TG" ] || { echo "claude-auto-tg: notifier unavailable ($TG)" >&2; exit 1; }
 
 # Everything passed is the message body. We do NOT parse flags: the worker controls

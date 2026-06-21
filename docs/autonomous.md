@@ -146,9 +146,9 @@ Config shape (one full probe set, not a diff):
 
 ```json
 { "probes": [
-  { "name": "asana-1215419932736878",
+  { "name": "asana-EXAMPLE",
     "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/asana-comments",
-            "--task", "1215419932736878", "--author", "794146060752"],
+            "--task", "ASANA_TASK_GID", "--author", "ASANA_AUTHOR_GID"],
     "interval_sec": 120, "source": "asana", "timeout_sec": 40 }
 ] }
 ```
