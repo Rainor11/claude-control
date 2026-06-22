@@ -988,16 +988,29 @@ async def _safe_edit(message, text, kb):
 
 
 def wl_workers_kb():
+    """Worker picker: one button per worker prefixed with 🟢/🔴 by unit state, plus a
+    stats header (active/stopped counts). Returns (header_text, kb). Blocking
+    (systemctl is-active per worker) → callers run it via asyncio.to_thread.
+    The 🟢/🔴 lives only in the button TEXT — callback_data stays `wl:w:<worker>`."""
+    workers = _list_workers()
+    states = {w: _worker_active(w) for w in workers}
     rows, pair = [], []
-    for w in _list_workers():
-        pair.append(InlineKeyboardButton(text=w, callback_data=f"wl:w:{w}"))
+    for w in workers:
+        dot = "🟢" if states[w] else "🔴"
+        pair.append(InlineKeyboardButton(text=f"{dot} {w}", callback_data=f"wl:w:{w}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
-    return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(
-        text="(нет воркеров)", callback_data="wl:list")]])
+    if not rows:
+        return ("🤖 <b>Воркеры</b>\nНе нашёл воркеров.",
+                InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                    text="(нет воркеров)", callback_data="wl:list")]]))
+    active = sum(1 for v in states.values() if v)
+    header = (f"🤖 <b>Воркеры</b> · 🟢 {active} актив. · 🔴 {len(workers) - active} остановл.\n"
+              "Выбери воркера:")
+    return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def wl_worker_view(worker):
@@ -1069,10 +1082,8 @@ def wl_worker_view(worker):
 async def cmd_whitelist_text(message: Message):
     if not authed_user_chat(message.from_user.id, message.chat.id):
         return
-    kb = await asyncio.to_thread(wl_workers_kb)
-    await message.answer("🤖 <b>Воркеры</b>\nВыбери воркера — статус, контекст, датчики, "
-                         "доступы и терминал в одной карточке:",
-                         parse_mode="HTML", reply_markup=kb)
+    text, kb = await asyncio.to_thread(wl_workers_kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def cb_wl(cb: CallbackQuery):
@@ -1092,8 +1103,8 @@ async def cb_wl(cb: CallbackQuery):
         return
 
     if sub == "list":
-        kb = await asyncio.to_thread(wl_workers_kb)
-        await _safe_edit(cb.message, "🤖 <b>Воркеры</b>\nВыбери воркера:", kb)
+        text, kb = await asyncio.to_thread(wl_workers_kb)
+        await _safe_edit(cb.message, text, kb)
         await cb.answer()
         return
 
