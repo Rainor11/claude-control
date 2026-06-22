@@ -209,6 +209,7 @@ cmd_adopt() {
   [ -n "$cwd" ] || die "adopt: --cwd <dir> required"
   [ -n "$name" ] || die "adopt: --name <name> required"
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "adopt: name must be [a-zA-Z0-9_-]"
+  [ "${#name}" -le 40 ] || die "adopt: --name too long (max 40 chars)"  # keep in sync with RnR bot _WORKER_RE
   [ -d "$cwd" ] || die "adopt: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"  # absolutize
 

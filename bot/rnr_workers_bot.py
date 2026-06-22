@@ -893,16 +893,25 @@ def _wl_pending_put(mid, worker):
     _WL_ADD_PENDING[mid] = worker
 
 
+# Worker-name charset AND length bound — kept in sync with `claude-auto adopt`
+# (which enforces the same 40-char cap), so the bot never hides a legitimately
+# created worker. The cap also keeps every callback_data (longest is
+# "wl:rmc:<worker>:<idx>:<token>" ≈ worker+19) safely under Telegram's 64-byte
+# limit, and filters odd dir names out of the inline buttons.
+_WORKER_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+
+
 def _list_workers():
     try:
         return sorted(n for n in os.listdir(WORKERS_DIR)
-                      if os.path.isdir(os.path.join(WORKERS_DIR, n)))
+                      if _WORKER_RE.fullmatch(n)
+                      and os.path.isdir(os.path.join(WORKERS_DIR, n)))
     except OSError:
         return []
 
 
 def _valid_worker(w):
-    return bool(w) and bool(re.fullmatch(r"[A-Za-z0-9_-]+", w)) \
+    return bool(w) and bool(_WORKER_RE.fullmatch(w)) \
         and os.path.isdir(os.path.join(WORKERS_DIR, w))
 
 
@@ -936,6 +945,27 @@ def _run_allow(action, worker, entry=None):
         return 99, str(e)
 
 
+def _run_lifecycle(action, worker):
+    """stop|start a worker via claude-auto. Idempotent and registry-aware
+    (stop → state=stopped so the reconciler won't wake it; start → state=active).
+    systemctl can be slower than `allow` → wider timeout. Returns (rc, short_out)."""
+    try:
+        p = subprocess.run([CLAUDE_AUTO, action, worker], capture_output=True, timeout=30)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return 99, str(e)
+
+
+def _confirm_kb(yes_cb, yes_label, back_cb):
+    """Two-button confirm row: [<yes_label> → yes_cb] [↩️ Отмена → back_cb]."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=yes_label, callback_data=yes_cb),
+        InlineKeyboardButton(text="↩️ Отмена", callback_data=back_cb),
+    ]])
+
+
 def _entry_token(kind, val):
     """Short fingerprint of a whitelist entry — embedded in the 🗑 callback so a stale
     button (list changed since render) can't delete a different entry by index."""
@@ -944,12 +974,17 @@ def _entry_token(kind, val):
 
 async def _safe_edit(message, text, kb):
     """edit_text that ignores Telegram's benign 'message is not modified' but logs
-    real failures (so a length-blowup doesn't silently leave a stale card)."""
+    real failures (so a length-blowup doesn't silently leave a stale card).
+    Returns True if the card now shows the intended content (edited OR already
+    identical), False on a real failure so the caller can surface a fallback."""
     try:
         await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        return True
     except Exception as e:  # noqa: BLE001
-        if "not modified" not in str(e).lower():
-            log.warning("whitelist card edit failed: %s", e)
+        if "not modified" in str(e).lower():
+            return True
+        log.warning("whitelist card edit failed: %s", e)
+        return False
 
 
 def wl_workers_kb():
@@ -1018,6 +1053,11 @@ def wl_worker_view(worker):
             text=f"🗑 {'💬' if kind == 'tg' else '📧'} {short}",
             callback_data=f"wl:rm:{worker}:{i}:{_entry_token(kind, val)}")])
     rows.append([InlineKeyboardButton(text="➕ Добавить контакт", callback_data=f"wl:add:{worker}")])
+    # lifecycle: one state-aware button (sleep needs confirm, wake is immediate)
+    if active:
+        rows.append([InlineKeyboardButton(text="⏸️ Усыпить", callback_data=f"wl:stop:{worker}")])
+    else:
+        rows.append([InlineKeyboardButton(text="▶️ Разбудить", callback_data=f"wl:start:{worker}")])
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:w:{worker}"),
                  InlineKeyboardButton(text="⬅️ К воркерам", callback_data="wl:list")])
     text = "\n".join(lines)
@@ -1043,13 +1083,21 @@ async def cb_wl(cb: CallbackQuery):
     parts = (cb.data or "").split(":")
     sub = parts[1] if len(parts) > 1 else ""
 
+    # Strict arity: reject unknown subs AND trailing junk (hardens the protocol so
+    # only well-formed operator callbacks act). worker is at parts[2] (when present).
+    arity = {"list": 2, "w": 3, "add": 3, "start": 3, "stop": 3,
+             "stopc": 3, "rm": 5, "rmc": 5}
+    if arity.get(sub) != len(parts):
+        await cb.answer("неизвестная команда", show_alert=True)
+        return
+
     if sub == "list":
         kb = await asyncio.to_thread(wl_workers_kb)
         await _safe_edit(cb.message, "🤖 <b>Воркеры</b>\nВыбери воркера:", kb)
         await cb.answer()
         return
 
-    worker = parts[2] if len(parts) > 2 else ""
+    worker = parts[2]
     if not _valid_worker(worker):
         await cb.answer("воркер не найден", show_alert=True)
         return
@@ -1060,26 +1108,83 @@ async def cb_wl(cb: CallbackQuery):
         await cb.answer()
         return
 
-    if sub == "rm":
+    # ---- lifecycle: start (immediate, harmless) / stop (confirm → stopc) ----
+    if sub == "start":
+        await cb.answer("бужу…")  # answer first — the subprocess may outlast the 15s callback TTL
+        rc, out = await asyncio.to_thread(_run_lifecycle, "start", worker)
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)  # card reflects the REAL state (is-active)
+        if rc != 0:
+            await cb.message.answer(
+                f"❌ Не удалось разбудить «{esc(worker)}»: <code>{esc(out)}</code>",
+                parse_mode="HTML")
+        return
+
+    if sub == "stop":
+        # confirm step — stop interrupts the worker's current turn (context is kept).
+        # Ack the callback FIRST (instant, within the TTL), THEN edit the card.
+        await cb.answer()
+        ok = await _safe_edit(
+            cb.message,
+            f"⏸️ Усыпить воркера «<b>{esc(worker)}</b>»?\n"
+            f"Текущая работа прервётся, но весь контекст сделки сохранится — "
+            f"разбудишь, и он продолжит с того же места.",
+            _confirm_kb(f"wl:stopc:{worker}", "⏸️ Усыпить", f"wl:w:{worker}"))
+        if not ok:
+            await cb.message.answer("⚠️ Не смог показать подтверждение — открой карточку воркера заново.")
+        return
+
+    if sub == "stopc":
+        await cb.answer("усыпляю…")
+        rc, out = await asyncio.to_thread(_run_lifecycle, "stop", worker)
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)
+        if rc != 0:
+            await cb.message.answer(
+                f"❌ Не удалось усыпить «{esc(worker)}»: <code>{esc(out)}</code>",
+                parse_mode="HTML")
+        return
+
+    # ---- whitelist removal: rm (confirm) → rmc (execute) -------------------
+    if sub in ("rm", "rmc"):
         try:
             idx = int(parts[3])
-        except (ValueError, IndexError):
+        except ValueError:
             await cb.answer("битый индекс", show_alert=True)
             return
-        token = parts[4] if len(parts) > 4 else ""
+        token = parts[4]
         entries = await asyncio.to_thread(_read_allow_entries, worker)
-        # stale-button guard: index AND content fingerprint must still match, else the
-        # list changed under us → refresh instead of removing the wrong contact.
+        # stale-button guard, checked on BOTH confirm and execute: index AND content
+        # fingerprint must still match, else the list changed → refresh, don't act.
         if idx < 0 or idx >= len(entries) or _entry_token(*entries[idx]) != token:
+            await cb.answer("список изменился — обновил", show_alert=True)
             text, kb = await asyncio.to_thread(wl_worker_view, worker)
             await _safe_edit(cb.message, text, kb)
-            await cb.answer("список изменился — обновил", show_alert=True)
             return
         kind, val = entries[idx]
+        if sub == "rm":
+            await cb.answer()  # ack first, then edit
+            contacts = await asyncio.to_thread(_load_contacts)
+            nm = _tg_name(val, contacts) if kind == "tg" else ""
+            ok = await _safe_edit(
+                cb.message,
+                f"🗑 Убрать из доступов «<b>{esc(worker)}</b>»?\n"
+                f"{'💬' if kind == 'tg' else '📧'} <code>{esc(val)}</code>"
+                + (f" — {esc(nm)}" if nm else "")
+                + "\nПосле этого воркер не сможет писать этому контакту без твоего аппрува.",
+                _confirm_kb(f"wl:rmc:{worker}:{idx}:{token}", "🗑 Убрать", f"wl:w:{worker}"))
+            if not ok:
+                await cb.message.answer("⚠️ Не смог показать подтверждение — открой карточку воркера заново.")
+            return
+        # sub == "rmc" — execute the removal
+        await cb.answer("убираю…")
         rc, _out = await asyncio.to_thread(_run_allow, "remove", worker, f"{kind}:{val}")
         text, kb = await asyncio.to_thread(wl_worker_view, worker)
         await _safe_edit(cb.message, text, kb)
-        await cb.answer("убрал ✅" if rc == 0 else "ошибка ❌", show_alert=(rc != 0))
+        if rc != 0:
+            await cb.message.answer(
+                f"❌ Не удалось убрать <code>{esc(val)}</code> у «{esc(worker)}»",
+                parse_mode="HTML")
         return
 
     if sub == "add":
