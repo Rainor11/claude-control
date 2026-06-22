@@ -115,7 +115,13 @@ valid_interval() {
 notify() {  # best-effort, sanitized (no raw args); never blocks the change
   local msg="$1"
   [ -x "$TG" ] || return 0
-  "$TG" "🔧 Датчики воркера «$NAME»: $msg" >/dev/null 2>&1 || true
+  # Route to the @RnR_Workers bot when its token is valid in .env; else default bot.
+  local rnr_val
+  rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' /home/rainor/server/.env 2>/dev/null | head -1 \
+              | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
+  local -a botflag=()
+  [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
+  "$TG" "${botflag[@]}" "🔧 Датчики воркера «$NAME»: $msg" >/dev/null 2>&1 || true
 }
 
 # Apply a new probes array (compact JSON) via the operator validator. flock covers
