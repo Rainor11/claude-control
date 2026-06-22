@@ -89,6 +89,8 @@ while tmux has-session -t "$sess" 2>/dev/null; do
     last="${LASTRUN[$pname]:-0}"
     if [ $(( now - last )) -ge "$interval" ]; then
       LASTRUN[$pname]="$now"
+      # Persist last-run (best-effort) so the RnR bot can show the next scheduled run.
+      printf '%s\n' "$now" > "$statedir/.lastrun-$(ident "$pname")" 2>/dev/null || true
       # build argv: cmd is array or string
       if jq -e '.cmd | type=="array"' <<<"$probe" >/dev/null 2>&1; then
         mapfile -t pcmd < <(jq -r '.cmd[]' <<<"$probe")
