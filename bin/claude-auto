@@ -114,9 +114,16 @@ emit_identity_sections() {
   echo "actions (data exfiltration, mass deletion, prod deploys, force-push). On top of that"
   echo "your operator's deny rules (\`rm -rf\`, \`sudo\`, reading secrets) and ask rules still"
   echo "apply — those are the hard fence."
-  echo "- Reaching a person OUTSIDE this server — an email, or a Telegram message to ANYONE"
-  echo "  other than your operator — is gated and will PAUSE for the operator to approve."
-  echo "  Don't try to route around it (e.g. by calling an API from a script)."
+  echo "- Messaging a PERSON (no blocking modal anymore):"
+  echo "  • Telegram → \`claude-auto-send tg <chat_id> '<your message>'\` — sends WITHOUT"
+  echo "    approval, but ONLY to operator-whitelisted contacts; a non-whitelisted chat_id"
+  echo "    is refused (you won't freeze). Do NOT use raw telegram_notify.sh (denied)."
+  echo "  • Email → use the normal send_email tool — whitelisted recipients go without"
+  echo "    approval, others are refused (non-blocking)."
+  echo "  • If a recipient is NOT whitelisted: do NOT retry, do NOT route around it. Post"
+  echo "    your draft + the intended recipient to the operator via \`claude-auto-tg\` and"
+  echo "    PARK the task — the operator will whitelist them or send it. NEVER block waiting;"
+  echo "    continue other work. The whitelist is operator-only (you cannot edit it)."
   echo "- You CANNOT change your own permissions (allow/ask/deny) — operator-only. If you"
   echo "  need one widened, say so in your output."
   echo
@@ -362,7 +369,8 @@ cmd_adopt() {
     "Edit(//${home#/}/**)" "Write(//${home#/}/**)" \
     "Edit(//${CONTROL_DIR#/}/**)" "Write(//${CONTROL_DIR#/}/**)" \
     "Edit(//${REPO_DIR#/}/**)" "Write(//${REPO_DIR#/}/**)" \
-    "Bash(claude-auto:*)" "Bash(tmux:*)" "Bash(codex:*)" \
+    "Bash(claude-auto:*)" "Bash(${BIN_DIR}/claude-auto:*)" "Bash(tmux:*)" "Bash(codex:*)" \
+    "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)" \
     | sed '/^$/d' | jq -R . | jq -s 'unique')
   # Bash(codex:*): raw Codex CLI has NO request timeout (a worker once hung 8h on a raw
   # background Codex). Deny it so the ONLY path is the bounded `bash …/codex_rescue.sh …`
@@ -382,15 +390,16 @@ cmd_adopt() {
   allow_json=$(printf '%s\n' "${allow[@]:-}" \
     "Bash(claude-auto-self-probes:*)" \
     "Bash(${BIN_DIR}/claude-auto-tg:*)" \
-    | sed '/^$/d' | jq -R . | jq -s 'unique')
-  # Baseline ask (always added): the narrow operator-approval gate on client-facing
-  # outbound — email + general telegram_notify.sh (to ANY recipient) + git push. ask
-  # rules still prompt in auto mode. (claude-auto-tg is NOT here → it reaches only the
-  # operator and runs free.)
-  ask_json=$(printf '%s\n' "${ask[@]:-}" \
-    "mcp__google-workspace__send_email" "mcp__google-workspace-rainor__send_email" \
+    "Bash(${BIN_DIR}/claude-auto-send:*)" \
     "mcp__google-workspace__draft_email" "mcp__google-workspace-rainor__draft_email" \
-    "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)" \
+    | sed '/^$/d' | jq -R . | jq -s 'unique')
+  # Baseline ask (always added): only git push now. Person-messaging is NOT in `ask`
+  # anymore — it would force a BLOCKING modal that freezes the unattended worker. TG
+  # goes through `claude-auto-send` (allow; validates recipient vs the per-worker
+  # whitelist) and raw telegram_notify.sh is in `deny`; email send is gated by the
+  # claude-auto-people-gate PreToolUse hook (whitelisted → allow, else NON-blocking
+  # deny). draft_email is in `allow` (a draft is not an external send).
+  ask_json=$(printf '%s\n' "${ask[@]:-}" \
     "Bash(git push:*)" \
     | sed '/^$/d' | jq -R . | jq -s 'unique')
 
@@ -416,10 +425,13 @@ cmd_adopt() {
     --arg notify "$BIN_DIR/claude-auto-notify $name" \
     --arg ledger "$BIN_DIR/claude-auto-asana-self-ledger $home/state" \
     --arg gledger "$BIN_DIR/claude-auto-gmail-self-ledger $home/state" \
+    --arg pgate "$BIN_DIR/claude-auto-people-gate $name" \
     '{enableAllProjectMcpServers: true,
       permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
+        PreToolUse:[{matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email",
+                     hooks:[{type:"command", command:$pgate}]}],
         PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story",
                       hooks:[{type:"command", command:$ledger}]},
                      {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email",
@@ -761,7 +773,8 @@ cmd_upgrade() {
   local ledgercmd="$BIN_DIR/claude-auto-asana-self-ledger $home/state"
   local gledgercmd="$BIN_DIR/claude-auto-gmail-self-ledger $home/state"
   t="$(mktemp "$home/.set.XXXXXX")" || die "upgrade: mktemp failed"
-  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" \
+  local pgatecmd="$BIN_DIR/claude-auto-people-gate $name"
+  jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" --arg pgatecmd "$pgatecmd" \
      --arg repo "${REPO_DIR#/}" --arg bin "$BIN_DIR" --arg whome "${home#/}" --arg cdir "${CONTROL_DIR#/}" '
     .enableAllProjectMcpServers = true
     | .hooks = (.hooks // {})
@@ -772,26 +785,38 @@ cmd_upgrade() {
           | select( ([ .hooks[]?.command // empty | select(test("claude-auto-(asana|gmail)-self-ledger")) ] | length) == 0 ) ]
         + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]},
            {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$gledgercmd}]}] )
+    | .hooks.PreToolUse = (
+        [ (.hooks.PreToolUse // [])[]
+          | select( ([ .hooks[]?.command // empty | select(test("claude-auto-people-gate")) ] | length) == 0 ) ]
+        + [{matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$pgatecmd}]}] )
     | .permissions = (.permissions // {})
     | .permissions.deny = ((.permissions.deny // []) + ([
-          "Bash(claude-auto:*)", "Bash(tmux:*)", "Bash(codex:*)",
+          "Bash(claude-auto:*)", ("Bash(" + $bin + "/claude-auto:*)"), "Bash(tmux:*)", "Bash(codex:*)",
           "Bash(sudo:*)", "Bash(rm -rf:*)", "Bash(rm -fr:*)",
           "Read(/home/rainor/.ssh/**)", "Read(**/.env*)", "Read(**/secrets/**)",
           "Read(**/credentials*.json)", "Read(**/id_rsa*)", "Read(/home/rainor/.aws/**)",
           ("Edit(//" + $whome + "/**)"), ("Write(//" + $whome + "/**)"),
           ("Edit(//" + $cdir + "/**)"), ("Write(//" + $cdir + "/**)"),
-          ("Edit(//" + $repo + "/**)"), ("Write(//" + $repo + "/**)")
+          ("Edit(//" + $repo + "/**)"), ("Write(//" + $repo + "/**)"),
+          "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)"
         ] - (.permissions.deny // [])))
-    | .permissions.allow = ((.permissions.allow // []) + ([
+    | .permissions.allow = (((.permissions.allow // [])
+          | map(select((test("telegram_notify")|not)
+                       and . != "mcp__google-workspace__send_email"
+                       and . != "mcp__google-workspace-rainor__send_email")))
+        + ([
           "Bash(claude-auto-self-probes:*)",
-          ("Bash(" + $bin + "/claude-auto-tg:*)")
+          ("Bash(" + $bin + "/claude-auto-tg:*)"),
+          ("Bash(" + $bin + "/claude-auto-send:*)"),
+          "mcp__google-workspace__draft_email", "mcp__google-workspace-rainor__draft_email"
         ] - (.permissions.allow // [])))
-    | .permissions.ask = ((.permissions.ask // []) + ([
-          "mcp__google-workspace__send_email", "mcp__google-workspace-rainor__send_email",
-          "mcp__google-workspace__draft_email", "mcp__google-workspace-rainor__draft_email",
-          "Bash(/home/rainor/server/server_monitor/telegram_notify.sh:*)",
-          "Bash(git push:*)"
-        ] - (.permissions.ask // [])))
+    | .permissions.ask = (((.permissions.ask // [])
+          | map(select((test("telegram_notify")|not)
+                       and . != "mcp__google-workspace__send_email"
+                       and . != "mcp__google-workspace-rainor__send_email"
+                       and . != "mcp__google-workspace__draft_email"
+                       and . != "mcp__google-workspace-rainor__draft_email")))
+        + (["Bash(git push:*)"] - (.permissions.ask // [])))
   ' "$s" > "$t" 2>/dev/null && jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "upgrade: settings.json patch failed"; }
   if cmp -s "$t" "$s"; then rm -f "$t"; else chmod 600 "$t" 2>/dev/null||true; mv "$t" "$s"; changed+=("settings.json"); fi
 
@@ -944,6 +969,11 @@ CLAUDE.md) и свой поток событий (датчики event-bridge).
   get-probes <имя>             показать датчики воркера
   set-probes <имя> <config>    заменить набор датчиков живьём (без рестарта, ~5с)
 
+БЕЛЫЙ СПИСОК (кому воркер пишет БЕЗ подтверждения: TG + почта)
+  allow list <имя>                       показать белый список воркера
+  allow add <имя> tg:<chat_id>|email:<addr>     добавить контакт
+  allow remove <имя> tg:<chat_id>|email:<addr>  убрать контакт
+
 ЖИЗНЕННЫЙ ЦИКЛ
   start <имя>                  запустить / поднять юнит
   stop <имя>                   остановить + отключить юнит (файлы сохраняются)
@@ -960,6 +990,42 @@ allow/ask/deny), смену датчиков — /worker-probes.
 USAGE
 }
 
+# ---- allow (operator-managed per-worker whitelist for claude-auto-send + people-gate) ----
+# The whitelist file (~/.claude-control/workers/<name>/people-allow) lists contacts the
+# worker may message WITHOUT approval: lines `tg <chat_id>` / `email <addr>`. Operator-only:
+# the worker has `claude-auto` (PATH + abs path) in deny, so it cannot run this.
+cmd_allow() {
+  local action="${1:-}"; [ "$#" -gt 0 ] && shift || true
+  local name="${1:-}"; [ "$#" -gt 0 ] && shift || true
+  [ -n "$action" ] && [ -n "$name" ] || die "usage: allow {list|add|remove} <worker> [tg:<chat_id>|email:<addr>]"
+  worker_exists "$name" || die "no worker '$name'"
+  local af="$WORKERS_DIR/$name/people-allow"
+  case "$action" in
+    list)
+      if [ -s "$af" ]; then cat "$af"; else echo "(белый список пуст для '$name')"; fi ;;
+    add|remove)
+      local entry="${1:-}"; [ -n "$entry" ] || die "usage: allow $action <worker> tg:<chat_id>|email:<addr>"
+      local kind val line
+      case "$entry" in
+        tg:*)    kind=tg;    val="${entry#tg:}";    [[ "$val" =~ ^-?[0-9]+$ ]] || die "tg chat_id must be numeric: '$val'" ;;
+        email:*) kind=email; val="${entry#email:}"
+                 case "$val" in *[[:space:]]*|*[!A-Za-z0-9._%+@-]*) die "email has illegal chars: '$val'" ;; esac
+                 case "$val" in *@*.*) ;; *) die "email looks invalid (need addr@dom.tld): '$val'" ;; esac
+                 val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')" ;;
+        *) die "entry must be tg:<chat_id> or email:<addr> (got: '$entry')" ;;
+      esac
+      line="$kind $val"
+      mkdir -p "$WORKERS_DIR/$name"; touch "$af"
+      local t; t="$(mktemp "$WORKERS_DIR/$name/.pa.XXXXXX")" || die "mktemp failed"
+      grep -vxF "$line" "$af" 2>/dev/null > "$t" || true   # drop existing identical (idempotent)
+      [ "$action" = add ] && printf '%s\n' "$line" >> "$t"
+      chmod 600 "$t" 2>/dev/null || true
+      mv "$t" "$af"
+      echo "$action ok: $line  ($af)" ;;
+    *) die "usage: allow {list|add|remove} <worker> [tg:<chat_id>|email:<addr>]" ;;
+  esac
+}
+
 # ---- dispatch --------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "$sub" in
@@ -973,6 +1039,7 @@ case "$sub" in
   get-probes) cmd_get_probes "$@" ;;
   set-probes) cmd_set_probes "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
+  allow) cmd_allow "$@" ;;
   install-units) cmd_install_units ;;
   ""|-h|--help) usage ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;

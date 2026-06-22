@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# claude-auto-send — let an autonomous worker message a WHITELISTED person on
+# Telegram WITHOUT an approval modal. The recipient must be in this worker's
+# operator-managed allowlist (~/.claude-control/workers/<name>/people-allow).
+# Non-whitelisted → refused (the worker must escalate to the operator via
+# claude-auto-tg and PARK — it is told so by its awareness).
+#
+# Boundary (honest): this gates the RECIPIENT in normal operation and removes the
+# blocking approval modal. It is NOT a sandbox against a fully-compromised worker
+# (which already has Bash(node:*) etc. and could write same-user files) — that is
+# the documented OS-sandbox ceiling, unchanged by this primitive.
+#
+# Why this is injection-safe for the RECIPIENT gate:
+#   * worker identity comes from the spoof-resistant /proc ancestor `claude --resume`
+#     environ (same mechanism as claude-auto-self-probes), NOT from CLAUDE_AUTO_NAME;
+#   * the message is handed to telegram_notify.sh as a SINGLE argv element AFTER `--`,
+#     so a message starting with `--chat-id`/`--bot-token-env` can never be re-parsed
+#     as a flag and redirected;
+#   * the notifier path is ABSOLUTE (not $PATH/env), like claude-auto-tg.
+#
+# Usage (worker-facing):  claude-auto-send tg <chat_id> <message…>
+# Allow in a worker by ABSOLUTE path only:
+#   Bash(/opt/projects/active/claude-control/bin/claude-auto-send:*)
+set -u
+
+TG="/home/rainor/server/server_monitor/telegram_notify.sh"   # absolute — NOT $PATH/env
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"            # trusted claude tree (hardcoded)
+
+die() { echo "claude-auto-send: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — mirrors claude-auto-self-probes resolve_name ----
+# Walk the PPID chain to the worker's `claude` process (cmdline has `--resume` AND
+# its real exe is inside the trusted claude tree), and read THAT process's
+# CLAUDE_AUTO_NAME from /proc. A worker cannot rewrite an ancestor's environ, and a
+# bash/python wrapper carrying a forged --resume fails the exe-tree check.
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+channel="${1:-}"; [ "$#" -gt 0 ] && shift || true
+[ "$channel" = "tg" ] || die "usage: claude-auto-send tg <chat_id> <message…>"
+
+chat_id="${1:-}"; [ "$#" -gt 0 ] && shift || true
+[[ "$chat_id" =~ ^-?[0-9]+$ ]] || die "chat_id must be numeric (got: '${chat_id}')"
+
+msg="$*"
+[ -n "$msg" ] || die "empty message"
+
+NAME="$(resolve_name)" || die "cannot determine worker identity (run from inside a worker session)"
+[[ "$NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || die "resolved worker name '$NAME' has illegal chars"
+
+ALLOW_FILE="$CONTROL_DIR/workers/$NAME/people-allow"
+[ -f "$ALLOW_FILE" ] || die "recipient $chat_id is NOT whitelisted for '$NAME' (no list) — escalate to the operator via claude-auto-tg and park; do NOT retry"
+
+# Match a line `tg <chat_id>` (leading ws + trailing comment tolerated). chat_id is
+# pre-validated to ^-?[0-9]+$ so it is safe to interpolate into the regex.
+if ! grep -qE "^[[:space:]]*tg[[:space:]]+${chat_id}([[:space:]]|\$)" "$ALLOW_FILE"; then
+  die "recipient $chat_id is NOT in '$NAME' whitelist — escalate to the operator via claude-auto-tg and park; do NOT retry"
+fi
+
+[ -x "$TG" ] || die "notifier unavailable ($TG)"
+
+# Sanitize control chars (keep tab/newline/CR), cap length under Telegram's limit.
+msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037' | cut -c1-3500)"
+
+# `--` ends telegram_notify flag parsing → the message is never re-parsed as a flag.
+exec "$TG" --as-me --chat-id "$chat_id" -- "$msg"

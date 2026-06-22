@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# claude-auto-people-gate <worker-name> — PreToolUse hook that gates the email-send
+# MCP tools (mcp__google-workspace__send_email / mcp__google-workspace-rainor__
+# send_email) for an autonomous worker against its operator-managed allowlist
+# (~/.claude-control/workers/<name>/people-allow, lines `email <addr>`).
+#
+#   ALL recipients (to+cc+bcc) whitelisted → permissionDecision: allow (no modal)
+#   otherwise / any doubt                  → permissionDecision: deny  (NON-blocking;
+#                                            the worker is told to escalate + park)
+#
+# Registered in settings.json as: { matcher: "<the two send_email tools>",
+#   hooks:[{type:"command", command:"<bin>/claude-auto-people-gate <name>"}] }.
+# The <name> argv is trusted: a worker cannot edit its own settings.json (deny).
+#
+# Boundary (honest): this gates the RECIPIENT in normal operation. A fully-
+# compromised worker with Bash(node:*) could write same-user files — the documented
+# OS-sandbox ceiling, unchanged here. The strict recipient parsing below is the real
+# control for normal operation (display-name spoof, comma-lists, CR/LF header
+# injection, non-ASCII look-alikes are all rejected → deny).
+#
+# FAIL-CLOSED by emitting a deny JSON (NOT merely exiting non-zero): on missing node,
+# bad input, unreadable list, or any error → a valid deny decision is printed.
+set -u
+
+NAME="${1:-}"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+HARD_DENY='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"people-gate fail-closed: recipient could not be validated — treat as NOT whitelisted; escalate to the operator via claude-auto-tg and park, do not retry"}}'
+
+emit_hard_deny() { printf '%s\n' "$HARD_DENY"; exit 0; }
+
+case "$NAME" in ''|*[!a-zA-Z0-9_-]*) emit_hard_deny ;; esac
+ALLOW_FILE="$CONTROL_DIR/workers/$NAME/people-allow"
+
+command -v node >/dev/null 2>&1 || emit_hard_deny
+payload="$(cat 2>/dev/null)"
+
+IFS='' read -r -d '' GATE_JS <<'JS' || true
+const fs = require('fs');
+function out(decision, reason){
+  process.stdout.write(JSON.stringify({hookSpecificOutput:{
+    hookEventName:"PreToolUse", permissionDecision:decision, permissionDecisionReason:reason }}));
+  process.exit(0);
+}
+const DENY = "recipient is NOT in this worker's whitelist — escalate to the operator via claude-auto-tg and park; do NOT retry the send";
+let raw = "";
+try { raw = fs.readFileSync(0, "utf8"); } catch (e) { out("deny", "people-gate: no hook input"); }
+let j;
+try { j = JSON.parse(raw); } catch (e) { out("deny", "people-gate: unparseable hook input"); }
+const tool = j.tool_name || "";
+// Only adjudicate the two intended email-send tools (EXACT match). For anything else
+// (matcher drift / a future tool) emit NO decision — exit 0 with no output — so it
+// falls through to the normal permission rules. NEVER auto-"allow" an unexpected tool.
+if (tool !== "mcp__google-workspace__send_email" && tool !== "mcp__google-workspace-rainor__send_email")
+  process.exit(0);
+const ti = j.tool_input || {};
+
+// Load whitelisted email addresses for this worker.
+let allow = new Set();
+try {
+  const txt = fs.readFileSync(process.env.ALLOW_FILE || "", "utf8");
+  for (let line of txt.split(/\r?\n/)) {
+    line = line.replace(/#.*/, "").trim();
+    if (!line) continue;
+    const f = line.split(/\s+/);
+    if (f[0] === "email" && f[1]) allow.add(f[1].toLowerCase());
+  }
+} catch (e) { out("deny", DENY); }   // no list / unreadable → nothing whitelisted
+if (allow.size === 0) out("deny", DENY);
+
+// Collect raw recipient strings from to/cc/bcc (string OR array).
+const rawRcpts = [];
+(function collect(v){
+  if (v == null) return;
+  if (Array.isArray(v)) { v.forEach(collect); return; }
+  if (typeof v === "string") { rawRcpts.push(v); return; }
+  rawRcpts.push(null);   // unexpected shape (object/number) → invalid marker
+})(ti.to);
+[ti.cc, ti.bcc].forEach(function(v){
+  if (v == null) return;
+  if (Array.isArray(v)) v.forEach(x => rawRcpts.push(typeof x === "string" ? x : null));
+  else rawRcpts.push(typeof v === "string" ? v : null);
+});
+
+const addrs = [];
+for (const r of rawRcpts) {
+  if (r === null) out("deny", "people-gate: unsupported recipient shape");
+  for (let part of r.split(",")) {            // comma-separated string = multiple
+    part = part.trim();
+    if (!part) continue;
+    if (/[\x00-\x1f\x7f]/.test(part)) out("deny", "people-gate: control char in recipient (header-injection attempt)");
+    const m = part.match(/<([^>]*)>/);        // "Name" <addr@dom> → take <addr> only
+    const addr = (m ? m[1].trim() : part);
+    if (!/^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(addr))
+      out("deny", "people-gate: unparseable / non-ASCII recipient: " + addr);
+    addrs.push(addr.toLowerCase());
+  }
+}
+if (addrs.length === 0) out("deny", "people-gate: no recipients found");
+for (const a of addrs) if (!allow.has(a)) out("deny", DENY);
+out("allow", "people-gate: all recipients whitelisted for this worker");
+JS
+
+# Guard: if the embedded script failed to load, `node -e ""` would exit 0 with no
+# output → "no decision" → FAIL-OPEN for an email send. Deny instead.
+[ -n "$GATE_JS" ] || emit_hard_deny
+out="$(printf '%s' "$payload" | ALLOW_FILE="$ALLOW_FILE" node -e "$GATE_JS" 2>/dev/null)"; rc=$?
+# rc≠0 → node crashed → fail-closed deny. JSON decision → pass through. Empty + rc=0 →
+# node deliberately made NO decision (non-email tool) → emit nothing (normal rules apply).
+[ "$rc" -ne 0 ] && emit_hard_deny
+case "$out" in
+  *'"permissionDecision"'*) printf '%s\n' "$out" ;;
+  '') exit 0 ;;
+  *) emit_hard_deny ;;
+esac
+exit 0
