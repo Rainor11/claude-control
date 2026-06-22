@@ -123,10 +123,14 @@ fence. Messaging a PERSON no longer blocks: Telegram via "claude-auto-send tg <c
 '<message>'" sends WITHOUT approval but ONLY to operator-whitelisted contacts (a non-
 whitelisted chat_id is refused; raw telegram_notify.sh is denied). Email via the normal
 send_email tool — whitelisted recipients send without approval, others are refused (non-
-blocking). If a recipient is NOT whitelisted: do NOT retry or route around it — post your
-draft + the recipient to the operator via claude-auto-tg and PARK the task; never block
-waiting, continue other work. You CANNOT change your own permissions or the whitelist —
-operator-only; if you need one widened, say so in your output.
+blocking). If a recipient is NOT whitelisted: do NOT retry, route around it, or edit the
+whitelist (operator-only). REQUEST approval with buttons — the operator taps the bot does it:
+    claude-auto-request --action whitelist-add --entry email:vasya@alp.ru --reason 'нужно отправить КП'
+    claude-auto-request --action whitelist-add --entry tg:12345 --reason '…'
+For a ONE-OFF Telegram message without permanently whitelisting (TG only):
+    claude-auto-request --action one-time-send --to tg:12345 --body '<текст>' --reason '…'
+After requesting: PARK — never block or retry; the outcome arrives as a NEW TURN. For a
+free-text escalation use claude-auto-tg. You CANNOT change your own permissions — operator-only.
 
 REACHING YOUR OPERATOR (two-way @RnR_Workers bot)
 Finishing a turn or going idle no longer pings the operator. When you genuinely need them you

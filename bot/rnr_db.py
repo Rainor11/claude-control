@@ -80,6 +80,35 @@ def _init(conn):
         CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msg
             ON asks(chat_id, message_id) WHERE message_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_status ON asks(status);
+
+        -- approvals: worker→operator requests for a BOUNDED action from a CLOSED
+        -- catalog. The worker only INSERTs an 'open' row (no message_id); the bot
+        -- renders the canonical card from THIS row, records message_id, claims the
+        -- operator's decision once-only, then executes from the stored fields.
+        CREATE TABLE IF NOT EXISTS approvals (
+            qid             TEXT PRIMARY KEY,
+            worker          TEXT NOT NULL,
+            tmux_target     TEXT NOT NULL,            -- 'claude-<worker>'
+            chat_id         INTEGER NOT NULL,
+            message_id      INTEGER,                  -- set when the bot SENDS the card
+            action          TEXT NOT NULL,            -- whitelist-add|whitelist-remove|one-time-send
+            arg_kind        TEXT,                     -- 'tg' | 'email'
+            arg_value       TEXT,                     -- chat_id / email addr (the recipient)
+            payload         TEXT,                     -- one-time-send body (bound, shown + sent)
+            reason          TEXT,                     -- worker's stated reason (DATA, shown labeled)
+            status          TEXT NOT NULL DEFAULT 'open',  -- open|approved|sending|denied|executed|failed
+            decided_via     TEXT,                     -- 'button'
+            decided_at      TEXT,
+            executed_at     TEXT,                     -- action performed
+            notified_at     TEXT,                     -- outcome injected back to the worker (terminal)
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            result          TEXT,
+            created_at      TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_appr_chat_msg
+            ON approvals(chat_id, message_id) WHERE message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_appr_status ON approvals(status);
         """
     )
     conn.commit()
@@ -239,6 +268,193 @@ def mark_failed(qid):
         conn.close()
 
 
+# ---- approvals: closed-catalog action requests -----------------------------
+
+ALLOWED_ACTIONS = ("whitelist-add", "whitelist-remove", "one-time-send")
+
+
+def insert_approval(qid, worker, tmux_target, chat_id, action,
+                    arg_kind=None, arg_value=None, payload=None, reason=None):
+    """Insert an 'open' approval request. The worker is the ONLY caller (via the
+    claude-auto-request bash helper); the bot renders/sends the card from this row."""
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError("action not in closed catalog: %r" % (action,))
+    if arg_kind not in (None, "tg", "email"):
+        raise ValueError("arg_kind must be tg|email")
+    conn = connect()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO approvals "
+                "(qid,worker,tmux_target,chat_id,action,arg_kind,arg_value,payload,reason,status,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?)",
+                (qid, worker, tmux_target, int(chat_id), action, arg_kind,
+                 arg_value, payload, reason, now_iso()),
+            )
+    finally:
+        conn.close()
+
+
+def set_message_id_appr(qid, message_id):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute("UPDATE approvals SET message_id=? WHERE qid=?",
+                         (int(message_id), qid))
+    finally:
+        conn.close()
+
+
+def delete_approval(qid):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute("DELETE FROM approvals WHERE qid=?", (qid,))
+    finally:
+        conn.close()
+
+
+def next_unsent(limit=10):
+    """Open requests whose card was not sent yet (message_id IS NULL)."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM approvals WHERE status='open' AND message_id IS NULL "
+            "ORDER BY created_at ASC LIMIT ?", (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def claim_approval(qid, decision, decided_via="button"):
+    """Atomic once-only decision: open → approved|denied. Returns the row or None."""
+    if decision not in ("approved", "denied"):
+        raise ValueError("decision must be approved|denied")
+    conn = connect()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE approvals SET status=?, decided_via=?, decided_at=? "
+                "WHERE qid=? AND status='open'",
+                (decision, decided_via, now_iso(), qid),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = conn.execute("SELECT * FROM approvals WHERE qid=?", (qid,)).fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def lease_sending(qid):
+    """At-most-once guard for the non-idempotent one-time-send: atomically move
+    approved → sending. Returns the row if WE won the lease, else None (so a crash
+    after the Telegram call leaves status='sending' and is NEVER auto-resent)."""
+    conn = connect()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE approvals SET status='sending', last_attempt_at=? "
+                "WHERE qid=? AND status='approved'",
+                (now_iso(), qid),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = conn.execute("SELECT * FROM approvals WHERE qid=?", (qid,)).fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_appr_by_qid(qid):
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM approvals WHERE qid=?", (qid,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_appr_by_message(chat_id, message_id):
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM approvals WHERE chat_id=? AND message_id=? LIMIT 1",
+            (int(chat_id), int(message_id)),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def next_actionable(limit=20, retry_after_sec=0):
+    """Rows the exec loop must still act on: a decision was made (or a one-time-send
+    is mid-flight) but the worker hasn't been notified yet. Backoff via last_attempt_at."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(seconds=retry_after_sec)).isoformat()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM approvals WHERE notified_at IS NULL "
+            "AND status IN ('approved','executed','denied','sending','failed') "
+            "AND (last_attempt_at IS NULL OR last_attempt_at < ?) "
+            "ORDER BY decided_at ASC LIMIT ?",
+            (cutoff, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def record_attempt_appr(qid):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE approvals SET attempts=attempts+1, last_attempt_at=? WHERE qid=?",
+                (now_iso(), qid),
+            )
+            row = conn.execute("SELECT attempts FROM approvals WHERE qid=?", (qid,)).fetchone()
+            return row["attempts"] if row else 0
+    finally:
+        conn.close()
+
+
+def mark_executed(qid, result=None):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE approvals SET status='executed', executed_at=?, result=? WHERE qid=?",
+                (now_iso(), result, qid),
+            )
+    finally:
+        conn.close()
+
+
+def mark_exec_failed(qid, result=None):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE approvals SET status='failed', executed_at=?, result=? WHERE qid=?",
+                (now_iso(), result, qid),
+            )
+    finally:
+        conn.close()
+
+
+def mark_notified(qid):
+    conn = connect()
+    try:
+        with conn:
+            conn.execute("UPDATE approvals SET notified_at=? WHERE qid=?",
+                         (now_iso(), qid))
+    finally:
+        conn.close()
+
+
 # ---- CLI (for bash helpers + tests) ----------------------------------------
 
 def _emit(obj):
@@ -301,6 +517,20 @@ def main(argv=None):
     sp = sub.add_parser("mark-failed")
     sp.add_argument("--qid", required=True)
 
+    sp = sub.add_parser("insert-approval")
+    sp.add_argument("--qid", required=True)
+    sp.add_argument("--worker", required=True)
+    sp.add_argument("--tmux-target", required=True)
+    sp.add_argument("--chat-id", required=True, type=int)
+    sp.add_argument("--action", required=True, choices=list(ALLOWED_ACTIONS))
+    sp.add_argument("--arg-kind", choices=["tg", "email"])
+    sp.add_argument("--arg-value")
+    sp.add_argument("--payload")
+    sp.add_argument("--reason")
+
+    sp = sub.add_parser("get-appr-by-qid")
+    sp.add_argument("--qid", required=True)
+
     a = p.parse_args(argv)
 
     if a.cmd == "init":
@@ -335,6 +565,15 @@ def main(argv=None):
         mark_delivered(a.qid); return 0
     if a.cmd == "mark-failed":
         mark_failed(a.qid); return 0
+    if a.cmd == "insert-approval":
+        try:
+            insert_approval(a.qid, a.worker, a.tmux_target, a.chat_id, a.action,
+                            a.arg_kind, a.arg_value, a.payload, a.reason)
+        except sqlite3.IntegrityError:
+            return 3  # qid collision — caller retries with a fresh qid
+        return 0
+    if a.cmd == "get-appr-by-qid":
+        _emit(get_appr_by_qid(a.qid)); return 0
     return 1
 
 

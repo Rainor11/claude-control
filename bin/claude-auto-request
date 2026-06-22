@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# claude-auto-request — let an autonomous worker REQUEST a bounded, operator-approved
+# action from a CLOSED catalog, delivered over the @RnR_Workers bot as a card with
+# ✅/❌ buttons. The worker only REGISTERS the request (an 'open' row in the shared
+# approvals DB); the BOT renders + sends the canonical card from that row, claims the
+# operator's decision once-only, and (on ✅) EXECUTES the action itself. The worker
+# NEVER mutates the whitelist or sends the message — it just asks and PARKS.
+#
+# Closed catalog (anything else is refused — no arbitrary command approval):
+#   whitelist-add    --entry tg:<id>|email:<addr>   add a contact to MY people-allow
+#   whitelist-remove --entry tg:<id>|email:<addr>   remove one
+#   one-time-send    --to tg:<id> --body '<text>'   send ONE Telegram message without
+#                                                    permanently whitelisting (TG only)
+#
+# Operator-only BY CONSTRUCTION (same guarantees as claude-auto-ask):
+#   * worker identity is the spoof-resistant /proc ancestor (resolve_name), NOT
+#     CLAUDE_AUTO_NAME — so the request is bound to THIS worker's own name/whitelist;
+#   * recipient (operator chat_id) is read from a FIXED absolute .env;
+#   * this helper writes only an 'open' approvals row — it cannot whitelist or send.
+#
+# Usage (worker-facing):
+#   claude-auto-request --action whitelist-add  --entry email:a@b.ru --reason '…'
+#   claude-auto-request --action whitelist-remove --entry tg:12345 --reason '…'
+#   claude-auto-request --action one-time-send  --to tg:12345 --body '…' --reason '…'
+# Allow in a worker by ABSOLUTE path only:
+#   Bash(/opt/projects/active/claude-control/bin/claude-auto-request:*)
+set -u
+
+OPERATOR_ENV="/home/rainor/server/.env"
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
+DB="/opt/projects/active/claude-control/bot/rnr_db.py"
+BODY_MAX=2000
+REASON_MAX=400
+
+die() { echo "claude-auto-request: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — mirrors claude-auto-send/self-probes resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+# ---- args ----
+ACTION=""; ENTRY=""; TO=""; BODY=""; SUBJECT=""; REASON=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --action)  ACTION="${2-}";  shift 2 || die "missing --action value" ;;
+    --entry)   ENTRY="${2-}";   shift 2 || die "missing --entry value" ;;
+    --to)      TO="${2-}";      shift 2 || die "missing --to value" ;;
+    --body)    BODY="${2-}";    shift 2 || die "missing --body value" ;;
+    --subject) SUBJECT="${2-}"; shift 2 || die "missing --subject value" ;;
+    --reason)  REASON="${2-}";  shift 2 || die "missing --reason value" ;;
+    *) die "unknown arg '$1'" ;;
+  esac
+done
+
+case "$ACTION" in
+  whitelist-add|whitelist-remove|one-time-send) ;;
+  "") die "missing --action (whitelist-add|whitelist-remove|one-time-send)" ;;
+  *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send)" ;;
+esac
+
+command -v python3 >/dev/null 2>&1 || die "python3 required"
+[ -f "$DB" ] || die "db helper unavailable ($DB)"
+
+# ---- validate a kind:value entry (mirror claude-auto allow / people-gate validators) --
+# Echoes "<kind> <value>" on success.
+parse_entry() {
+  local e="$1" kind val
+  case "$e" in
+    tg:*)    kind=tg;    val="${e#tg:}";    [[ "$val" =~ ^-?[0-9]+$ ]] || die "tg chat_id must be numeric: '$val'" ;;
+    email:*) kind=email; val="${e#email:}"
+             case "$val" in *[[:space:]]*|*[!A-Za-z0-9._%+@-]*) die "email has illegal chars: '$val'" ;; esac
+             case "$val" in *@*.*) ;; *) die "email looks invalid (need addr@dom.tld): '$val'" ;; esac
+             val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')" ;;
+    *) die "entry must be tg:<chat_id> or email:<addr> (got: '$e')" ;;
+  esac
+  printf '%s %s' "$kind" "$val"
+}
+
+ARG_KIND=""; ARG_VALUE=""; PAYLOAD=""
+case "$ACTION" in
+  whitelist-add|whitelist-remove)
+    [ -n "$ENTRY" ] || die "--entry tg:<id>|email:<addr> required for $ACTION"
+    # NB: parse_entry `die`s inside $(...) which only exits the SUBSHELL — so capture
+    # its output AND propagate the exit (|| exit 1), else a bad entry would silently
+    # yield empty ARG_KIND/ARG_VALUE and register a malformed request.
+    parsed="$(parse_entry "$ENTRY")" || exit 1
+    read -r ARG_KIND ARG_VALUE <<<"$parsed"
+    ;;
+  one-time-send)
+    [ -n "$TO" ] || die "--to tg:<id> required for one-time-send"
+    parsed="$(parse_entry "$TO")" || exit 1
+    read -r ARG_KIND ARG_VALUE <<<"$parsed"
+    [ "$ARG_KIND" = tg ] || die "one-time-send supports only TG in v1 (--to tg:<id>); for email use --action whitelist-add"
+    [ -n "$BODY" ] || die "--body '<text>' required for one-time-send"
+    # strip control bytes (keep tab/newline), cap (bidi-strip happens in the bot's renderer)
+    PAYLOAD="$(printf '%s' "$BODY" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$BODY_MAX")"
+    [ -n "${PAYLOAD//[[:space:]]/}" ] || die "--body is empty after sanitization"
+    ;;
+esac
+
+# ---- reason (sanitize, cap) ----
+if [ -n "$REASON" ]; then
+  REASON="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$REASON_MAX")"
+fi
+
+# ---- operator chat_id (fixed; not worker-controlled) ----
+OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
+[ -n "$OPERATOR_CHAT_ID" ] || die "operator chat_id unavailable ($OPERATOR_ENV)"
+
+# ---- identity ----
+NAME="$(resolve_name)" || die "cannot determine worker identity (run from inside a worker session)"
+[[ "$NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || die "resolved worker name '$NAME' has illegal chars"
+
+# ---- register the request (unique qid; retry on PK collision) ----
+gen_qid() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; }
+qid=""
+for _try in 1 2 3 4 5; do
+  cand="$(gen_qid)"; [ -n "$cand" ] || die "qid generation failed"
+  args=(insert-approval --qid "$cand" --worker "$NAME" --tmux-target "claude-$NAME"
+        --chat-id "$OPERATOR_CHAT_ID" --action "$ACTION")
+  [ -n "$ARG_KIND" ]  && args+=(--arg-kind "$ARG_KIND")
+  [ -n "$ARG_VALUE" ] && args+=(--arg-value "$ARG_VALUE")
+  [ -n "$PAYLOAD" ]   && args+=(--payload "$PAYLOAD")
+  [ -n "$REASON" ]    && args+=(--reason "$REASON")
+  if python3 "$DB" "${args[@]}" 2>/dev/null; then qid="$cand"; break; fi
+  rc=$?
+  [ "$rc" = 3 ] && continue
+  die "could not register the request (db error rc=$rc)"
+done
+[ -n "$qid" ] || die "could not allocate a unique qid"
+
+echo "claude-auto-request: запрос «$ACTION» отправлен оператору на одобрение (qid=$qid). ПАРКУЙСЯ — придёт решение (✅/❌) новым ходом; НЕ ретрай, продолжай другую работу."
+exit 0

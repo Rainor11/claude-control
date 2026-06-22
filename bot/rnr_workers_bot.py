@@ -23,6 +23,7 @@ polling retry with backoff + getMe health-check + session reset.
 import asyncio
 import datetime
 import fcntl
+import hashlib
 import html
 import json
 import logging
@@ -36,6 +37,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -45,13 +49,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.normpath(os.path.join(HERE, "..", "bin"))
 SESSION_INJECT = os.path.join(BIN, "session-inject")
 CLAUDE_AUTO = os.path.join(BIN, "claude-auto")
+TG_NOTIFY = "/home/rainor/server/server_monitor/telegram_notify.sh"  # absolute
 CONTROL_DIR = os.environ.get("CLAUDE_CONTROL_DIR",
                              os.path.join(os.path.expanduser("~"), ".claude-control"))
 WORKERS_DIR = os.path.join(CONTROL_DIR, "workers")
 ENV_PATH = os.environ.get("RNR_ENV_PATH", "/home/rainor/server/.env")
-BTN_OVERVIEW = "📋 Воркеры — статус"
-BTN_PROBES = "📡 Датчики"
-BTN_ATTACH = "🔗 Терминал"
+BTN_OVERVIEW = "📊 Сводка"
+BTN_PROBES = "📡 Датчики"          # legacy (folded into the worker card; handler kept)
+BTN_ATTACH = "🔗 Терминал"         # legacy (folded into the worker card; handler kept)
+BTN_WHITELIST = "🤖 Воркеры"
 TG_LIMIT = 3900  # safe chunk size under Telegram's 4096
 
 sys.path.insert(0, HERE)
@@ -63,6 +69,16 @@ INJECT_TIMEOUT = 20   # session-inject wait-for-idle per attempt (short → loop
 RETRY_AFTER = 25      # don't re-attempt a row within this many seconds (> INJECT_TIMEOUT)
 ALERT_AT = 6          # attempts before a "still trying" ping (~few min)
 MAX_ATTEMPTS = 160    # give up + alert (a parked worker may stay busy a while)
+
+# --- approval flow tunables ---
+APPR_POLL_SEC = 5       # card-sender + exec loop tick
+APPR_MAX_ATTEMPTS = 60  # idempotent whitelist exec retries before giving up + alert
+
+ACTION_LABEL = {
+    "whitelist-add": "➕ Добавить в whitelist",
+    "whitelist-remove": "🗑 Убрать из whitelist",
+    "one-time-send": "✉️ Разовая отправка (Telegram)",
+}
 
 log = logging.getLogger("rnr-workers-bot")
 
@@ -106,6 +122,35 @@ def authed_user_chat(user_id, chat_id):
 def _sanitize(text, cap=3500):
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text or "")
     return text[:cap]
+
+
+# Auto-collected Telegram contact book (rainor-ai-business). Lets us show a human
+# name next to a bare chat_id. Read on demand (small file, infrequent renders).
+_CONTACTS_PATH = "/home/rainor/server/services/rainor_ai_business/contacts.json"
+
+
+def _load_contacts():
+    try:
+        with open(_CONTACTS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _tg_name(chat_id, contacts=None):
+    """Human label for a Telegram id ('Имя Фамилия (@user)' / '@user' / ''), from the
+    contact book. Empty when unknown — caller falls back to the raw id."""
+    c = contacts if contacts is not None else _load_contacts()
+    rec = c.get(str(chat_id))
+    if not isinstance(rec, dict):
+        return ""
+    name = ((rec.get("first_name") or "").strip() + " "
+            + (rec.get("last_name") or "").strip()).strip()
+    un = (rec.get("username") or "").strip()
+    if name and un:
+        return f"{name} (@{un})"
+    return name or (f"@{un}" if un else "")
 
 
 def run_session_inject(target, text):
@@ -342,8 +387,7 @@ def make_keyboard():
     # Persistent ReplyKeyboard — кнопки всегда внизу в панели (не inline).
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_OVERVIEW), KeyboardButton(text=BTN_PROBES)],
-            [KeyboardButton(text=BTN_ATTACH)],
+            [KeyboardButton(text=BTN_OVERVIEW), KeyboardButton(text=BTN_WHITELIST)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -374,7 +418,10 @@ async def cmd_start(message: Message):
         "Двусторонний канал с автономными воркерами.\n\n"
         "• Воркер пришлёт вопрос с кнопками или эскалацию — нажми кнопку "
         "или <b>ответь реплаем</b>, и ответ уйдёт ему в сессию.\n"
-        "• Кнопка внизу — статус всех воркеров.",
+        "• Воркер может запросить одобрение (whitelist / разовая отправка) — "
+        "придёт карточка с ✅/❌.\n"
+        "• Кнопки внизу: <b>📊 Сводка</b> (флот одним взглядом) и "
+        "<b>🤖 Воркеры</b> (карточка по каждому: статус, контекст, датчики, доступы, терминал).",
         parse_mode="HTML",
         reply_markup=make_keyboard(),
     )
@@ -470,6 +517,30 @@ async def on_reply(message: Message):
     if not authed_user_chat(message.from_user.id, message.chat.id):
         return
     rt = message.reply_to_message
+    # ➕ whitelist-add: trigger ONLY if this is a reply to a ForceReply prompt WE sent
+    # (tracked by message_id in _WL_ADD_PENDING). NOT by a tag in text — worker-authored
+    # ask/question text could otherwise forge the tag and hijack the operator's reply.
+    wl_worker = _WL_ADD_PENDING.pop(rt.message_id, None)
+    if wl_worker:
+        if not _valid_worker(wl_worker):
+            await message.reply("❌ Воркер не найден.")
+            return
+        entry = _normalize_entry(message.text or "")  # bare email / tg id OR prefixed
+        if not entry:
+            _wl_pending_put(rt.message_id, wl_worker)  # let the operator retry the reply
+            await message.reply("❌ Не похоже на email или Telegram id. Пришли ещё раз — "
+                                "например <code>vasya@alp-itsm.ru</code> или <code>12345</code>.",
+                                parse_mode="HTML")
+            return
+        rc, out = await asyncio.to_thread(_run_allow, "add", wl_worker, entry)
+        if rc == 0:
+            await message.reply(f"✅ Добавил «{esc(wl_worker)}»: <code>{esc(entry)}</code>",
+                                parse_mode="HTML")
+            text, kb = await asyncio.to_thread(wl_worker_view, wl_worker)
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.reply(f"❌ Не добавил: {esc(out)}")
+        return
     answer_text = _sanitize(message.text or message.caption or "")
     if not answer_text.strip():
         await message.reply("↩️ Пустой ответ — пришли текст.")
@@ -497,6 +568,534 @@ async def on_reply(message: Message):
         await message.reply("⏳ На это уже отвечено ранее — повторный ответ НЕ отправлен.")
         return
     await message.reply(f"✅ Принято, передаю воркеру «{esc(row['worker'])}».")
+
+
+# ============================ approval flow =================================
+# Worker REQUESTS a bounded action from a closed catalog (via claude-auto-request,
+# which only INSERTs an 'open' approvals row). The bot renders the CANONICAL card
+# from that row, claims the operator's decision once-only, then EXECUTES the action
+# itself from the stored fields. The worker never mutates the whitelist or sends.
+
+# Strip control chars AND Unicode bidi/zero-width overrides so the card the operator
+# reviews can't be visually spoofed (recipient/body shown verbatim).
+_BIDI_RE = re.compile("[​-‏‪-‮⁦-⁩؜﻿]")
+
+
+def _clean(s):
+    return _BIDI_RE.sub("", re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s or ""))
+
+
+def render_approval(row):
+    """Canonical approval card — built ONLY from the stored row, so what the operator
+    sees is exactly what the executor will run (anti-forge)."""
+    worker = esc(_clean(row["worker"]))
+    action = row["action"]
+    label = ACTION_LABEL.get(action, action)
+    lines = [
+        f"🔐 <b>Запрос одобрения · воркер «{worker}»</b>",
+        "━━━━━━━━━━━━━━",
+        f"<b>{esc(label)}</b>",
+    ]
+    if action in ("whitelist-add", "whitelist-remove"):
+        kind = "Telegram" if row.get("arg_kind") == "tg" else "Email"
+        val = _clean(str(row.get("arg_value")))
+        nm = _tg_name(val) if row.get("arg_kind") == "tg" else ""
+        lines.append(f"Контакт: <code>{esc(val)}</code>  · {kind}" + (f" · {esc(nm)}" if nm else ""))
+    elif action == "one-time-send":
+        val = _clean(str(row.get("arg_value")))
+        nm = _tg_name(val)
+        lines.append(f"Кому (Telegram): <code>{esc(val)}</code>" + (f" · {esc(nm)}" if nm else ""))
+        lines.append("Текст сообщения:")
+        lines.append(f"<blockquote>{esc(_clean(row.get('payload') or ''))}</blockquote>")
+    if row.get("reason"):
+        lines.append(f"\n💬 <i>Причина (со слов воркера): {esc(_clean(row['reason']))}</i>")
+    lines.append("\n<i>Это меняет права/отправку. Проверь контакт и реши.</i>")
+    return "\n".join(lines)
+
+
+def approval_kb(qid):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"appr:{qid}:1"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"appr:{qid}:0"),
+    ]])
+
+
+def exec_whitelist(row):
+    """Run the idempotent whitelist mutation as the bot (argv, shell=False). Returns
+    (ok, detail). Safe to retry (claude-auto allow dedups)."""
+    verb = "add" if row["action"] == "whitelist-add" else "remove"
+    entry = f"{row['arg_kind']}:{row['arg_value']}"
+    try:
+        p = subprocess.run([CLAUDE_AUTO, "allow", verb, row["worker"], entry],
+                           capture_output=True, timeout=30)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode == 0, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return False, f"exec error: {e}"
+
+
+def exec_one_time_tg(row):
+    """Send ONE Telegram message as the operator. Caller MUST have won lease_sending
+    first (approved→sending) — this is NOT retried (at-most-once)."""
+    try:
+        # Send the SAME cleaned payload the operator saw on the card (render_approval
+        # also _clean's it) — so "what was reviewed == what is sent" (anti-forge for
+        # bidi/zero-width chars, which the ASCII-only strip in the helper leaves in).
+        body = _clean(row.get("payload") or "")
+        p = subprocess.run(
+            [TG_NOTIFY, "--as-me", "--chat-id", str(row["arg_value"]), "--", body],
+            capture_output=True, timeout=40)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode == 0, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return False, f"send error: {e}"
+
+
+async def cb_approval(cb: CallbackQuery):
+    chat_id = cb.message.chat.id if cb.message else 0
+    if not authed_user_chat(cb.from_user.id, chat_id):
+        await cb.answer("нет доступа", show_alert=True)
+        return
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3 or parts[2] not in ("0", "1"):
+        await cb.answer("битый запрос", show_alert=True)
+        return
+    qid, sdec = parts[1], parts[2]
+    row = rnr_db.get_appr_by_qid(qid)
+    if not row:
+        await cb.answer("запрос не найден", show_alert=True)
+        return
+    # Privileged action ⇒ STRICTER binding than asks: exact chat_id AND message_id
+    # must match (fail-closed if message_id was never recorded).
+    if (row["chat_id"] != chat_id or not row["message_id"] or not cb.message
+            or row["message_id"] != cb.message.message_id):
+        await cb.answer("несовпадение сообщения", show_alert=True)
+        return
+    decision = "approved" if sdec == "1" else "denied"
+    claimed = rnr_db.claim_approval(qid, decision, "button")
+    if not claimed:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer("уже решено ранее", show_alert=True)
+        return
+    tag = "✅ Одобрено" if decision == "approved" else "❌ Отклонено"
+    await cb.answer(tag)
+    try:
+        new = (cb.message.html_text or "") + f"\n\n{tag}"
+        await cb.message.edit_text(new, parse_mode="HTML", reply_markup=None)
+    except Exception:  # noqa: BLE001
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+    # approval_exec_loop executes (if approved) + notifies the worker.
+
+
+async def notify_worker_outcome(bot: Bot, row, approved, ok, detail):
+    """Inject the decision outcome into the worker session; mark notified only on a
+    successful inject (else it is retried by the loop — notified_at stays NULL)."""
+    qid = row["qid"]
+    human = ACTION_LABEL.get(row["action"], row["action"])
+    argd = f" ({row.get('arg_kind')}:{row.get('arg_value')})" if row.get("arg_value") else ""
+    if not approved:
+        body = f"Оператор ОТКЛОНИЛ запрос: {human}{argd}. Не повторяй; действуй иначе или эскалируй."
+    elif ok:
+        body = f"Оператор ОДОБРИЛ, выполнено: {human}{argd}. Можешь продолжать."
+    else:
+        body = f"Оператор одобрил, но выполнить НЕ удалось: {detail}. Не повторяй сам; эскалируй оператору."
+    msg = f"[ответ оператора на твой запрос (#{qid})]\n{body}"
+    rc = await asyncio.to_thread(run_session_inject, row["tmux_target"], msg)
+    if rc == 0:
+        rnr_db.mark_notified(qid)
+        log.info("approval outcome delivered #%s → %s (approved=%s ok=%s)",
+                 qid, row["worker"], approved, ok)
+
+
+async def process_approval(bot: Bot, row):
+    qid, worker, status, action = row["qid"], row["worker"], row["status"], row["action"]
+    attempts = rnr_db.record_attempt_appr(qid)
+
+    if status == "denied":
+        await notify_worker_outcome(bot, row, approved=False, ok=None, detail="")
+        return
+
+    # one-time-send crashed mid-send (lease set, no terminal write) → at-most-once:
+    # NEVER resend. Mark failed-uncertain, alert operator, tell the worker it's unknown.
+    if status == "sending":
+        rnr_db.mark_exec_failed(qid, "uncertain: crashed mid-send, NOT resent")
+        await alert_operator(
+            bot, f"⚠️ Разовая отправка воркера «{worker}» (#{qid}) прервалась в момент "
+                 f"отправки — НЕ повторяю автоматически. Проверь вручную, ушло ли сообщение.")
+        await notify_worker_outcome(bot, row, approved=True, ok=False,
+                                    detail="отправка прервалась, исход НЕИЗВЕСТЕН")
+        return
+
+    if status == "approved":
+        if action in ("whitelist-add", "whitelist-remove"):
+            ok, detail = await asyncio.to_thread(exec_whitelist, row)
+            if ok:
+                rnr_db.mark_executed(qid, detail)
+                await notify_worker_outcome(bot, row, approved=True, ok=True, detail=detail)
+            elif attempts >= APPR_MAX_ATTEMPTS:
+                rnr_db.mark_exec_failed(qid, detail)
+                await alert_operator(
+                    bot, f"❌ Не смог выполнить «{action}» для «{worker}» (#{qid}) за "
+                         f"{attempts} попыток: {detail}")
+            # else: leave 'approved' → backoff retry (idempotent)
+            return
+        if action == "one-time-send":
+            leased = await asyncio.to_thread(rnr_db.lease_sending, qid)
+            if not leased:
+                return  # lost the lease (concurrent / already moved) — skip
+            ok, detail = await asyncio.to_thread(exec_one_time_tg, leased)
+            if ok:
+                rnr_db.mark_executed(qid, detail)
+                await notify_worker_outcome(bot, leased, approved=True, ok=True, detail=detail)
+            else:
+                rnr_db.mark_exec_failed(qid, detail)  # at-most-once: do NOT retry a send
+                await alert_operator(
+                    bot, f"⚠️ Разовая отправка воркера «{worker}» (#{qid}) не удалась: "
+                         f"{detail}. НЕ повторяю автоматически.")
+                await notify_worker_outcome(bot, leased, approved=True, ok=False, detail=detail)
+            return
+
+    # executed/failed but worker not yet notified (crash between exec and notify) → notify
+    if status in ("executed", "failed"):
+        await notify_worker_outcome(bot, row, approved=True, ok=(status == "executed"),
+                                    detail=row.get("result") or "")
+
+
+async def card_sender_loop(bot: Bot):
+    """Render + send the canonical card for each new 'open' request, then record its
+    message_id. The card is built by the BOT (not the worker helper) — single source."""
+    log.info("approval card-sender loop started")
+    while True:
+        try:
+            for row in rnr_db.next_unsent(limit=10):
+                if row["chat_id"] != OPERATOR:
+                    # forged/corrupt chat_id (legit rows always carry OPERATOR from .env):
+                    # DELETE it (a sentinel message_id would collide with the partial
+                    # UNIQUE(chat_id,message_id) on repeats and poison the loop).
+                    rnr_db.delete_approval(row["qid"])
+                    log.warning("approval row %s chat_id!=OPERATOR — deleted", row["qid"])
+                    continue
+                try:
+                    m = await bot.send_message(OPERATOR, render_approval(row),
+                                               parse_mode="HTML",
+                                               reply_markup=approval_kb(row["qid"]))
+                    rnr_db.set_message_id_appr(row["qid"], m.message_id)
+                    log.info("approval card sent qid=%s worker=%s action=%s",
+                             row["qid"], row["worker"], row["action"])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("approval card send failed qid=%s: %s", row["qid"], e)
+        except Exception as e:  # noqa: BLE001
+            log.exception("card_sender_loop error: %s", e)
+        await asyncio.sleep(APPR_POLL_SEC)
+
+
+async def approval_exec_loop(bot: Bot):
+    log.info("approval exec loop started")
+    while True:
+        try:
+            for row in rnr_db.next_actionable(limit=20, retry_after_sec=RETRY_AFTER):
+                await process_approval(bot, row)
+        except Exception as e:  # noqa: BLE001
+            log.exception("approval_exec_loop error: %s", e)
+        await asyncio.sleep(APPR_POLL_SEC)
+
+
+_ENTRY_TG = re.compile(r"tg:-?\d+$")
+_ENTRY_EMAIL = re.compile(r"email:[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+_BARE_TG = re.compile(r"-?\d+$")
+_BARE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _normalize_entry(s):
+    """Accept a bare email / bare Telegram id (the natural thing to paste) OR the
+    explicit tg:/email: form → return a validated `kind:value`, or None."""
+    s = (s or "").strip()
+    if s.startswith("tg:") or s.startswith("email:"):
+        cand = s
+    elif _BARE_TG.fullmatch(s):
+        cand = "tg:" + s
+    elif _BARE_EMAIL.fullmatch(s):
+        cand = "email:" + s.lower()
+    else:
+        return None
+    return cand if (_ENTRY_TG.fullmatch(cand) or _ENTRY_EMAIL.fullmatch(cand)) else None
+
+
+async def cmd_allow(message: Message):
+    """Operator-only whitelist management from the phone. Strict parser (exact arity,
+    single line, validated tokens) → subprocess claude-auto allow (shell=False)."""
+    if not authed_user_chat(message.from_user.id, message.chat.id):
+        return
+    raw = (message.text or "").strip()
+    if "\n" in raw:
+        await message.reply("❌ Одна строка: /allow list|add|remove <воркер> [tg:<id>|email:<addr>]")
+        return
+    parts = raw.split()
+    parts[0] = parts[0].split("@")[0]  # tolerate /allow@bot
+    if len(parts) < 3:
+        await message.reply("Использование: /allow list|add|remove <воркер> [tg:<id>|email:<addr>]")
+        return
+    action, worker = parts[1], parts[2]
+    if action not in ("list", "add", "remove"):
+        await message.reply("❌ Действие: list | add | remove")
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", worker):
+        await message.reply("❌ Имя воркера: только [A-Za-z0-9_-]")
+        return
+    cmd = [CLAUDE_AUTO, "allow", action, worker]
+    if action == "list":
+        if len(parts) != 3:
+            await message.reply("❌ list не принимает доп. аргументы")
+            return
+    else:
+        if len(parts) != 4:
+            await message.reply("❌ Нужна ровно одна запись: tg:<id> | email:<addr>")
+            return
+        entry = parts[3]
+        if not (_ENTRY_TG.fullmatch(entry) or _ENTRY_EMAIL.fullmatch(entry)):
+            await message.reply("❌ Запись: tg:<число> | email:<addr@dom.tld>")
+            return
+        cmd.append(entry)
+    try:
+        p = await asyncio.to_thread(
+            lambda: subprocess.run(cmd, capture_output=True, timeout=15))
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip() or "(пусто)"
+        await message.reply(f"<pre>{esc(out[:3500])}</pre>", parse_mode="HTML")
+    except Exception as e:  # noqa: BLE001
+        await message.reply(f"❌ Ошибка: {esc(str(e))}")
+
+
+# ===================== whitelist management UI (buttons) ====================
+# Operator manages each worker's people-allow entirely by TAPPING: pick a worker,
+# see its whitelist, 🗑 to remove an entry, ➕ to add (which asks for the contact via
+# one ForceReply — the only thing a button can't carry is a brand-new address/id).
+# Every callback is operator-authed; the worker name is validated + must exist; the
+# entry is validated; execution is the same idempotent `claude-auto allow`.
+
+# message_id → worker for pending ➕ ForceReply prompts (in-memory; lost on restart,
+# which just means the operator re-taps ➕). Keyed by the bot's own prompt message_id
+# so a worker cannot forge the trigger via text.
+_WL_ADD_PENDING = {}
+
+
+def _wl_pending_put(mid, worker):
+    if len(_WL_ADD_PENDING) > 100:
+        _WL_ADD_PENDING.clear()  # crude cap — these are short-lived
+    _WL_ADD_PENDING[mid] = worker
+
+
+def _list_workers():
+    try:
+        return sorted(n for n in os.listdir(WORKERS_DIR)
+                      if os.path.isdir(os.path.join(WORKERS_DIR, n)))
+    except OSError:
+        return []
+
+
+def _valid_worker(w):
+    return bool(w) and bool(re.fullmatch(r"[A-Za-z0-9_-]+", w)) \
+        and os.path.isdir(os.path.join(WORKERS_DIR, w))
+
+
+def _read_allow_entries(worker):
+    """Parsed people-allow as [(kind, value)], kind ∈ {tg,email}."""
+    entries = []
+    try:
+        with open(os.path.join(WORKERS_DIR, worker, "people-allow")) as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                p = ln.split()
+                if len(p) >= 2 and p[0] in ("tg", "email"):
+                    entries.append((p[0], p[1]))
+    except OSError:
+        pass
+    return entries
+
+
+def _run_allow(action, worker, entry=None):
+    cmd = [CLAUDE_AUTO, "allow", action, worker]
+    if entry:
+        cmd.append(entry)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=15)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return 99, str(e)
+
+
+def _entry_token(kind, val):
+    """Short fingerprint of a whitelist entry — embedded in the 🗑 callback so a stale
+    button (list changed since render) can't delete a different entry by index."""
+    return hashlib.sha1(f"{kind}:{val}".encode("utf-8")).hexdigest()[:8]
+
+
+async def _safe_edit(message, text, kb):
+    """edit_text that ignores Telegram's benign 'message is not modified' but logs
+    real failures (so a length-blowup doesn't silently leave a stale card)."""
+    try:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:  # noqa: BLE001
+        if "not modified" not in str(e).lower():
+            log.warning("whitelist card edit failed: %s", e)
+
+
+def wl_workers_kb():
+    rows, pair = [], []
+    for w in _list_workers():
+        pair.append(InlineKeyboardButton(text=w, callback_data=f"wl:w:{w}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(
+        text="(нет воркеров)", callback_data="wl:list")]])
+
+
+def wl_worker_view(worker):
+    """Rich per-worker panel (one card): status + session + sensors + whitelist
+    (each contact a 🗑 button) + ➕ add + terminal attach. Blocking (systemctl + file
+    reads) → callers run it via asyncio.to_thread."""
+    active = _worker_active(worker)
+    ctx, thr = _worker_ctx(worker)
+    pct = round(ctx / thr * 100) if thr else 0
+    entries = _read_allow_entries(worker)
+    contacts = _load_contacts()
+    probes = _worker_probe_objs(worker)
+
+    lines = [f"🤖 <b>{esc(worker)}</b>  {'🟢 активен' if active else '🔴 остановлен'}"]
+    lines.append(f"🧠 Контекст <b>{round(ctx / 1000)}k</b> / {round(thr / 1000)}k · "
+                 f"загрузка <b>{pct}%</b>" + (" ⚠️" if pct >= 90 else ""))
+    lines.append("━━━━━━━━━━━━━━")
+    # sensors (per-worker, reusing the probe formatters)
+    if probes:
+        lines.append(f"📡 <b>Датчики · {len(probes)}</b>")
+        for p in probes:
+            pname = str(p.get("name", "?"))[:48]  # cap worker-set name (anti-blowup)
+            seg = [f"{_probe_emoji(p.get('source', ''))} <b>{esc(pname)}</b>"]
+            tgt = _probe_target(p)
+            if tgt:
+                seg.append(esc(tgt))
+            freq = _freq_short(p.get("interval_sec"), p.get("source", ""))
+            if freq:
+                seg.append(freq)
+            lines.append("  " + " · ".join(seg) + esc(_probe_next_suffix(worker, p)))
+    else:
+        lines.append("📡 <i>датчиков нет</i>")
+    lines.append("━━━━━━━━━━━━━━")
+    # whitelist
+    lines.append("🔐 <b>Доступы</b> — кому пишет без твоего аппрува:")
+    if entries:
+        for kind, val in entries:
+            if kind == "tg":
+                nm = _tg_name(val, contacts)
+                lines.append(f"💬 <code>{esc(val)}</code>" + (f" — {esc(nm)}" if nm else ""))
+            else:
+                lines.append(f"📧 <code>{esc(val)}</code>")
+        lines.append("<i>🗑 убрать · ➕ добавить</i>")
+    else:
+        lines.append("<i>пусто</i> · ➕ чтобы добавить")
+    lines.append(f"\n🔗 <code>tmux attach -t claude-{esc(worker)}</code>")
+
+    rows = []
+    for i, (kind, val) in enumerate(entries):
+        disp = (_tg_name(val, contacts) or val) if kind == "tg" else val
+        short = disp if len(disp) <= 24 else disp[:22] + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"🗑 {'💬' if kind == 'tg' else '📧'} {short}",
+            callback_data=f"wl:rm:{worker}:{i}:{_entry_token(kind, val)}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить контакт", callback_data=f"wl:add:{worker}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:w:{worker}"),
+                 InlineKeyboardButton(text="⬅️ К воркерам", callback_data="wl:list")])
+    text = "\n".join(lines)
+    if len(text) > TG_LIMIT:  # hard cap so a bloated card never fails edit_text
+        text = text[:TG_LIMIT - 1].rstrip() + "\n…"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def cmd_whitelist_text(message: Message):
+    if not authed_user_chat(message.from_user.id, message.chat.id):
+        return
+    kb = await asyncio.to_thread(wl_workers_kb)
+    await message.answer("🤖 <b>Воркеры</b>\nВыбери воркера — статус, контекст, датчики, "
+                         "доступы и терминал в одной карточке:",
+                         parse_mode="HTML", reply_markup=kb)
+
+
+async def cb_wl(cb: CallbackQuery):
+    chat_id = cb.message.chat.id if cb.message else 0
+    if not authed_user_chat(cb.from_user.id, chat_id):
+        await cb.answer("нет доступа", show_alert=True)
+        return
+    parts = (cb.data or "").split(":")
+    sub = parts[1] if len(parts) > 1 else ""
+
+    if sub == "list":
+        kb = await asyncio.to_thread(wl_workers_kb)
+        await _safe_edit(cb.message, "🤖 <b>Воркеры</b>\nВыбери воркера:", kb)
+        await cb.answer()
+        return
+
+    worker = parts[2] if len(parts) > 2 else ""
+    if not _valid_worker(worker):
+        await cb.answer("воркер не найден", show_alert=True)
+        return
+
+    if sub == "w":
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)
+        await cb.answer()
+        return
+
+    if sub == "rm":
+        try:
+            idx = int(parts[3])
+        except (ValueError, IndexError):
+            await cb.answer("битый индекс", show_alert=True)
+            return
+        token = parts[4] if len(parts) > 4 else ""
+        entries = await asyncio.to_thread(_read_allow_entries, worker)
+        # stale-button guard: index AND content fingerprint must still match, else the
+        # list changed under us → refresh instead of removing the wrong contact.
+        if idx < 0 or idx >= len(entries) or _entry_token(*entries[idx]) != token:
+            text, kb = await asyncio.to_thread(wl_worker_view, worker)
+            await _safe_edit(cb.message, text, kb)
+            await cb.answer("список изменился — обновил", show_alert=True)
+            return
+        kind, val = entries[idx]
+        rc, _out = await asyncio.to_thread(_run_allow, "remove", worker, f"{kind}:{val}")
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)
+        await cb.answer("убрал ✅" if rc == 0 else "ошибка ❌", show_alert=(rc != 0))
+        return
+
+    if sub == "add":
+        # ForceReply: the operator replies with just the contact (no command to memorize).
+        # We remember THIS prompt's message_id → worker so the reply is matched by id,
+        # not by any worker-authored text tag (anti-hijack).
+        m = await cb.message.answer(
+            f"➕ Контакт для «{esc(worker)}» — ответь РЕПЛАЕМ на это сообщение.\n"
+            f"Просто пришли email или Telegram id (префикс не нужен):\n"
+            f"<code>vasya@alp-itsm.ru</code>  или  <code>12345</code>",
+            parse_mode="HTML", reply_markup=ForceReply(selective=False))
+        _wl_pending_put(m.message_id, worker)
+        await cb.answer()
+        return
+
+    await cb.answer()
 
 
 # ============================ delivery loop =================================
@@ -569,7 +1168,11 @@ def build_dispatcher():
     dp.message.register(cmd_overview_text, F.text == BTN_OVERVIEW)
     dp.message.register(cmd_probes_text, F.text == BTN_PROBES)
     dp.message.register(cmd_attach_text, F.text == BTN_ATTACH)
+    dp.message.register(cmd_whitelist_text, F.text == BTN_WHITELIST)
+    dp.message.register(cmd_allow, Command("allow"))
     dp.callback_query.register(cb_ask, F.data.startswith("ask:"))
+    dp.callback_query.register(cb_approval, F.data.startswith("appr:"))
+    dp.callback_query.register(cb_wl, F.data.startswith("wl:"))
     dp.message.register(on_reply, F.reply_to_message)
     return dp
 
@@ -604,6 +1207,8 @@ async def main():
     bot = make_bot()
     dp = build_dispatcher()
     asyncio.create_task(delivery_loop(bot))
+    asyncio.create_task(card_sender_loop(bot))
+    asyncio.create_task(approval_exec_loop(bot))
 
     retry_delay = 5
     consecutive_fails = 0

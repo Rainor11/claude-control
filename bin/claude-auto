@@ -120,10 +120,15 @@ emit_identity_sections() {
   echo "    is refused (you won't freeze). Do NOT use raw telegram_notify.sh (denied)."
   echo "  • Email → use the normal send_email tool — whitelisted recipients go without"
   echo "    approval, others are refused (non-blocking)."
-  echo "  • If a recipient is NOT whitelisted: do NOT retry, do NOT route around it. Post"
-  echo "    your draft + the intended recipient to the operator via \`claude-auto-tg\` and"
-  echo "    PARK the task — the operator will whitelist them or send it. NEVER block waiting;"
-  echo "    continue other work. The whitelist is operator-only (you cannot edit it)."
+  echo "  • If a recipient is NOT whitelisted: do NOT retry, do NOT route around it, do NOT"
+  echo "    edit the whitelist (operator-only). REQUEST approval with buttons — the operator"
+  echo "    taps ✅/❌ and the BOT does it, then tells you:"
+  echo "      claude-auto-request --action whitelist-add --entry email:vasya@alp.ru --reason 'нужно отправить КП'"
+  echo "      claude-auto-request --action whitelist-add --entry tg:12345 --reason '…'"
+  echo "    For a ONE-OFF Telegram message without permanently whitelisting (TG only):"
+  echo "      claude-auto-request --action one-time-send --to tg:12345 --body '<текст>' --reason '…'"
+  echo "    After requesting: PARK — do NOT block or retry; the outcome arrives as a NEW TURN"
+  echo "    (tagged \`[ответ оператора … (#<qid>)]\`). For a free-text escalation use claude-auto-tg."
   echo "- You CANNOT change your own permissions (allow/ask/deny) — operator-only. If you"
   echo "  need one widened, say so in your output."
   echo
@@ -399,6 +404,7 @@ cmd_adopt() {
     "Bash(${BIN_DIR}/claude-auto-tg:*)" \
     "Bash(${BIN_DIR}/claude-auto-send:*)" \
     "Bash(${BIN_DIR}/claude-auto-ask:*)" \
+    "Bash(${BIN_DIR}/claude-auto-request:*)" \
     "mcp__google-workspace__draft_email" "mcp__google-workspace-rainor__draft_email" \
     | sed '/^$/d' | jq -R . | jq -s 'unique')
   # Baseline ask (always added): only git push now. Person-messaging is NOT in `ask`
@@ -817,6 +823,7 @@ cmd_upgrade() {
           ("Bash(" + $bin + "/claude-auto-tg:*)"),
           ("Bash(" + $bin + "/claude-auto-send:*)"),
           ("Bash(" + $bin + "/claude-auto-ask:*)"),
+          ("Bash(" + $bin + "/claude-auto-request:*)"),
           "mcp__google-workspace__draft_email", "mcp__google-workspace-rainor__draft_email"
         ] - (.permissions.allow // [])))
     | .permissions.ask = (((.permissions.ask // [])
