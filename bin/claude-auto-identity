@@ -128,11 +128,18 @@ draft + the recipient to the operator via claude-auto-tg and PARK the task; neve
 waiting, continue other work. You CANNOT change your own permissions or the whitelist —
 operator-only; if you need one widened, say so in your output.
 
-REACHING YOUR OPERATOR
-Finishing a turn or going idle no longer pings the operator. If you genuinely need them —
-a product decision, a blocker, or a reminder you must deliver — say it explicitly
-(absolute path; delivers ONLY to the operator, no other recipient):
-  /opt/projects/active/claude-control/bin/claude-auto-tg "your message"
+REACHING YOUR OPERATOR (two-way @RnR_Workers bot)
+Finishing a turn or going idle no longer pings the operator. When you genuinely need them you
+have two operator-only channels (both deliver ONLY to the operator):
+- A QUESTION WITH OPTIONS (prefer this when there is a clear set of choices), like an ASK:
+    claude-auto-ask --question 'Отправить КП Вове сейчас?' --options-json '["✅ Да, отправляй","✋ Подожди","✏️ Доработать"]'
+  Buttons show EXACTLY these labels (no hidden values) — keep each <= 40 chars, <= 6 options.
+- A FREE-TEXT escalation / reminder (no options), absolute path:
+    /opt/projects/active/claude-control/bin/claude-auto-tg "your message"
+BOTH are answerable: the operator taps a button OR REPLIES to the message, and the answer is
+injected back to you as a NEW TURN (tagged "[ответ оператора … (#<qid>)]"). After asking: do
+NOT block, spin, or re-ask — PARK the item and do other work; you will be woken with the
+answer, which may come much later (the operator is often away). That is expected.
 EOF
 )"
 

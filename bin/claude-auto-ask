@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# claude-auto-ask — let an autonomous worker ask the OPERATOR a structured question
+# with inline buttons (like an ASK), delivered over the @RnR_Workers Telegram bot.
+# The operator answers by tapping a button OR replying to the message; the answer is
+# injected back into this worker's session by the bot's delivery loop. NON-BLOCKING:
+# the worker posts the question and PARKS — it never freezes waiting.
+#
+# Operator-only BY CONSTRUCTION (same guarantees as claude-auto-tg):
+#   * recipient (operator chat_id) is read from a FIXED absolute .env, notifier path
+#     is ABSOLUTE — a worker supplies only question text + button LABELS;
+#   * worker identity comes from the spoof-resistant /proc ancestor (resolve_name),
+#     not from CLAUDE_AUTO_NAME — so the answer routes to the RIGHT session;
+#   * the question is handed to telegram_notify.sh as a SINGLE argv after `--`.
+#
+# Anti-forge (Codex CRIT-1): options are VISIBLE LABELS ONLY — there is no hidden
+# "value". What gets injected on a button press is the exact label the operator saw
+# ("operator chose «<label>»"), so a worker cannot show one thing and inject another.
+#
+# Usage (worker-facing):
+#   claude-auto-ask --question '<text>' --options-json '["✅ Да","❌ Нет"]'
+# Allow in a worker by ABSOLUTE path only:
+#   Bash(/opt/projects/active/claude-control/bin/claude-auto-ask:*)
+set -u
+
+TG="/home/rainor/server/server_monitor/telegram_notify.sh"   # absolute — NOT $PATH/env
+OPERATOR_ENV="/home/rainor/server/.env"
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"            # trusted claude tree
+DB="/opt/projects/active/claude-control/bot/rnr_db.py"
+MAX_OPTS=6
+LABEL_MAX=40
+
+die() { echo "claude-auto-ask: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — mirrors claude-auto-send/self-probes resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+# ---- args ----
+QUESTION=""
+OPTIONS_JSON=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --question)     QUESTION="${2-}"; shift 2 || die "missing --question value" ;;
+    --options-json) OPTIONS_JSON="${2-}"; shift 2 || die "missing --options-json value" ;;
+    *) die "unknown arg '$1' (usage: claude-auto-ask --question '…' --options-json '[\"…\"]')" ;;
+  esac
+done
+[ -n "$QUESTION" ]     || die "empty --question"
+[ -n "$OPTIONS_JSON" ] || die "empty --options-json"
+
+command -v jq >/dev/null 2>&1 || die "jq required"
+command -v python3 >/dev/null 2>&1 || die "python3 required"
+[ -x "$TG" ] || die "notifier unavailable ($TG)"
+[ -f "$DB" ] || die "db helper unavailable ($DB)"
+
+# ---- validate options: JSON array of 1..MAX non-empty strings, each <= LABEL_MAX ----
+jq -e 'type=="array"' >/dev/null 2>&1 <<<"$OPTIONS_JSON" || die "--options-json must be a JSON array of label strings"
+n="$(jq 'length' <<<"$OPTIONS_JSON" 2>/dev/null)" || die "--options-json: invalid JSON"
+[ "$n" -ge 1 ] 2>/dev/null || die "need at least 1 option"
+[ "$n" -le "$MAX_OPTS" ] 2>/dev/null || die "too many options ($n > $MAX_OPTS)"
+jq -e --argjson m "$LABEL_MAX" 'all(.[]; type=="string" and (gsub("^\\s+|\\s+$";"")|length)>0 and (length)<=$m)' \
+   >/dev/null 2>&1 <<<"$OPTIONS_JSON" \
+   || die "each option must be a non-empty string <= $LABEL_MAX chars (shorten the button labels)"
+
+# ---- operator chat_id (fixed; not worker-controlled) ----
+OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
+[ -n "$OPERATOR_CHAT_ID" ] || die "operator chat_id unavailable ($OPERATOR_ENV)"
+
+# ---- RnR bot token must be configured (the ask channel needs the @RnR_Workers bot) ----
+# Validate the TOKEN FORMAT (digits:secret), not just non-empty, so a placeholder /
+# commented / malformed value doesn't make us try to send with a bad token (Codex MED-4).
+rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' "$OPERATOR_ENV" 2>/dev/null | head -1 \
+            | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
+[[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
+  || die "RnR bot not configured (RNR_WORKERS_BOT_TOKEN missing/malformed) — escalate via claude-auto-tg and park"
+
+# ---- identity ----
+NAME="$(resolve_name)" || die "cannot determine worker identity (run from inside a worker session)"
+[[ "$NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || die "resolved worker name '$NAME' has illegal chars"
+
+# ---- sanitize question (keep newline/tab; strip other control bytes; cap) ----
+QUESTION="$(printf '%s' "$QUESTION" | tr -d '\000-\010\013\014\016-\037' | cut -c1-2500)"
+# Re-check: a payload of only control bytes is empty after stripping (Codex MED-5).
+[ -n "${QUESTION//[[:space:]]/}" ] || die "question is empty after sanitization"
+
+html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# ---- unique qid (~95 bits; retry on the (astronomically unlikely) PK collision) ----
+gen_qid() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; }
+qid=""
+for _try in 1 2 3 4 5; do
+  cand="$(gen_qid)"
+  [ -n "$cand" ] || die "qid generation failed"
+  if python3 "$DB" insert-ask --qid "$cand" --kind ask --worker "$NAME" \
+        --tmux-target "claude-$NAME" --chat-id "$OPERATOR_CHAT_ID" \
+        --question="$QUESTION" --options-json "$OPTIONS_JSON" 2>/dev/null; then
+    qid="$cand"; break
+  fi
+  rc=$?
+  [ "$rc" = 3 ] && continue            # qid collision → new qid
+  die "could not register the question (db error rc=$rc)"
+done
+[ -n "$qid" ] || die "could not allocate a unique qid"
+
+# ---- build message (HTML) + inline keyboard (one button per row; callback ask:qid:idx) ----
+q_html="$(printf '%s' "$QUESTION" | html_escape)"
+name_html="$(printf '%s' "$NAME" | html_escape)"
+html="$(printf '🤖 <b>Воркер «%s»</b>\n━━━━━━━━━━━━━━\n❓ <i>Нужно твоё решение</i>\n\n%s\n\n<i>Нажми кнопку или ответь реплаем.</i>  🆔 RNR-%s' \
+        "$name_html" "$q_html" "$qid")"
+
+markup="$(jq -nc --argjson opts "$OPTIONS_JSON" --arg qid "$qid" \
+  '{inline_keyboard: [ $opts | to_entries[] | [ {text: .value, callback_data: ("ask:" + $qid + ":" + (.key|tostring))} ] ]}')" \
+  || { python3 "$DB" delete-ask --qid "$qid" 2>/dev/null; die "failed to build keyboard"; }
+
+# ---- send via the RnR bot; `--` ends flag parsing so the message is never re-parsed ----
+out="$("$TG" --bot-token-env RNR_WORKERS_BOT_TOKEN --chat-id "$OPERATOR_CHAT_ID" \
+        --parse-mode HTML --reply-markup "$markup" -- "$html" 2>&1)"; rc=$?
+
+# Only a REAL send failure (rc≠0) drops the row. If rc=0 the message IS live (buttons
+# carry the qid; a reply routes via the visible 🆔 RNR-<qid>), so even an unparsed
+# message_id must NOT delete the row — that would orphan an answerable question.
+if [ "$rc" != 0 ]; then
+  python3 "$DB" delete-ask --qid "$qid" 2>/dev/null || true
+  die "RnR send failed (rc=$rc) — escalate via claude-auto-tg and park; do NOT retry. Detail: ${out:-<none>}"
+fi
+mid="$(printf '%s' "$out" | grep -oE 'message_id=[0-9]+' | head -1 | grep -oE '[0-9]+')"
+[ -n "$mid" ] && python3 "$DB" set-message-id --qid "$qid" --message-id "$mid" 2>/dev/null || true
+
+echo "claude-auto-ask: вопрос отправлен оператору (qid=$qid${mid:+, message_id=$mid}). ПАРКУЙСЯ — ответ (кнопка или реплай) прилетит новым ходом; не зависай, продолжай другую работу."
+exit 0

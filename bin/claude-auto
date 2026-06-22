@@ -127,12 +127,19 @@ emit_identity_sections() {
   echo "- You CANNOT change your own permissions (allow/ask/deny) — operator-only. If you"
   echo "  need one widened, say so in your output."
   echo
-  echo "## Reaching your operator"
+  echo "## Reaching your operator (two-way @RnR_Workers bot)"
   echo
-  echo "Finishing a turn or going idle no longer pings the operator. If you genuinely need"
-  echo "them — a product decision, a blocker, or a reminder you must deliver — say it"
-  echo "explicitly (absolute path; delivers ONLY to the operator, no other recipient):"
-  echo "  /opt/projects/active/claude-control/bin/claude-auto-tg \"your message\""
+  echo "Finishing a turn or going idle no longer pings the operator. When you genuinely need"
+  echo "them you have two operator-only channels (both deliver ONLY to the operator):"
+  echo "- A QUESTION WITH OPTIONS (prefer this when there's a clear set of choices), like an ASK:"
+  echo "    claude-auto-ask --question 'Отправить КП Вове сейчас?' --options-json '[\"✅ Да, отправляй\",\"✋ Подожди\",\"✏️ Доработать\"]'"
+  echo "  Buttons show EXACTLY these labels (no hidden values) — keep each ≤ 40 chars, ≤ 6 options."
+  echo "- A FREE-TEXT escalation / reminder (no options): the absolute path —"
+  echo "    /opt/projects/active/claude-control/bin/claude-auto-tg \"your message\""
+  echo "BOTH are answerable: the operator taps a button OR REPLIES to the message, and the answer"
+  echo "is injected back to you as a NEW TURN (tagged \`[ответ оператора … (#<qid>)]\`). So after"
+  echo "asking: do NOT block, spin, or re-ask — PARK the item and do other work; you'll be woken"
+  echo "with the answer, which may come much later (the operator is often away). That's expected."
   echo
   echo "<!-- END worker-awareness -->"
 }
@@ -391,6 +398,7 @@ cmd_adopt() {
     "Bash(claude-auto-self-probes:*)" \
     "Bash(${BIN_DIR}/claude-auto-tg:*)" \
     "Bash(${BIN_DIR}/claude-auto-send:*)" \
+    "Bash(${BIN_DIR}/claude-auto-ask:*)" \
     "mcp__google-workspace__draft_email" "mcp__google-workspace-rainor__draft_email" \
     | sed '/^$/d' | jq -R . | jq -s 'unique')
   # Baseline ask (always added): only git push now. Person-messaging is NOT in `ask`
@@ -808,6 +816,7 @@ cmd_upgrade() {
           "Bash(claude-auto-self-probes:*)",
           ("Bash(" + $bin + "/claude-auto-tg:*)"),
           ("Bash(" + $bin + "/claude-auto-send:*)"),
+          ("Bash(" + $bin + "/claude-auto-ask:*)"),
           "mcp__google-workspace__draft_email", "mcp__google-workspace-rainor__draft_email"
         ] - (.permissions.allow // [])))
     | .permissions.ask = (((.permissions.ask // [])

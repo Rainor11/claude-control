@@ -26,9 +26,31 @@ set -u
 OPERATOR_ENV="/home/rainor/server/.env"
 OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
 TG="/home/rainor/server/server_monitor/telegram_notify.sh"     # absolute — NOT $PATH/env
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"              # trusted claude tree
+DB="/opt/projects/active/claude-control/bot/rnr_db.py"          # outbox (reply routing)
 
 [ -n "$OPERATOR_CHAT_ID" ] || { echo "claude-auto-tg: operator chat_id unavailable ($OPERATOR_ENV)" >&2; exit 1; }
 [ -x "$TG" ] || { echo "claude-auto-tg: notifier unavailable ($TG)" >&2; exit 1; }
+
+# Spoof-resistant worker identity (mirrors claude-auto-send) — used ONLY to route the
+# operator's reply back to the RIGHT session. Recipient/notifier stay fixed regardless.
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
 
 # Everything passed is the message body. We do NOT parse flags: the worker controls
 # text only, never the recipient or notifier.
@@ -42,7 +64,62 @@ case "$name" in ""|*[!a-zA-Z0-9_-]*) name="worker" ;; esac
 
 # Sanitize control chars (keep tab/newline/CR), cap length well under Telegram's limit.
 msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037' | cut -c1-3500)"
+# A payload of only control bytes is empty after stripping (Codex MED-5).
+[ -n "${msg//[[:space:]]/}" ] || { echo "claude-auto-tg: message empty after sanitization" >&2; exit 2; }
 
-# Single quoted argv element → telegram_notify.sh sees it as the message, never flags.
-exec "$TG" --chat-id "$OPERATOR_CHAT_ID" "🤖 Воркер «$name»:
+# --- @RnR_Workers bot, gracefully ---
+# Use the dedicated worker bot ONLY if its token is configured AND well-formed
+# (digits:secret) in .env; otherwise fall back to the default bot (so deploying this
+# script BEFORE the token is added — or a placeholder/malformed value — never breaks
+# notifications). When a valid token lands, escalations auto-switch with no edit.
+rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' "$OPERATOR_ENV" 2>/dev/null | head -1 \
+            | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
+botflag=(); rnr_ok=0
+[[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && { rnr_ok=1; botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN); }
+
+# Reply routing: if this is a real worker (spoof-resistant), the bot is configured, and
+# the session is live, register a `notify` row so the operator can REPLY to this message
+# and have the reply injected back. A visible `🆔 RNR-<qid>` lets the bot map a reply even
+# before message_id lands (race-proof). Non-worker callers just send (no routing).
+route=0; qid=""
+wname="$(resolve_name 2>/dev/null || true)"
+if [ "$rnr_ok" = 1 ] && [[ "$wname" =~ ^[a-zA-Z0-9_-]+$ ]] \
+   && command -v tmux >/dev/null 2>&1 && tmux has-session -t "claude-$wname" 2>/dev/null \
+   && [ -f "$DB" ] && command -v python3 >/dev/null 2>&1; then
+  qid="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
+  if [ -n "$qid" ] && python3 "$DB" insert-ask --qid "$qid" --kind notify --worker "$wname" \
+        --tmux-target "claude-$wname" --chat-id "$OPERATOR_CHAT_ID" \
+        --question="$msg" --options-json '[]' 2>/dev/null; then
+    route=1
+  fi
+fi
+
+full="🤖 Воркер «$name»:
 $msg"
+[ "$route" = 1 ] && full="$full
+
+🆔 RNR-$qid"
+
+# `--` ends flag parsing → the message is never re-parsed as a flag.
+out="$("$TG" "${botflag[@]}" --chat-id "$OPERATOR_CHAT_ID" -- "$full" 2>&1)"; rc=$?
+
+# If the RnR bot send failed, fall back to the DEFAULT bot so an escalation is never lost
+# (Codex MED-4). The default bot has no reply-poller, so drop the route row.
+if [ "$rc" != 0 ] && [ "$rnr_ok" = 1 ]; then
+  out="$("$TG" --chat-id "$OPERATOR_CHAT_ID" -- "$full" 2>&1)"; rc=$?
+  if [ "$route" = 1 ]; then python3 "$DB" delete-ask --qid "$qid" 2>/dev/null || true; route=0; fi
+fi
+
+if [ "$route" = 1 ]; then
+  if [ "$rc" = 0 ]; then
+    # Sent OK. Record message_id if we can parse it; if not, KEEP the row — a reply
+    # still routes via the visible 🆔 RNR-<qid> fallback. Never delete a live message.
+    mid="$(printf '%s' "$out" | grep -oE 'message_id=[0-9]+' | head -1 | grep -oE '[0-9]+')"
+    [ -n "$mid" ] && python3 "$DB" set-message-id --qid "$qid" --message-id "$mid" 2>/dev/null || true
+  else
+    python3 "$DB" delete-ask --qid "$qid" 2>/dev/null || true          # send failed → drop the row
+  fi
+fi
+
+printf '%s\n' "$out"
+exit "$rc"

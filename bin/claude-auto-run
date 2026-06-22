@@ -121,7 +121,10 @@ else
   # re-prompts on every launch (no persisted ack), which would wedge an
   # unattended restart. (Channel mode is kept in channels/event-bridge for when
   # the preview gate is lifted.)
-  [ -s "$home/CLAUDE.md" ] && args+=( --append-system-prompt "$(cat "$home/CLAUDE.md")" )
+  # Pass the mission FILE (not its 16KB of content) — a long --append-system-prompt
+  # argument blew past tmux new-session's command-length limit ("command too long")
+  # once CLAUDE.md grew, wedging the launch. The path is short; claude reads the file.
+  [ -s "$home/CLAUDE.md" ] && args+=( --append-system-prompt-file "$home/CLAUDE.md" )
   args+=( --model "${model:-$DEFAULT_MODEL}" )
   # Remote Control: expose this durable session to claude.ai/code + the Claude app.
   # It's a flag on the same interactive session, so --resume/--settings/mission all

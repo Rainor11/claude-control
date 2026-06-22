@@ -1,0 +1,4 @@
+# RnR Workers bot — pinned to match the server's proven aiogram (telegram_bot).
+aiogram==3.13.1
+# Required by aiogram's AiohttpSession for proxy requests (sing-box egress).
+aiohttp-socks==0.11.0
