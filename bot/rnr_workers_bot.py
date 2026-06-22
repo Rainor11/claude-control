@@ -51,6 +51,7 @@ WORKERS_DIR = os.path.join(CONTROL_DIR, "workers")
 ENV_PATH = os.environ.get("RNR_ENV_PATH", "/home/rainor/server/.env")
 BTN_OVERVIEW = "📋 Воркеры — статус"
 BTN_PROBES = "📡 Датчики"
+BTN_ATTACH = "🔗 Терминал"
 TG_LIMIT = 3900  # safe chunk size under Telegram's 4096
 
 sys.path.insert(0, HERE)
@@ -340,10 +341,29 @@ def build_framed(row):
 def make_keyboard():
     # Persistent ReplyKeyboard — кнопки всегда внизу в панели (не inline).
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_OVERVIEW), KeyboardButton(text=BTN_PROBES)]],
+        keyboard=[
+            [KeyboardButton(text=BTN_OVERVIEW), KeyboardButton(text=BTN_PROBES)],
+            [KeyboardButton(text=BTN_ATTACH)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def render_attach():
+    """Per-worker tmux attach command — tap a <code> line to copy the exact command,
+    no need to remember the session name. Run it in a terminal on ai-dev-1."""
+    try:
+        names = sorted(n for n in os.listdir(WORKERS_DIR)
+                       if os.path.isdir(os.path.join(WORKERS_DIR, n)))
+    except OSError:
+        return "🔗 <b>Терминал</b>\nНе нашёл воркеров."
+    lines = ["🔗 <b>Подключиться к сессии</b> (терминал на ai-dev-1) — тапни команду, чтобы скопировать:", ""]
+    for n in names:
+        lines.append(f"<b>{esc(n)}</b>")
+        lines.append(f"<code>tmux attach -t claude-{esc(n)}</code>")
+    lines += ["", "<i>выйти из сессии: Ctrl-b, затем d</i>"]
+    return "\n".join(lines)
 
 
 async def cmd_start(message: Message):
@@ -382,6 +402,16 @@ async def cmd_probes_text(message: Message):
             await message.answer(ch, parse_mode="HTML", reply_markup=kb)
         except Exception as e:  # noqa: BLE001
             log.warning("probes send failed: %s", e)
+
+
+async def cmd_attach_text(message: Message):
+    if not authed_user_chat(message.from_user.id, message.chat.id):
+        return
+    text = await asyncio.to_thread(render_attach)
+    try:
+        await message.answer(text, parse_mode="HTML", reply_markup=make_keyboard())
+    except Exception as e:  # noqa: BLE001
+        log.warning("attach send failed: %s", e)
 
 
 async def cb_ask(cb: CallbackQuery):
@@ -538,6 +568,7 @@ def build_dispatcher():
     dp.message.register(cmd_start, Command("help"))
     dp.message.register(cmd_overview_text, F.text == BTN_OVERVIEW)
     dp.message.register(cmd_probes_text, F.text == BTN_PROBES)
+    dp.message.register(cmd_attach_text, F.text == BTN_ATTACH)
     dp.callback_query.register(cb_ask, F.data.startswith("ask:"))
     dp.message.register(on_reply, F.reply_to_message)
     return dp
