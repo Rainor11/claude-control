@@ -112,22 +112,73 @@ valid_interval() {
   [ "$iv" -le "$MAX_INTERVAL" ] || die "interval too large: max ${MAX_INTERVAL}s"
 }
 
-notify() {  # best-effort, sanitized (no raw args); never blocks the change
-  local msg="$1"
+# ---- presentation helpers (operator-facing Telegram card) ------------------
+html_escape() {  # minimal HTML entity escape for parse_mode=HTML
+  local s="${1:-}"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"
+}
+
+human_interval() {  # seconds -> human RU phrase (3600 -> "каждый час")
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) printf '%sс' "$s"; return ;; esac
+  if [ "$s" -ge 86400 ] && [ $((s % 86400)) -eq 0 ]; then
+    local d=$((s/86400)); [ "$d" -eq 1 ] && printf 'раз в сутки' || printf 'каждые %d сут' "$d"
+  elif [ "$s" -ge 3600 ] && [ $((s % 3600)) -eq 0 ]; then
+    local h=$((s/3600)); [ "$h" -eq 1 ] && printf 'каждый час' || printf 'каждые %d ч' "$h"
+  elif [ "$s" -ge 60 ] && [ $((s % 60)) -eq 0 ]; then
+    printf 'каждые %d мин' $((s/60))
+  else
+    printf 'каждые %dс' "$s"
+  fi
+}
+
+probe_kind_label() {  # adapter source -> labelled kind (own emoji)
+  case "${1:-}" in
+    gmail)     printf '📧 Gmail' ;;
+    telegram)  printf '💬 Telegram' ;;
+    asana)     printf '📋 Asana' ;;
+    timer)     printf '⏲ Таймер' ;;
+    date-gate) printf '📅 Дата-напоминание' ;;
+    *)         printf '%s' "${1:-}" ;;
+  esac
+}
+
+# Operator ping for a probe change — corporate HTML card, routed to @RnR_Workers
+# when its token is valid in .env (else default bot). Best-effort; never blocks
+# the change. Args: <verb add|remove|retime> <probe-name> <detail-line>.
+notify() {
+  local verb="${1:-}" pname="${2:-}" detail="${3:-}"
   [ -x "$TG" ] || return 0
+  local emoji word
+  case "$verb" in
+    add)    emoji='➕'; word='Добавлен датчик' ;;
+    remove) emoji='🗑'; word='Удалён датчик' ;;
+    retime) emoji='⏱'; word='Изменён интервал' ;;
+    *)      emoji='🔧'; word='Изменение' ;;
+  esac
+  local body
+  body="🔧 <b>Датчики · воркер «$(html_escape "$NAME")»</b>
+━━━━━━━━━━━━━━
+${emoji} ${word} <code>$(html_escape "$pname")</code>"
+  [ -n "$detail" ] && body="${body}
+$(html_escape "$detail")"
+  if [ -n "$REASON" ]; then
+    local r; r="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
+    [ -n "$r" ] && body="${body}
+💬 <i>$(html_escape "$r")</i>"
+  fi
   # Route to the @RnR_Workers bot when its token is valid in .env; else default bot.
   local rnr_val
   rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' /home/rainor/server/.env 2>/dev/null | head -1 \
               | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
   local -a botflag=()
   [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
-  "$TG" "${botflag[@]}" "🔧 Датчики воркера «$NAME»: $msg" >/dev/null 2>&1 || true
+  "$TG" "${botflag[@]}" --parse-mode HTML -- "$body" >/dev/null 2>&1 || true
 }
 
 # Apply a new probes array (compact JSON) via the operator validator. flock covers
 # the whole read-modify-write so concurrent self/operator changes can't lose updates.
 apply_probes() {
-  local new_arr="$1" action="$2"
+  local new_arr="$1" action="$2" verb="${3:-}" pname="${4:-}" detail="${5:-}"
   printf '%s' "$new_arr" | jq -e 'type=="array"' >/dev/null 2>&1 || die "internal: new probes not an array"
   local n; n="$(printf '%s' "$new_arr" | jq 'length')"
   [ "$n" -le "$MAX_PROBES" ] || die "too many probes ($n > $MAX_PROBES) — remove one first"
@@ -143,7 +194,7 @@ apply_probes() {
       local r; r="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
       [ -n "$r" ] && note="$action — причина: $r"
     fi
-    notify "$note"
+    notify "$verb" "$pname" "$detail"
     echo "OK: $note. Активные датчики:"; cmd_list
   else
     rm -f "$tmp"
@@ -175,7 +226,7 @@ cmd_retime() {
   local cur; cur="$(current_probes)"
   printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null 2>&1 || die "no probe named '$name' (see: list)"
   local new; new="$(printf '%s' "$cur" | jq -c --arg n "$name" --argjson iv "$iv" 'map(if .name==$n then .interval_sec=$iv else . end)')"
-  apply_probes "$new" "перенастроен интервал '$name' → ${iv}s"
+  apply_probes "$new" "перенастроен интервал '$name' → ${iv}s" retime "$name" "🔁 $(human_interval "$iv")"
 }
 
 cmd_remove() {
@@ -191,7 +242,7 @@ cmd_remove() {
   local cur; cur="$(current_probes)"
   printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null 2>&1 || die "no probe named '$name' (see: list)"
   local new; new="$(printf '%s' "$cur" | jq -c --arg n "$name" 'map(select(.name != $n))')"
-  apply_probes "$new" "удалён датчик '$name'"
+  apply_probes "$new" "удалён датчик '$name'" remove "$name" ""
 }
 
 # add: build the adapter argv ourselves from typed params (NEVER a raw cmd).
@@ -299,11 +350,16 @@ cmd_add() {
   # in the trusted adapters dir (TCB), not a swapped symlink.
   [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ] || die "add: adapter '$adapter' missing / not a regular executable"
 
-  local probe new
+  local probe new detail
   probe="$(jq -nc --arg n "$name" --arg s "$source" --argjson iv "$interval" --argjson c "$cmd_json" \
     '{name:$n, source:$s, interval_sec:$iv, cmd:$c}')"
   new="$(current_probes | jq -c --argjson p "$probe" '. + [$p]')"
-  apply_probes "$new" "добавлен датчик '$name' ($source, interval ${interval}s)"
+  if [ "$type" = date-gate ]; then
+    detail="📅 сработает $(date -d "${gate:0:4}-${gate:4:2}-${gate:6:2}" +%d.%m.%Y 2>/dev/null)"
+  else
+    detail="$(probe_kind_label "$source") · $(human_interval "$interval")"
+  fi
+  apply_probes "$new" "добавлен датчик '$name' ($source, interval ${interval}s)" add "$name" "$detail"
 }
 
 # ---- dispatch --------------------------------------------------------------
