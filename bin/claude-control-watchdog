@@ -110,6 +110,58 @@ last_bridge_status() {
     | tail -1 | sed -E 's/.*-> ([0-9]{3}).*/\1/'
 }
 
+# A SEVERE agent-session fault the current bridge process has NOT recovered from.
+# This is a DIFFERENT failure mode than the poll-loop health below: the bridge can
+# keep polling happily (last status 2xx, file fresh) while the interactive session
+# child has crashed and was never respawned — the app then shows the session as
+# present but dead, and nothing self-heals until the unit is restarted. (Observed
+# 2026-06-20: token-refresh 401 -> child exit_code=1 -> "Bridge session failed" ->
+# bridge idle for ~2 days while still polling 200.) The poll-loop detector reads
+# that as "healthy" forever, so we need this separate, order-based check.
+#
+# Detection by LOG ORDER (not timestamps — bash ISO8601 parsing is brittle across
+# GNU/BSD), one awk pass over the WHOLE debug file (the fault scrolls far past any
+# tail -N over days of polls; claude-control-logrotate trims the file in place so
+# it stays small enough for a full scan each tick):
+#   recovery = latest "Starting poll loop" (process re-registered) OR
+#              latest "Spawning sessionId="  (this process accepted later work)
+#   severe   = latest child exit whose code is NOT a clean/stop code (0/130/143).
+#              A bare "status=failed" is NOT a crash signal: an intentional SIGTERM
+#              logs exit_code=143 status=failed, so we key on the child EXIT CODE.
+#   token    = latest "[bridge:token] reconnectSession(...) failed:"
+# Frozen iff a severe exit (or a token failure paired with "Bridge session failed")
+# is NEWER than the latest recovery. A restart or a later respawn makes recovery
+# newest -> clears automatically (no re-kick loop). Echoes a reason and returns 0
+# when faulted; returns 1 otherwise.
+session_fault_after_recovery() {
+  [[ -f "$DEBUG_FILE" ]] || return 1
+  awk '
+    /\[bridge:work\] Starting poll loop/         { if (NR > recovery) recovery = NR }
+    /\[bridge:session\] Spawning sessionId=/      { if (NR > recovery) recovery = NR }
+    /\[ERROR\] \[bridge:token\] reconnectSession\(.*\) failed:/ { token_fail = NR }
+    /\[bridge:session\] sessionId=.* failed exit_code=/ {
+      code = $0
+      sub(/^.*failed exit_code=/, "", code)
+      sub(/[^0-9].*$/, "", code)
+      if (code != "" && code != "0" && code != "130" && code != "143") {
+        severe = NR; why = "exit_code=" code
+      }
+    }
+    /\[ERROR\] Bridge session failed: Process exited with error/ {
+      if (severe > recovery || token_fail > recovery) {
+        fault = NR; if (why == "") why = "bridge-session-failed"
+      }
+    }
+    END {
+      if (fault > recovery || severe > recovery) {
+        printf "session-fault(%s)", (why != "" ? why : "unknown")
+        exit 0
+      }
+      exit 1
+    }
+  ' "$DEBUG_FILE" 2>/dev/null
+}
+
 # Legacy fallback for sessions started without --debug-file: look for the session
 # name as a standalone token in the recent control.log tail. 0 = seen, 1 = not.
 HEARTBEAT_WINDOW="${CLAUDE_CONTROL_HEARTBEAT_WINDOW:-80}"
@@ -124,6 +176,10 @@ heartbeat_seen() {
 # No debug file yet (old session, or just (re)started) -> defer to the legacy
 # control.log heartbeat so we don't false-kick during the transition / startup.
 session_state() {
+  # A crashed agent session that the bridge never respawned is frozen even when the
+  # poll loop below still looks healthy — check it FIRST so fresh 2xx polling can't
+  # mask a dead interactive session.
+  if session_fault_after_recovery >/dev/null; then echo "frozen"; return; fi
   if [[ ! -f "$DEBUG_FILE" ]]; then
     if heartbeat_seen; then echo "healthy"; else echo "frozen"; fi
     return
@@ -166,7 +222,8 @@ write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 state="$(session_state)"
 age_now="$(file_age "$DEBUG_FILE")"
 last_now="$(last_bridge_status)"
-ctx="age=${age_now}s last=${last_now:-none}"
+fault_now="$(session_fault_after_recovery || true)"
+ctx="age=${age_now}s last=${last_now:-none}${fault_now:+ ${fault_now}}"
 
 if [[ "$state" != "frozen" ]]; then
   write_misses 0
