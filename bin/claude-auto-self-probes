@@ -34,7 +34,10 @@ TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"
 
 # Self-service policy bounds (operator via `claude-auto set-probes` is unbounded).
-MAX_PROBES=20              # ceiling on total probes per worker
+# MAX_PROBES is now PER-WORKER: spec.json `.max_probes` (set by the operator via
+# `claude-auto set-probe-limit`), clamped to 1..100, falling back to this default.
+# Read live inside apply_probes() under the RMW lock — see effective_max_probes().
+MAX_PROBES_DEFAULT=20      # default ceiling on total probes when spec.json has no override
 MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
 MAX_INTERVAL=604800        # 1 week
 MAX_LOOKBACK=336           # hours (14 days)
@@ -112,6 +115,19 @@ valid_interval() {
   [ "$iv" -le "$MAX_INTERVAL" ] || die "interval too large: max ${MAX_INTERVAL}s"
 }
 
+# Effective self-service probe ceiling for THIS worker: spec.json `.max_probes` clamped
+# to an INTEGER in 1..100, else the default. Range-clamp here too (not only at the
+# writer) so a corrupted/hand-edited `max_probes:100000` can't bypass the hard cap.
+# Read fresh each call (the operator can change it live); mutation paths call this
+# under take_lock, so the value is consistent with a concurrent set-probe-limit.
+effective_max_probes() {
+  local v
+  v="$(jq -r 'if (.max_probes|type)=="number" and (.max_probes==(.max_probes|floor))
+                 and .max_probes>=1 and .max_probes<=100
+              then .max_probes else empty end' "$HOME_DIR/spec.json" 2>/dev/null)"
+  printf '%s' "${v:-$MAX_PROBES_DEFAULT}"
+}
+
 # ---- presentation helpers (operator-facing Telegram card) ------------------
 html_escape() {  # minimal HTML entity escape for parse_mode=HTML
   local s="${1:-}"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"
@@ -181,7 +197,17 @@ apply_probes() {
   local new_arr="$1" action="$2" verb="${3:-}" pname="${4:-}" detail="${5:-}"
   printf '%s' "$new_arr" | jq -e 'type=="array"' >/dev/null 2>&1 || die "internal: new probes not an array"
   local n; n="$(printf '%s' "$new_arr" | jq 'length')"
-  [ "$n" -le "$MAX_PROBES" ] || die "too many probes ($n > $MAX_PROBES) — remove one first"
+  # Per-worker ceiling, read under the caller's lock (every mutation holds take_lock).
+  # Block ONLY growth beyond the cap: a reduce/retime (n not increasing) must always
+  # pass, so lowering the limit below the current probe count can't trap the worker
+  # (it could otherwise no longer even `remove` its way back under the cap).
+  local max_probes old_count
+  max_probes="$(effective_max_probes)"
+  old_count="$(current_probes | jq 'length')"
+  [[ "$old_count" =~ ^[0-9]+$ ]] || old_count=0   # fail-closed: unknown old count → treat growth as growth
+  if [ "$n" -gt "$max_probes" ] && [ "$n" -gt "$old_count" ]; then
+    die "too many probes ($n > $max_probes) — remove one first"
+  fi
   local tmp; tmp="$(mktemp "$HOME_DIR/.sp.XXXXXX")" || die "mktemp failed"
   printf '%s\n' "$new_arr" | jq '{probes: .}' > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "build config failed"; }
   # We already hold the shared lock (take_lock). Tell set-probes to skip re-locking
@@ -195,7 +221,7 @@ apply_probes() {
       [ -n "$r" ] && note="$action — причина: $r"
     fi
     notify "$verb" "$pname" "$detail"
-    echo "OK: $note. Активные датчики:"; cmd_list
+    echo "OK: $note."; cmd_list
   else
     rm -f "$tmp"
     die "set-probes rejected the change (validation failed) — config unchanged"
@@ -204,6 +230,10 @@ apply_probes() {
 
 # ---- subcommands -----------------------------------------------------------
 cmd_list() {  # redacted: name/source/adapter/interval only — no queries/ids/args
+  local max_probes count
+  max_probes="$(effective_max_probes)"
+  count="$(current_probes | jq 'length')"
+  echo "Активные датчики (${count}/${max_probes} — лимит самообслуживания):"
   current_probes | jq -r '
     if length==0 then "  (датчиков нет)"
     else .[] | "  • " + (.name // "?") + "  [" + (.source // "?") + "/"

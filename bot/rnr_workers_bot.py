@@ -585,13 +585,47 @@ async def on_reply(message: Message):
             return
         rc, out = await asyncio.to_thread(_run_allow, "add", wl_worker, entry)
         if rc == 0:
+            # ForceReply (the prompt above) hides the persistent bottom panel; re-send it
+            # on the confirmation so it comes back without needing /start. The card that
+            # follows carries an INLINE kb, which doesn't touch the reply keyboard slot.
             await message.reply(f"✅ Добавил «{esc(wl_worker)}»: <code>{esc(entry)}</code>",
-                                parse_mode="HTML")
+                                parse_mode="HTML", reply_markup=make_keyboard())
             text, kb = await asyncio.to_thread(wl_worker_view, wl_worker)
             await message.answer(text, parse_mode="HTML", reply_markup=kb)
         else:
-            await message.reply(f"❌ Не добавил: {esc(out)}")
+            await message.reply(f"❌ Не добавил: {esc(out)}", reply_markup=make_keyboard())
         return
+
+    # 📊 set-probe-limit: reply to a ForceReply prompt WE sent (matched by message_id).
+    # Consumes the reply and ALWAYS returns — a limit reply must never fall through into
+    # normal answer delivery to the worker below.
+    limit_worker = _WL_LIMIT_PENDING.pop(rt.message_id, None)
+    if limit_worker:
+        if not _valid_worker(limit_worker):
+            await message.reply("❌ Воркер не найден.")
+            return
+        raw = (message.text or "").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = -1
+        if n < 1 or n > _PROBE_LIMIT_CEILING:
+            _wl_limit_pending_put(rt.message_id, limit_worker)  # let the operator retry
+            await message.reply(f"❌ Нужно число от 1 до {_PROBE_LIMIT_CEILING}. "
+                                f"Пришли ещё раз — например <code>10</code>.",
+                                parse_mode="HTML")
+            return
+        rc, out = await asyncio.to_thread(_run_set_limit, limit_worker, n)
+        if rc == 0:
+            # Restore the persistent bottom panel that ForceReply hid (see add branch).
+            await message.reply(f"✅ Лимит датчиков «{esc(limit_worker)}» → <b>{n}</b>",
+                                parse_mode="HTML", reply_markup=make_keyboard())
+            text, kb = await asyncio.to_thread(wl_worker_view, limit_worker)
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.reply(f"❌ Не установил: {esc(out)}", reply_markup=make_keyboard())
+        return
+
     answer_text = _sanitize(message.text or message.caption or "")
     if not answer_text.strip():
         await message.reply("↩️ Пустой ответ — пришли текст.")
@@ -944,6 +978,18 @@ def _wl_pending_put(mid, worker):
     _WL_ADD_PENDING[mid] = worker
 
 
+# 📊 set-probe-limit pending ForceReply prompts. Same shape & anti-forge rationale as
+# _WL_ADD_PENDING: keyed by the bot's own prompt message_id so a worker cannot trigger
+# a limit change via text.
+_WL_LIMIT_PENDING = {}
+
+
+def _wl_limit_pending_put(mid, worker):
+    if len(_WL_LIMIT_PENDING) > 100:
+        _WL_LIMIT_PENDING.clear()  # crude cap — short-lived
+    _WL_LIMIT_PENDING[mid] = worker
+
+
 # Worker-name charset AND length bound — kept in sync with `claude-auto adopt`
 # (which enforces the same 40-char cap), so the bot never hides a legitimately
 # created worker. The cap also keeps every callback_data (longest is
@@ -989,6 +1035,20 @@ def _run_allow(action, worker, entry=None):
         cmd.append(entry)
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=15)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return 99, str(e)
+
+
+def _run_set_limit(worker, n):
+    """Set the worker's self-service probe ceiling via claude-auto (shell=False argv;
+    claude-auto validates worker, range, and writes spec.json atomically under the
+    shared lock). Returns (returncode, short_output)."""
+    try:
+        p = subprocess.run([CLAUDE_AUTO, "set-probe-limit", worker, str(n)],
+                           capture_output=True, timeout=15)
         out = (p.stdout or b"").decode("utf-8", "replace").strip() \
             or (p.stderr or b"").decode("utf-8", "replace").strip()
         return p.returncode, out[:300]
@@ -1078,6 +1138,27 @@ def _worker_cwd(name):
     return ""
 
 
+# Default self-service probe ceiling — kept in sync with claude-auto-self-probes
+# MAX_PROBES_DEFAULT and the claude-auto set-probe-limit hard ceiling.
+_PROBE_LIMIT_DEFAULT = 20
+_PROBE_LIMIT_CEILING = 100
+
+
+def _worker_max_probes(name):
+    """Worker's self-service probe ceiling from spec.json `.max_probes`. Same clamp as
+    the consumer: an int in 1..100, else the default — so a corrupted/out-of-range value
+    is shown as the default rather than as a real (over-cap) limit."""
+    try:
+        with open(os.path.join(WORKERS_DIR, name, "spec.json")) as f:
+            v = json.load(f).get("max_probes")
+        if isinstance(v, int) and not isinstance(v, bool) \
+                and 1 <= v <= _PROBE_LIMIT_CEILING:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
+    return _PROBE_LIMIT_DEFAULT
+
+
 def wl_worker_view(worker):
     """Rich per-worker panel (one card): status + session + sensors + whitelist
     (each contact a 🗑 button) + ➕ add + terminal attach. Blocking (systemctl + file
@@ -1088,6 +1169,7 @@ def wl_worker_view(worker):
     entries = _read_allow_entries(worker)
     contacts = _load_contacts()
     probes = _worker_probe_objs(worker)
+    limit = _worker_max_probes(worker)
 
     lines = [f"🤖 <b>{esc(worker)}</b>  {'🟢 активен' if active else '🔴 остановлен'}"]
     lines.append(f"🧠 Контекст <b>{round(ctx / 1000)}k</b> / {round(thr / 1000)}k · "
@@ -1098,7 +1180,7 @@ def wl_worker_view(worker):
     lines.append("━━━━━━━━━━━━━━")
     # sensors (per-worker, reusing the probe formatters)
     if probes:
-        lines.append(f"📡 <b>Датчики · {len(probes)}</b>")
+        lines.append(f"📡 <b>Датчики · {len(probes)}</b> · лимит самообслуживания <b>{limit}</b>")
         for p in probes:
             pname = str(p.get("name", "?"))[:48]  # cap worker-set name (anti-blowup)
             seg = [f"{_probe_emoji(p.get('source', ''))} <b>{esc(pname)}</b>"]
@@ -1110,7 +1192,7 @@ def wl_worker_view(worker):
                 seg.append(freq)
             lines.append("  " + " · ".join(seg) + esc(_probe_next_suffix(worker, p)))
     else:
-        lines.append("📡 <i>датчиков нет</i>")
+        lines.append(f"📡 <i>датчиков нет</i> · лимит самообслуживания <b>{limit}</b>")
     lines.append("━━━━━━━━━━━━━━")
     # whitelist
     lines.append("🔐 <b>Доступы</b> — кому пишет без твоего аппрува:")
@@ -1139,6 +1221,8 @@ def wl_worker_view(worker):
         rows.append([InlineKeyboardButton(text="⏸️ Усыпить", callback_data=f"wl:stop:{worker}")])
     else:
         rows.append([InlineKeyboardButton(text="▶️ Разбудить", callback_data=f"wl:start:{worker}")])
+    rows.append([InlineKeyboardButton(text=f"📊 Лимит датчиков ({limit})",
+                                      callback_data=f"wl:limit:{worker}")])
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:w:{worker}"),
                  InlineKeyboardButton(text="⬅️ К воркерам", callback_data="wl:list")])
     text = "\n".join(lines)
@@ -1165,7 +1249,7 @@ async def cb_wl(cb: CallbackQuery):
     # Strict arity: reject unknown subs AND trailing junk (hardens the protocol so
     # only well-formed operator callbacks act). worker is at parts[2] (when present).
     arity = {"list": 2, "w": 3, "add": 3, "start": 3, "stop": 3,
-             "stopc": 3, "rm": 5, "rmc": 5}
+             "stopc": 3, "limit": 3, "rm": 5, "rmc": 5}
     if arity.get(sub) != len(parts):
         await cb.answer("неизвестная команда", show_alert=True)
         return
@@ -1276,6 +1360,19 @@ async def cb_wl(cb: CallbackQuery):
             f"<code>vasya@alp-itsm.ru</code>  или  <code>12345</code>",
             parse_mode="HTML", reply_markup=ForceReply(selective=False))
         _wl_pending_put(m.message_id, worker)
+        await cb.answer()
+        return
+
+    if sub == "limit":
+        # ForceReply: operator replies with just a number. Matched back by the bot
+        # prompt's message_id (anti-hijack), same as ➕ add.
+        cur = await asyncio.to_thread(_worker_max_probes, worker)
+        m = await cb.message.answer(
+            f"📊 Лимит датчиков для «{esc(worker)}» — ответь РЕПЛАЕМ на это сообщение.\n"
+            f"Сейчас <b>{cur}</b>. Пришли число от 1 до {_PROBE_LIMIT_CEILING} "
+            f"(сколько датчиков воркер навесит на себя сам):",
+            parse_mode="HTML", reply_markup=ForceReply(selective=False))
+        _wl_limit_pending_put(m.message_id, worker)
         await cb.answer()
         return
 

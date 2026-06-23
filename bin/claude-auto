@@ -742,6 +742,43 @@ cmd_set_probes() {
     || echo "  note: worker is not running — the new config applies on next start."
 }
 
+# set-probe-limit <name> <N> — set the worker's SELF-SERVICE probe ceiling (how many
+# probes the worker may put on ITSELF via claude-auto-self-probes). Stored as
+# `max_probes` in spec.json; absent => default 20. The operator path (set-probes) stays
+# UNBOUNDED — this bounds only the worker's own self-management. The change is live:
+# claude-auto-self-probes re-reads spec.json (under the shared lock) on each mutation,
+# so no restart is needed.
+cmd_set_probe_limit() {
+  local name="${1:?usage: set-probe-limit <name> <N>}"
+  local n="${2:-}" ceiling=100   # hard cap vs fat-finger; self-service above 100 is pointless
+  [ -n "$n" ] || die "usage: set-probe-limit <name> <N>"
+  worker_exists "$name" || die "no worker '$name'"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "limit must be a positive integer (no leading zeros)"
+  [ "$n" -le "$ceiling" ] || die "limit too large: max $ceiling"
+  local home="$WORKERS_DIR/$name" spec="$WORKERS_DIR/$name/spec.json"
+  local statedir="$WORKERS_DIR/$name/state"
+  # spec.json must already exist as a valid object — never synthesize one holding only
+  # max_probes (that would drop every other worker field).
+  [ -s "$spec" ] && jq -e 'type=="object"' "$spec" >/dev/null 2>&1 \
+    || die "set-probe-limit: spec.json missing/empty/invalid for '$name' — refusing to write"
+  mkdir -p "$statedir"
+  # Shared RMW lock — also taken by set-probes / claude-auto-self-probes, so a limit
+  # change and a probe mutation can't interleave (self-probes reads max_probes under the
+  # same lock). Skipped when a caller already holds it (CLAUDE_AUTO_PROBES_LOCKED=1).
+  if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
+    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
+      flock -w 10 8 2>/dev/null || die "set-probe-limit: busy (a probe change is in progress) — retry"
+    fi
+  fi
+  local t; t="$(mktemp "$home/.spec.XXXXXX")" || die "set-probe-limit: mktemp failed"
+  jq --argjson m "$n" '.max_probes = $m' "$spec" > "$t" \
+    || { rm -f "$t"; die "set-probe-limit: jq write failed"; }
+  [ -s "$t" ] && jq -e 'type=="object"' "$t" >/dev/null 2>&1 \
+    || { rm -f "$t"; die "set-probe-limit: produced invalid spec — unchanged"; }
+  mv "$t" "$spec" || { rm -f "$t"; die "set-probe-limit: mv failed"; }
+  echo "set-probe-limit: '$name' self-service probe limit set to $n (applies immediately; no restart)."
+}
+
 # upgrade <name> — retrofit an EXISTING worker to the current template WITHOUT a
 # re-adopt (which would re-fork the origin and lose the worker's accumulated
 # conversation). Idempotently: (1) wire the SessionStart identity hook into
@@ -926,6 +963,18 @@ cmd_upgrade() {
   if [ -f "$spec" ]; then
     local cur_mode; cur_mode="$(jq -r '.permission_mode // ""' "$spec" 2>/dev/null)"
     if [ "$cur_mode" != "auto" ]; then
+      # Take the shared RMW lock for this full-file spec rewrite: `set-probe-limit` also
+      # rewrites spec.json (whole-file), so without a common lock two concurrent writers
+      # could clobber each other's field (mode vs max_probes). cur_mode was read pre-lock,
+      # but mode only ever goes ->auto and set-probe-limit never touches mode, so the
+      # decision stays valid; the jq read below runs under the lock and preserves
+      # max_probes written by a just-finished set-probe-limit. Skip if a caller holds it.
+      if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
+        mkdir -p "$home/state"
+        if exec 8>"$home/state/.probes-rmw.lock" 2>/dev/null; then
+          flock -w 10 8 2>/dev/null || die "upgrade: busy (a probe/spec change is in progress) — retry"
+        fi
+      fi
       local st; st="$(mktemp "$home/.spec.XXXXXX")" || die "upgrade: mktemp failed"
       if jq '.permission_mode="auto"' "$spec" > "$st" 2>/dev/null && jq -e . "$st" >/dev/null 2>&1; then
         chmod 600 "$st" 2>/dev/null||true; mv "$st" "$spec"; changed+=("spec.json:mode=auto")
@@ -985,6 +1034,8 @@ CLAUDE.md) и свой поток событий (датчики event-bridge).
 ДАТЧИКИ (за чем воркер следит)
   get-probes <имя>             показать датчики воркера
   set-probes <имя> <config>    заменить набор датчиков живьём (без рестарта, ~5с)
+  set-probe-limit <имя> <N>    потолок самообслуживания: сколько датчиков воркер
+                               навесит на себя сам (1..100; дефолт 20; живьём)
 
 БЕЛЫЙ СПИСОК (кому воркер пишет БЕЗ подтверждения: TG + почта)
   allow list <имя>                       показать белый список воркера
@@ -1055,6 +1106,7 @@ case "$sub" in
   remove) cmd_remove "$@" ;;
   get-probes) cmd_get_probes "$@" ;;
   set-probes) cmd_set_probes "$@" ;;
+  set-probe-limit) cmd_set_probe_limit "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
   allow) cmd_allow "$@" ;;
   install-units) cmd_install_units ;;
