@@ -1064,6 +1064,20 @@ def wl_workers_kb():
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _worker_cwd(name):
+    """Worker's working directory (where it runs / its deal repo). spec.json is the
+    canonical source (set at adopt); fall back to last_seen.json (heartbeat)."""
+    for rel in ("spec.json", "state/last_seen.json"):
+        try:
+            with open(os.path.join(WORKERS_DIR, name, rel)) as f:
+                cwd = (json.load(f).get("cwd") or "").strip()
+            if cwd:
+                return cwd
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
 def wl_worker_view(worker):
     """Rich per-worker panel (one card): status + session + sensors + whitelist
     (each contact a 🗑 button) + ➕ add + terminal attach. Blocking (systemctl + file
@@ -1078,6 +1092,9 @@ def wl_worker_view(worker):
     lines = [f"🤖 <b>{esc(worker)}</b>  {'🟢 активен' if active else '🔴 остановлен'}"]
     lines.append(f"🧠 Контекст <b>{round(ctx / 1000)}k</b> / {round(thr / 1000)}k · "
                  f"загрузка <b>{pct}%</b>" + (" ⚠️" if pct >= 90 else ""))
+    cwd = _worker_cwd(worker)
+    if cwd:
+        lines.append(f"📁 <code>{esc(cwd)}</code>")
     lines.append("━━━━━━━━━━━━━━")
     # sensors (per-worker, reusing the probe formatters)
     if probes:
