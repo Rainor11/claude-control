@@ -181,13 +181,64 @@ def _worker_active(name):
         return False
 
 
+def _live_ctx_from_transcript(name):
+    """Recompute the worker's CURRENT context from the tail of its transcript — the
+    last NON-ZERO model-request usage (input + cache_read + cache_creation), the same
+    formula claude-auto-heartbeat uses. Returns int tokens, or None if it can't be
+    derived (no/unreadable transcript, no real turn in the window). Live read avoids
+    the stale-snapshot effect where context.json freezes on a wake/compact turn until
+    the worker's next Stop hook fires. Caller already runs this off the event loop."""
+    try:
+        with open(os.path.join(WORKERS_DIR, name, "state", "last_seen.json")) as f:
+            tpath = (json.load(f).get("transcript_path") or "")
+    except Exception:  # noqa: BLE001
+        return None
+    if not tpath or not os.path.isfile(tpath):
+        return None
+    try:
+        with open(tpath, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            window = min(size, 2_000_000)  # tail window — comfortably holds recent turns
+            f.seek(size - window)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        if window < size and lines:
+            lines = lines[1:]  # drop the partial first line
+        last = 0
+        for ln in lines[-600:]:
+            if '"assistant"' not in ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except Exception:  # noqa: BLE001
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            u = (obj.get("message") or {}).get("usage") or {}
+            s = (int(u.get("input_tokens") or 0)
+                 + int(u.get("cache_read_input_tokens") or 0)
+                 + int(u.get("cache_creation_input_tokens") or 0))
+            if s > 0:
+                last = s
+        return last or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _worker_ctx(name):
+    """(ctx_tokens, threshold). Prefer a LIVE recompute from the transcript so the
+    number reflects reality immediately; fall back to the context.json snapshot (which
+    only refreshes on the worker's Stop hook), then to defaults."""
+    snap, thr = 0, 700000
     try:
         with open(os.path.join(WORKERS_DIR, name, "state", "context.json")) as f:
             d = json.load(f)
-        return int(d.get("ctx_tokens") or 0), int(d.get("threshold") or 700000)
+        snap = int(d.get("ctx_tokens") or 0)
+        thr = int(d.get("threshold") or 700000)
     except Exception:  # noqa: BLE001
-        return 0, 700000
+        pass
+    live = _live_ctx_from_transcript(name)
+    return (live if live is not None else snap), thr
 
 
 def _worker_probes(name):
