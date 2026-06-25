@@ -270,7 +270,7 @@ def mark_failed(qid):
 
 # ---- approvals: closed-catalog action requests -----------------------------
 
-ALLOWED_ACTIONS = ("whitelist-add", "whitelist-remove", "one-time-send")
+ALLOWED_ACTIONS = ("whitelist-add", "whitelist-remove", "one-time-send", "mcp-add")
 
 
 def insert_approval(qid, worker, tmux_target, chat_id, action,
@@ -279,8 +279,8 @@ def insert_approval(qid, worker, tmux_target, chat_id, action,
     claude-auto-request bash helper); the bot renders/sends the card from this row."""
     if action not in ALLOWED_ACTIONS:
         raise ValueError("action not in closed catalog: %r" % (action,))
-    if arg_kind not in (None, "tg", "email"):
-        raise ValueError("arg_kind must be tg|email")
+    if arg_kind not in (None, "tg", "email", "mcp"):
+        raise ValueError("arg_kind must be tg|email|mcp")
     conn = connect()
     try:
         with conn:
@@ -523,7 +523,7 @@ def main(argv=None):
     sp.add_argument("--tmux-target", required=True)
     sp.add_argument("--chat-id", required=True, type=int)
     sp.add_argument("--action", required=True, choices=list(ALLOWED_ACTIONS))
-    sp.add_argument("--arg-kind", choices=["tg", "email"])
+    sp.add_argument("--arg-kind", choices=["tg", "email", "mcp"])
     sp.add_argument("--arg-value")
     sp.add_argument("--payload")
     sp.add_argument("--reason")

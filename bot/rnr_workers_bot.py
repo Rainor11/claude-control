@@ -78,6 +78,7 @@ ACTION_LABEL = {
     "whitelist-add": "➕ Добавить в whitelist",
     "whitelist-remove": "🗑 Убрать из whitelist",
     "one-time-send": "✉️ Разовая отправка (Telegram)",
+    "mcp-add": "🧩 Подключить MCP-сервер",
 }
 
 log = logging.getLogger("rnr-workers-bot")
@@ -692,16 +693,25 @@ def render_approval(row):
         lines.append(f"Кому (Telegram): <code>{esc(val)}</code>" + (f" · {esc(nm)}" if nm else ""))
         lines.append("Текст сообщения:")
         lines.append(f"<blockquote>{esc(_clean(row.get('payload') or ''))}</blockquote>")
+    elif action == "mcp-add":
+        srv = _clean(str(row.get("arg_value")))
+        lines.append(f"MCP-сервер: <code>{esc(srv)}</code>")
     if row.get("reason"):
         lines.append(f"\n💬 <i>Причина (со слов воркера): {esc(_clean(row['reason']))}</i>")
-    lines.append("\n<i>Это меняет права/отправку. Проверь контакт и реши.</i>")
+    if action == "mcp-add":
+        lines.append("\n<i>Это добавит MCP-сервер в набор воркера и перезапустит его. Реши.</i>")
+    else:
+        lines.append("\n<i>Это меняет права/отправку. Проверь контакт и реши.</i>")
     return "\n".join(lines)
 
 
-def approval_kb(qid):
+def approval_kb(qid, action=None):
+    # mcp-add gets action-specific labels ("Добавить + рестарт"); others use generic ✅/❌.
+    yes = "➕ Добавить + рестарт" if action == "mcp-add" else "✅ Одобрить"
+    no = "✖ Отклонить" if action == "mcp-add" else "❌ Отклонить"
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"appr:{qid}:1"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"appr:{qid}:0"),
+        InlineKeyboardButton(text=yes, callback_data=f"appr:{qid}:1"),
+        InlineKeyboardButton(text=no, callback_data=f"appr:{qid}:0"),
     ]])
 
 
@@ -736,6 +746,38 @@ def exec_one_time_tg(row):
         return p.returncode == 0, out[:300]
     except Exception as e:  # noqa: BLE001
         return False, f"send error: {e}"
+
+
+def exec_mcp_add(row):
+    """Add an MCP server to the worker's subscription, then restart it so the new set loads.
+    Both via claude-auto (argv, shell=False; idempotent — safe to retry; claude-auto
+    re-validates the name against the catalog). Returns (ok, detail):
+      - mcp-add failed                  → (False, …) → retried, then alerted
+      - restart errored (rc!=0)         → (False, …) → server added but NOT loaded → retried
+      - restart DEFERRED (worker busy)  → (True, 'pending') → add persisted; set applies on the
+                                          next launch; the worker is told it's not active yet
+      - restart ok                      → (True, 'restarted') → server live
+    The detail is surfaced verbatim to the worker (see notify_worker_outcome)."""
+    worker, server = row["worker"], (row.get("arg_value") or "")
+    try:
+        p = subprocess.run([CLAUDE_AUTO, "mcp-add", worker, server],
+                           capture_output=True, timeout=30)
+        if p.returncode != 0:
+            err = (p.stderr or b"").decode("utf-8", "replace").strip() \
+                or (p.stdout or b"").decode("utf-8", "replace").strip()
+            return False, f"mcp-add не удался: {err[:200]}"
+        r = subprocess.run([CLAUDE_AUTO, "restart", worker], capture_output=True, timeout=90)
+        rout = (r.stdout or b"").decode("utf-8", "replace").strip() \
+            or (r.stderr or b"").decode("utf-8", "replace").strip()
+        if r.returncode != 0:
+            # add persisted, but the restart errored → the server is NOT loaded → retry/alert.
+            return False, f"сервер '{server}' добавлен в подписку, но рестарт НЕ удался: {rout[:160]}"
+        if "DEFERRED" in rout or "занят" in rout.lower():
+            return True, (f"сервер '{server}' добавлен; воркер был занят — рестарт отложен, "
+                          "сервер активируется при следующем перезапуске (пока недоступен)")
+        return True, f"сервер '{server}' подключён, воркер перезапущен"
+    except Exception as e:  # noqa: BLE001
+        return False, f"exec error: {e}"
 
 
 async def cb_approval(cb: CallbackQuery):
@@ -789,7 +831,12 @@ async def notify_worker_outcome(bot: Bot, row, approved, ok, detail):
     if not approved:
         body = f"Оператор ОТКЛОНИЛ запрос: {human}{argd}. Не повторяй; действуй иначе или эскалируй."
     elif ok:
-        body = f"Оператор ОДОБРИЛ, выполнено: {human}{argd}. Можешь продолжать."
+        # mcp-add: surface the exact state (restarted / restart-deferred) — a deferred restart
+        # means the server is added but NOT loaded yet, so the worker must NOT assume it's live.
+        if row["action"] == "mcp-add" and detail:
+            body = f"Оператор ОДОБРИЛ: {human}{argd}. {detail}."
+        else:
+            body = f"Оператор ОДОБРИЛ, выполнено: {human}{argd}. Можешь продолжать."
     else:
         body = f"Оператор одобрил, но выполнить НЕ удалось: {detail}. Не повторяй сам; эскалируй оператору."
     msg = f"[ответ оператора на твой запрос (#{qid})]\n{body}"
@@ -832,6 +879,18 @@ async def process_approval(bot: Bot, row):
                          f"{attempts} попыток: {detail}")
             # else: leave 'approved' → backoff retry (idempotent)
             return
+        if action == "mcp-add":
+            ok, detail = await asyncio.to_thread(exec_mcp_add, row)
+            if ok:
+                rnr_db.mark_executed(qid, detail)
+                await notify_worker_outcome(bot, row, approved=True, ok=True, detail=detail)
+            elif attempts >= APPR_MAX_ATTEMPTS:
+                rnr_db.mark_exec_failed(qid, detail)
+                await alert_operator(
+                    bot, f"❌ Не смог подключить MCP-сервер для «{worker}» (#{qid}) за "
+                         f"{attempts} попыток: {detail}")
+            # else: leave 'approved' → backoff retry (idempotent)
+            return
         if action == "one-time-send":
             leased = await asyncio.to_thread(rnr_db.lease_sending, qid)
             if not leased:
@@ -871,7 +930,7 @@ async def card_sender_loop(bot: Bot):
                 try:
                     m = await bot.send_message(OPERATOR, render_approval(row),
                                                parse_mode="HTML",
-                                               reply_markup=approval_kb(row["qid"]))
+                                               reply_markup=approval_kb(row["qid"], row["action"]))
                     rnr_db.set_message_id_appr(row["qid"], m.message_id)
                     log.info("approval card sent qid=%s worker=%s action=%s",
                              row["qid"], row["worker"], row["action"])
@@ -1069,6 +1128,39 @@ def _run_lifecycle(action, worker):
         return 99, str(e)
 
 
+def _run_mcp(*args):
+    """Run a claude-auto MCP/lifecycle subcommand (get-mcp/set-mcp/mcp-add/mcp-rm/
+    mcp-reset/restart) as the operator (argv, shell=False; claude-auto validates names
+    against the catalog + writes spec.json atomically under the shared lock). Wider
+    timeout because `restart` drives systemctl. Returns (returncode, short_output)."""
+    try:
+        p = subprocess.run([CLAUDE_AUTO, *args], capture_output=True, timeout=60)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode, out
+    except Exception as e:  # noqa: BLE001
+        return 99, str(e)
+
+
+def _worker_mcp(worker):
+    """The worker's MCP view via `claude-auto get-mcp`: {subscribed, catalog, missing}
+    (subscribed is None when the worker inherits ALL). Returns the dict, or None on error."""
+    rc, out = _run_mcp("get-mcp", worker)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mcp_token(name):
+    """12-char fingerprint of an MCP server name, embedded in the toggle callback so a
+    stale button (catalog changed since render) resolves safely (never toggles the wrong
+    server). Wider than the 8-char whitelist token — extra headroom under the 64B limit."""
+    return hashlib.sha1(f"mcp:{name}".encode("utf-8")).hexdigest()[:12]
+
+
 def _confirm_kb(yes_cb, yes_label, back_cb):
     """Two-button confirm row: [<yes_label> → yes_cb] [↩️ Отмена → back_cb]."""
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -1159,6 +1251,77 @@ def _worker_max_probes(name):
     return _PROBE_LIMIT_DEFAULT
 
 
+def _worker_mcp_summary(worker):
+    """Cheap MCP-subscription summary for the card button — spec.json only, no catalog
+    read (the hot card path). Mirrors the launch tri-state: 'все' (absent/null → inherit
+    all), 'N' (explicit subscription of N), '⚠' (malformed → launch fails closed)."""
+    try:
+        with open(os.path.join(WORKERS_DIR, worker, "spec.json")) as f:
+            v = json.load(f).get("mcp_servers")
+    except Exception:  # noqa: BLE001
+        return "все"
+    if v is None:
+        return "все"
+    if isinstance(v, list):
+        return str(len([x for x in v if isinstance(x, str)]))
+    return "⚠"
+
+
+def wl_mcp_view(worker, mcp):
+    """MCP-server submenu for a worker. `mcp` is the parsed `claude-auto get-mcp` dict
+    ({subscribed, catalog, missing}; subscribed=None ⇒ inherits ALL). Returns (text, kb).
+    Each catalog server is a toggle (✓ on / ○ off); ⚠️ rows are subscribed-but-vanished
+    (tap to drop). Changes need a restart to take effect (button below)."""
+    subscribed = mcp.get("subscribed")          # list | None
+    catalog = mcp.get("catalog") or []
+    missing = mcp.get("missing") or []
+    inherit = subscribed is None
+    sub_set = set(subscribed or [])
+
+    lines = [f"🧩 <b>MCP-серверы</b> · «{esc(worker)}»"]
+    if inherit:
+        lines.append("Сейчас <b>наследует ВСЕ</b> серверы каталога (подписки нет). "
+                     "Первое изменение зафиксирует явный набор — дальше воркер поднимает "
+                     "только отмеченные ✓.")
+    else:
+        lines.append(f"Подписан на <b>{len(sub_set)}</b> из {len(catalog)} · "
+                     "🟢 вкл · 🔴 выкл" + (" · ⚠️ исчез из каталога" if missing else ""))
+    lines.append("<i>⚙️ stdio — поднимает процесс (память); 🌐 http/sse — почти бесплатно.</i>")
+    lines.append("━━━━━━━━━━━━━━")
+    for c in catalog:
+        nm = str(c.get("name", "?"))
+        on = inherit or (nm in sub_set)
+        kind = "⚙️ stdio" if c.get("stdio") else "🌐 http"
+        lines.append(f"{'🟢' if on else '🔴'} <b>{esc(nm)}</b> · {kind}")
+    for m in missing:
+        lines.append(f"⚠️ <b>{esc(str(m))}</b> · подписан, нет в каталоге")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("⚠️ Изменения применяются после <b>перезапуска</b>.")
+
+    rows = []
+    for c in catalog:
+        nm = str(c.get("name", "?"))
+        on = inherit or (nm in sub_set)
+        kind = "⚙️" if c.get("stdio") else "🌐"
+        rows.append([InlineKeyboardButton(
+            text=f"{'🟢' if on else '🔴'} {kind} {nm}"[:60],
+            callback_data=f"wl:mtog:{worker}:{_mcp_token(nm)}")])
+    for m in missing:
+        rows.append([InlineKeyboardButton(
+            text=f"⚠️🗑 {m}"[:60], callback_data=f"wl:mtog:{worker}:{_mcp_token(str(m))}")])
+    if not inherit:
+        rows.append([InlineKeyboardButton(text="↩️ Сбросить (наследовать все)",
+                                          callback_data=f"wl:mrst:{worker}")])
+    rows.append([InlineKeyboardButton(text="🔄 Перезапустить сейчас",
+                                      callback_data=f"wl:mres:{worker}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:mcp:{worker}"),
+                 InlineKeyboardButton(text="⬅️ К воркеру", callback_data=f"wl:w:{worker}")])
+    text = "\n".join(lines)
+    if len(text) > TG_LIMIT:
+        text = text[:TG_LIMIT - 1].rstrip() + "\n…"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def wl_worker_view(worker):
     """Rich per-worker panel (one card): status + session + sensors + whitelist
     (each contact a 🗑 button) + ➕ add + terminal attach. Blocking (systemctl + file
@@ -1170,6 +1333,7 @@ def wl_worker_view(worker):
     contacts = _load_contacts()
     probes = _worker_probe_objs(worker)
     limit = _worker_max_probes(worker)
+    mcp_sum = _worker_mcp_summary(worker)
 
     lines = [f"🤖 <b>{esc(worker)}</b>  {'🟢 активен' if active else '🔴 остановлен'}"]
     lines.append(f"🧠 Контекст <b>{round(ctx / 1000)}k</b> / {round(thr / 1000)}k · "
@@ -1206,6 +1370,10 @@ def wl_worker_view(worker):
         lines.append("<i>🗑 убрать · ➕ добавить</i>")
     else:
         lines.append("<i>пусто</i> · ➕ чтобы добавить")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("🧩 <b>MCP</b>: " + ("наследует все" if mcp_sum == "все"
+                 else "подписка повреждена ⚠️" if mcp_sum == "⚠"
+                 else f"подписка на {mcp_sum} серв."))
     lines.append(f"\n🔗 <code>tmux attach -t claude-{esc(worker)}</code>")
 
     rows = []
@@ -1223,6 +1391,8 @@ def wl_worker_view(worker):
         rows.append([InlineKeyboardButton(text="▶️ Разбудить", callback_data=f"wl:start:{worker}")])
     rows.append([InlineKeyboardButton(text=f"📊 Лимит датчиков ({limit})",
                                       callback_data=f"wl:limit:{worker}")])
+    rows.append([InlineKeyboardButton(text=f"🧩 MCP-серверы ({mcp_sum})",
+                                      callback_data=f"wl:mcp:{worker}")])
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:w:{worker}"),
                  InlineKeyboardButton(text="⬅️ К воркерам", callback_data="wl:list")])
     text = "\n".join(lines)
@@ -1249,7 +1419,8 @@ async def cb_wl(cb: CallbackQuery):
     # Strict arity: reject unknown subs AND trailing junk (hardens the protocol so
     # only well-formed operator callbacks act). worker is at parts[2] (when present).
     arity = {"list": 2, "w": 3, "add": 3, "start": 3, "stop": 3,
-             "stopc": 3, "limit": 3, "rm": 5, "rmc": 5}
+             "stopc": 3, "limit": 3, "rm": 5, "rmc": 5,
+             "mcp": 3, "mtog": 4, "mrst": 3, "mres": 3}
     if arity.get(sub) != len(parts):
         await cb.answer("неизвестная команда", show_alert=True)
         return
@@ -1374,6 +1545,77 @@ async def cb_wl(cb: CallbackQuery):
             parse_mode="HTML", reply_markup=ForceReply(selective=False))
         _wl_limit_pending_put(m.message_id, worker)
         await cb.answer()
+        return
+
+    # ---- MCP servers: open menu (mcp) / toggle (mtog) / reset (mrst) / restart (mres) ----
+    if sub == "mcp":
+        mcp = await asyncio.to_thread(_worker_mcp, worker)
+        if mcp is None:
+            await cb.answer("не смог прочитать MCP-набор", show_alert=True)
+            return
+        text, kb = wl_mcp_view(worker, mcp)
+        await _safe_edit(cb.message, text, kb)
+        await cb.answer()
+        return
+
+    if sub == "mtog":
+        token = parts[3]
+        mcp = await asyncio.to_thread(_worker_mcp, worker)
+        if mcp is None:
+            await cb.answer("не смог прочитать MCP-набор", show_alert=True)
+            return
+        subscribed = mcp.get("subscribed")
+        catalog = mcp.get("catalog") or []
+        missing = mcp.get("missing") or []
+        names = [str(c.get("name")) for c in catalog] + [str(m) for m in missing]
+        target = next((n for n in names if _mcp_token(n) == token), None)
+        if not target:  # catalog changed since render → re-resolve, don't act on a stale button
+            await cb.answer("каталог изменился — обновил", show_alert=True)
+            text, kb = wl_mcp_view(worker, mcp)
+            await _safe_edit(cb.message, text, kb)
+            return
+        if subscribed is None:
+            # inherit-all: every server is ON → toggling materializes an explicit set = rest
+            rest = [str(c.get("name")) for c in catalog if str(c.get("name")) != target]
+            rc, out = await asyncio.to_thread(_run_mcp, "set-mcp", worker, *rest)
+            verb = "выключен"
+        elif target in set(subscribed):
+            rc, out = await asyncio.to_thread(_run_mcp, "mcp-rm", worker, target)
+            verb = "выключен"
+        else:
+            rc, out = await asyncio.to_thread(_run_mcp, "mcp-add", worker, target)
+            verb = "включён"
+        await cb.answer(f"ошибка: {out[:180]}" if rc != 0
+                        else f"{target}: {verb} · перезапусти для применения", show_alert=(rc != 0))
+        mcp = await asyncio.to_thread(_worker_mcp, worker)
+        if mcp is not None:
+            text, kb = wl_mcp_view(worker, mcp)
+            await _safe_edit(cb.message, text, kb)
+        return
+
+    if sub == "mrst":
+        rc, out = await asyncio.to_thread(_run_mcp, "mcp-reset", worker)
+        await cb.answer(f"ошибка: {out[:180]}" if rc != 0
+                        else "сброшено — наследует все · перезапусти", show_alert=(rc != 0))
+        mcp = await asyncio.to_thread(_worker_mcp, worker)
+        if mcp is not None:
+            text, kb = wl_mcp_view(worker, mcp)
+            await _safe_edit(cb.message, text, kb)
+        return
+
+    if sub == "mres":
+        await cb.answer("перезапускаю…")  # restart drives systemctl → may outlast the 15s TTL
+        rc, out = await asyncio.to_thread(_run_mcp, "restart", worker)
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)
+        if rc != 0:
+            await cb.message.answer(
+                f"❌ Рестарт «{esc(worker)}»: <code>{esc(out)}</code>", parse_mode="HTML")
+        elif "DEFERRED" in out or "занят" in out.lower():
+            await cb.message.answer(
+                f"⏸️ «<b>{esc(worker)}</b>» сейчас занят — рестарт отложен. Новый MCP-набор "
+                "применится при следующем перезапуске (или нажми ещё раз, когда освободится).",
+                parse_mode="HTML")
         return
 
     await cb.answer()

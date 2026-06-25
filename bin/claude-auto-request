@@ -11,6 +11,8 @@
 #   whitelist-remove --entry tg:<id>|email:<addr>   remove one
 #   one-time-send    --to tg:<id> --body '<text>'   send ONE Telegram message without
 #                                                    permanently whitelisting (TG only)
+#   mcp-add          --server <name>                add an MCP server (from the catalog
+#                                                    ONLY) to MY subscription + restart me
 #
 # Operator-only BY CONSTRUCTION (same guarantees as claude-auto-ask):
 #   * worker identity is the spoof-resistant /proc ancestor (resolve_name), NOT
@@ -22,6 +24,7 @@
 #   claude-auto-request --action whitelist-add  --entry email:a@b.ru --reason '…'
 #   claude-auto-request --action whitelist-remove --entry tg:12345 --reason '…'
 #   claude-auto-request --action one-time-send  --to tg:12345 --body '…' --reason '…'
+#   claude-auto-request --action mcp-add --server google-workspace --reason '…'
 # Allow in a worker by ABSOLUTE path only:
 #   Bash(/opt/projects/active/claude-control/bin/claude-auto-request:*)
 set -u
@@ -29,6 +32,7 @@ set -u
 OPERATOR_ENV="/home/rainor/server/.env"
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
 DB="/opt/projects/active/claude-control/bot/rnr_db.py"
+MCP_CATALOG_FILE="${MCP_CATALOG_FILE:-$HOME/.claude.json}"  # MCP catalog (source of truth)
 BODY_MAX=2000
 REASON_MAX=400
 
@@ -54,7 +58,7 @@ resolve_name() {
 }
 
 # ---- args ----
-ACTION=""; ENTRY=""; TO=""; BODY=""; SUBJECT=""; REASON=""
+ACTION=""; ENTRY=""; TO=""; BODY=""; SUBJECT=""; REASON=""; SERVER=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --action)  ACTION="${2-}";  shift 2 || die "missing --action value" ;;
@@ -62,15 +66,16 @@ while [ "$#" -gt 0 ]; do
     --to)      TO="${2-}";      shift 2 || die "missing --to value" ;;
     --body)    BODY="${2-}";    shift 2 || die "missing --body value" ;;
     --subject) SUBJECT="${2-}"; shift 2 || die "missing --subject value" ;;
+    --server)  SERVER="${2-}";  shift 2 || die "missing --server value" ;;
     --reason)  REASON="${2-}";  shift 2 || die "missing --reason value" ;;
     *) die "unknown arg '$1'" ;;
   esac
 done
 
 case "$ACTION" in
-  whitelist-add|whitelist-remove|one-time-send) ;;
-  "") die "missing --action (whitelist-add|whitelist-remove|one-time-send)" ;;
-  *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send)" ;;
+  whitelist-add|whitelist-remove|one-time-send|mcp-add) ;;
+  "") die "missing --action (whitelist-add|whitelist-remove|one-time-send|mcp-add)" ;;
+  *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send|mcp-add)" ;;
 esac
 
 command -v python3 >/dev/null 2>&1 || die "python3 required"
@@ -110,6 +115,17 @@ case "$ACTION" in
     # strip control bytes (keep tab/newline), cap (bidi-strip happens in the bot's renderer)
     PAYLOAD="$(printf '%s' "$BODY" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$BODY_MAX")"
     [ -n "${PAYLOAD//[[:space:]]/}" ] || die "--body is empty after sanitization"
+    ;;
+  mcp-add)
+    # Request to add an MCP server to MY subscription. The server MUST be in the live
+    # catalog — a worker can only request a REAL server, never invent one. The bot adds
+    # it (claude-auto mcp-add) + restarts me on ✅. arg_value carries the server name.
+    [ -n "$SERVER" ] || die "--server <name> required for mcp-add"
+    [[ "$SERVER" =~ ^[a-zA-Z0-9_-]+$ ]] || die "mcp-add: bad server name '$SERVER' (use [a-zA-Z0-9_-])"
+    command -v jq >/dev/null 2>&1 || die "mcp-add: jq required to validate the server against the catalog"
+    [ -f "$MCP_CATALOG_FILE" ] && jq -e --arg k "$SERVER" '(.mcpServers // {}) | has($k)' "$MCP_CATALOG_FILE" >/dev/null 2>&1 \
+      || die "mcp-add: '$SERVER' is not in the MCP catalog ($MCP_CATALOG_FILE) — you may request only a catalog server"
+    ARG_KIND=mcp; ARG_VALUE="$SERVER"
     ;;
 esac
 

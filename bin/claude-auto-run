@@ -62,8 +62,17 @@ find_wfile() { ls -1 "$HOME/.claude/projects"/*/"$session_id.jsonl" 2>/dev/null 
 flip_seeded_if_ready() {
   [ "$seeded" = "true" ] && return 0
   [ -n "$(find_wfile)" ] || return 0
-  local t="$spec.tmp"
-  jq '.seeded = true' "$spec" > "$t" 2>/dev/null && mv "$t" "$spec" && { seeded=true; say "seeded confirmed (worker transcript present)"; }
+  # Take the SAME lock as the operator spec writers (claude-auto spec_rmw /
+  # set-probe-limit, which flock $home/state/.probes-rmw.lock) so this full-file
+  # rewrite can't lost-update a concurrent MCP-subscription / probe-limit change
+  # made while the worker is seeding. flock contends on the FILE (inode), so a
+  # different FD number here than claude-auto's still serializes correctly.
+  mkdir -p "$home/state"
+  (
+    flock 202 || exit 1
+    t="$(mktemp "$home/.spec.XXXXXX")" || exit 1
+    if jq '.seeded = true' "$spec" > "$t" 2>/dev/null && [ -s "$t" ]; then mv "$t" "$spec"; else rm -f "$t"; exit 1; fi
+  ) 202>"$home/state/.probes-rmw.lock" && { seeded=true; say "seeded confirmed (worker transcript present)"; }
 }
 
 [ -d "$cwd" ] || { echo "claude-auto-run: cwd missing: $cwd" >&2; exit 1; }
@@ -73,6 +82,21 @@ sess="claude-$name"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "$(ts) claude-auto-run[$name]: $*" | tee -a "$log" >&2; }
+
+# Best-effort one-way operator alert (NEVER blocks launch). Mirrors claude-auto-tg's
+# fixed-recipient pattern: operator chat_id + bot token from the operator's server .env,
+# telegram_notify.sh at an absolute path. Used to flag a dropped/malformed MCP subscription.
+OPERATOR_ENV="/home/rainor/server/.env"
+TG_NOTIFY="/home/rainor/server/server_monitor/telegram_notify.sh"
+notify_operator() {
+  local text="$1" chat rnr_val; local -a botflag=()
+  chat="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
+  { [ -n "$chat" ] && [ -x "$TG_NOTIFY" ]; } || return 0
+  rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' "$OPERATOR_ENV" 2>/dev/null | head -1 \
+              | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
+  [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
+  "$TG_NOTIFY" "${botflag[@]}" --chat-id "$chat" -- "$text" >/dev/null 2>&1 || true
+}
 
 # Pre-accept the folder-trust dialog for this cwd. An interactive worker would
 # otherwise BLOCK on "Is this a project you trust?" with no one to answer. In
@@ -131,6 +155,69 @@ else
   # still apply (durability kept). TTY is provided by tmux. Name defaults to worker.
   if [ "$remote_control" = "true" ]; then
     args+=( --remote-control "${rc_name:-$name}" )
+  fi
+
+  # ---- per-worker MCP subscription (resolved LIVE against the catalog) --------
+  # spec.json .mcp_servers is the operator-owned subscription (worker has Write-deny).
+  # Resolve it against the LIVE catalog (~/.claude.json .mcpServers) into a temp config +
+  # --strict-mcp-config so this worker loads ONLY its subscribed servers (no stale
+  # snapshot; survives a server's port/command change; skips a vanished one + alerts).
+  #   absent/null → no flags → inherit ALL (legacy; byte-identical to pre-feature launch)
+  #   []          → strict-zero (no MCP servers)
+  #   [names…]    → strict, only those that still exist in the catalog
+  mcp_runtime="$home/state/mcp.runtime.json"
+  mcp_notified="$home/state/.mcp-missing-notified"
+  mcp_sub="$(jq -c 'if (has("mcp_servers")|not) or (.mcp_servers|type)=="null" then "none"
+                    elif (.mcp_servers|type)=="array" then (.mcp_servers|map(select(type=="string"))|unique)
+                    else "bad" end' "$spec" 2>/dev/null)"
+  [ -n "$mcp_sub" ] || mcp_sub='"none"'   # spec unreadable → safest legacy fallback
+  if [ "$mcp_sub" = '"none"' ]; then
+    rm -f "$mcp_runtime" 2>/dev/null || true   # drop a stale runtime from a prior subscription
+  else
+    # Fail CLOSED on a malformed value: strict-zero + alert, never inherit-all on garbage,
+    # never crash-loop under systemd supervision.
+    if [ "$mcp_sub" = '"bad"' ]; then
+      say "WARN: spec.json .mcp_servers is malformed (not an array of strings) — failing closed to strict-zero MCP"
+      notify_operator "⚠️ Воркер «$name»: поле .mcp_servers в spec.json повреждено — стартую БЕЗ MCP-серверов (strict-zero). Проверь подписку."
+      mcp_sub='[]'
+    fi
+    catalog="$(jq -c '.mcpServers // {}' "$trust_cfg" 2>/dev/null || echo '{}')"
+    resolved="$(jq -nc --argjson cat "$catalog" --argjson sub "$mcp_sub" \
+      '{ resolved: { mcpServers: ($cat|to_entries|map(select(.key as $k|$sub|index($k)))|from_entries) },
+         missing: [ $sub[] | select(. as $k | ($cat|has($k))|not) ] }' 2>/dev/null)"
+    # Write the resolved config atomically (temp in the same dir → atomic rename). We HAVE a
+    # subscription here, so on ANY write failure we must NOT inherit-all (that would silently
+    # over-privilege the worker). Fail CLOSED: fall back to a strict-zero config; only a true
+    # disk/permission catastrophe (can't write ANY file) skips the flag, with a CRITICAL alert.
+    rtmp="$mcp_runtime.tmp.$$"
+    if [ -n "$resolved" ] && printf '%s' "$resolved" | jq '.resolved' > "$rtmp" 2>/dev/null \
+       && [ -s "$rtmp" ] && mv "$rtmp" "$mcp_runtime" 2>/dev/null; then
+      chmod 600 "$mcp_runtime" 2>/dev/null || true
+      args+=( --strict-mcp-config --mcp-config "$mcp_runtime" )
+    else
+      rm -f "$rtmp" 2>/dev/null || true
+      if printf '%s\n' '{"mcpServers":{}}' > "$mcp_runtime" 2>/dev/null; then
+        chmod 600 "$mcp_runtime" 2>/dev/null || true
+        args+=( --strict-mcp-config --mcp-config "$mcp_runtime" )
+        say "WARN: could not build resolved MCP config — failing CLOSED to strict-zero (no servers)"
+        notify_operator "⚠️ Воркер «$name»: не смог собрать MCP-набор — стартую БЕЗ серверов (strict-zero, fail-closed). Проверь подписку/каталог."
+      else
+        say "CRITICAL: cannot write any MCP runtime config ($mcp_runtime) — launching WITHOUT --mcp-config (inherits all). Investigate disk/permissions."
+        notify_operator "🔴 Воркер «$name»: не смог записать MCP-конфиг ВООБЩЕ ($home/state) — стартую с НАСЛЕДОВАНИЕМ всех серверов. Проверь диск/права."
+      fi
+    fi
+    # Alert on subscribed-but-vanished servers (deduped by set hash; cleared on recovery).
+    missing="$(printf '%s' "$resolved" | jq -c '.missing // []' 2>/dev/null)"
+    if [ -n "$missing" ] && [ "$missing" != '[]' ]; then
+      mhash="$(printf '%s' "$missing" | sha1sum 2>/dev/null | cut -c1-16)"
+      if [ "$(cat "$mcp_notified" 2>/dev/null)" != "$mhash" ]; then
+        say "subscribed MCP server(s) not in catalog — skipped: $missing"
+        notify_operator "⚠️ Воркер «$name»: подписан на MCP-серверы, которых нет в каталоге — пропущены: $(printf '%s' "$missing" | jq -r 'join(", ")' 2>/dev/null). Обнови подписку (бот → 🧩 MCP-серверы)."
+        printf '%s' "$mhash" > "$mcp_notified" 2>/dev/null || true
+      fi
+    else
+      rm -f "$mcp_notified" 2>/dev/null || true   # recovery: clear so a later disappearance re-alerts
+    fi
   fi
 
   say "launching: ${seeded:+resume }$session_id mode=$mode cwd=$cwd"

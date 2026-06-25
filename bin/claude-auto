@@ -50,6 +50,17 @@ have() { command -v "$1" >/dev/null 2>&1; }
 have jq || die "jq required"
 ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
+# ---- MCP catalog (per-worker MCP subscriptions) ----------------------------
+# The live catalog (source of truth) is ~/.claude.json key `.mcpServers`. A worker
+# stores only a SUBSCRIPTION (list of names) in its spec.json `.mcp_servers`; the
+# real definitions are resolved against this catalog at every launch (see
+# claude-auto-run), so a server changing/disappearing never leaves a stale snapshot.
+MCP_CATALOG_FILE="${MCP_CATALOG_FILE:-$HOME/.claude.json}"
+mcp_catalog() {  # echo the catalog object ({} if unreadable/absent)
+  [ -f "$MCP_CATALOG_FILE" ] && jq -c '.mcpServers // {}' "$MCP_CATALOG_FILE" 2>/dev/null || echo '{}'
+}
+mcp_valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }  # same charset as MCP server keys
+
 # Identity + event-bridge awareness sections for a worker's CLAUDE.md (the STATIC
 # base layer; the dynamic, live-probe-list version is the SessionStart hook
 # claude-auto-identity). Shared by `adopt` (fresh worker) and `upgrade` (retrofit
@@ -131,6 +142,12 @@ emit_identity_sections() {
   echo "    (tagged \`[ответ оператора … (#<qid>)]\`). For a free-text escalation use claude-auto-tg."
   echo "- You CANNOT change your own permissions (allow/ask/deny) — operator-only. If you"
   echo "  need one widened, say so in your output."
+  echo "- Your MCP servers may be SCOPED to a subset (operator-owned, stored in your spec —"
+  echo "  you can't widen it yourself). If you need an MCP server you don't currently have,"
+  echo "  REQUEST it from the catalog — the operator taps ✅ and the BOT adds it + restarts you:"
+  echo "      claude-auto-request --action mcp-add --server <name> --reason 'зачем нужно'"
+  echo "    Only catalog servers are allowed (you can't invent one). After requesting: PARK —"
+  echo "    the outcome (and the restart) arrive on their own; do NOT retry."
   echo
   echo "## Reaching your operator (two-way @RnR_Workers bot)"
   echo
@@ -186,7 +203,7 @@ cmd_install_units() {
 cmd_adopt() {
   local session="" cwd="" name="" mode="auto" mission="" mission_file="" probe_config="" model=""
   local remote_control=false rc_name=""
-  local -a allow=() ask=() deny=()
+  local -a allow=() ask=() deny=() mcp_servers=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --session) session="${2:-}"; shift 2 ;;
@@ -198,6 +215,7 @@ cmd_adopt() {
       --allow) allow+=("${2:-}"); shift 2 ;;
       --ask) ask+=("${2:-}"); shift 2 ;;
       --deny) deny+=("${2:-}"); shift 2 ;;
+      --mcp) mcp_servers+=("${2:-}"); shift 2 ;;
       --probe-config) probe_config="${2:-}"; shift 2 ;;
       --model) model="${2:-}"; shift 2 ;;
       --remote-control) remote_control=true; shift ;;
@@ -286,6 +304,22 @@ cmd_adopt() {
   local home="$WORKERS_DIR/$name"
   [ -e "$home" ] && die "adopt: worker '$name' already exists ($home). Use a new name or 'remove' first."
 
+  # MCP subscription (least-privilege per-worker MCP set). Validate each name against
+  # the live catalog NOW (fail fast). No --mcp → no `.mcp_servers` key → inherit-all
+  # (byte-identical to pre-feature workers; backward compatible). `--mcp` with names →
+  # the worker launches with ONLY those (resolved live at launch by claude-auto-run).
+  local mcp_arg="null"
+  if [ "${#mcp_servers[@]}" -gt 0 ]; then
+    local _cat _s; _cat="$(mcp_catalog)"
+    for _s in "${mcp_servers[@]}"; do
+      [ -n "$_s" ] || continue
+      mcp_valid_name "$_s" || die "adopt: bad --mcp server name '$_s' (use [a-zA-Z0-9_-])"
+      jq -e --arg k "$_s" 'has($k)' <<<"$_cat" >/dev/null 2>&1 \
+        || die "adopt: --mcp '$_s' is not in the MCP catalog (~/.claude.json mcpServers)"
+    done
+    mcp_arg="$(printf '%s\n' "${mcp_servers[@]}" | sed '/^$/d' | jq -R . | jq -s 'unique')"
+  fi
+
   mkdir -p "$home/logs" "$home/state"
   local W; W="$(cat /proc/sys/kernel/random/uuid)"
 
@@ -294,11 +328,12 @@ cmd_adopt() {
   # empty (jq cartesian-product semantics), silently producing a 0-byte spec.
   jq -n --arg n "$name" --arg w "$W" --arg o "$session" --arg c "$cwd" \
         --arg m "$mode" --arg model "$model" --arg t "$(ts)" \
-        --argjson rc "$remote_control" --arg rcn "$rc_name" \
+        --argjson rc "$remote_control" --arg rcn "$rc_name" --argjson mcp "$mcp_arg" \
     '{name:$n, session_id:$w, origin_id:$o, cwd:$c, permission_mode:$m,
       seeded:false, model:(if $model=="" then null else $model end),
       remote_control:$rc, remote_control_name:(if $rcn=="" then null else $rcn end),
-      created_at:$t}' \
+      created_at:$t}
+     + (if $mcp==null then {} else {mcp_servers:$mcp} end)' \
     > "$home/spec.json" || die "failed to write spec.json"
   [ -s "$home/spec.json" ] && jq -e . "$home/spec.json" >/dev/null 2>&1 || die "spec.json is empty/invalid after write"
 
@@ -490,6 +525,31 @@ EOF
 # Validate the name BEFORE using it in a path: a name like `..` would otherwise
 # pass `-d` and let set-probes/remove/etc. traverse outside WORKERS_DIR.
 worker_exists() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] && [ -d "$WORKERS_DIR/$1" ]; }
+
+# Atomic, locked read-modify-write of a worker's spec.json. Mirrors cmd_set_probe_limit
+# and takes the SAME shared lock (.probes-rmw.lock) so a spec write (MCP subscription)
+# and a probe/limit change can't lost-update each other. Validates that spec.json is a
+# JSON object before AND after (never produce a broken spec under systemd supervision).
+# Usage: spec_rmw <name> '<jq program>' [jq args...]
+spec_rmw() {
+  local name="$1"; shift
+  local prog="$1"; shift
+  local home="$WORKERS_DIR/$name" spec="$WORKERS_DIR/$name/spec.json" statedir="$WORKERS_DIR/$name/state"
+  [ -s "$spec" ] && jq -e 'type=="object"' "$spec" >/dev/null 2>&1 \
+    || die "spec write: spec.json missing/empty/invalid for '$name' — refusing to write"
+  mkdir -p "$statedir"
+  if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
+    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
+      flock -w 10 8 2>/dev/null || die "spec write: busy (a probe/spec change is in progress) — retry"
+    fi
+  fi
+  local t; t="$(mktemp "$home/.spec.XXXXXX")" || die "spec write: mktemp failed"
+  if jq "$@" "$prog" "$spec" > "$t" && [ -s "$t" ] && jq -e 'type=="object"' "$t" >/dev/null 2>&1; then
+    mv "$t" "$spec" || { rm -f "$t"; die "spec write: mv failed"; }
+  else
+    rm -f "$t"; die "spec write: produced invalid spec — unchanged"
+  fi
+}
 
 # Heuristic: is the worker's TUI mid-turn / showing a permission prompt? Used by
 # `upgrade` to DEFER a stop/start restart so we don't kill tmux during a tool call
@@ -779,6 +839,125 @@ cmd_set_probe_limit() {
   echo "set-probe-limit: '$name' self-service probe limit set to $n (applies immediately; no restart)."
 }
 
+# ---- MCP subscription (per-worker MCP server set) --------------------------
+# spec.json `.mcp_servers` is the SUBSCRIPTION (operator-owned; worker has Write-deny):
+#   absent/null  → inherit ALL catalog servers (legacy behavior; backward compatible)
+#   []           → strict, ZERO servers
+#   [names…]     → strict, ONLY those (resolved live against the catalog at launch)
+# Changes are NOT live — they apply on the next launch (use `restart`).
+
+# get-mcp <name> — print a rich JSON view for the bot: the subscription, the live
+# catalog (name + stdio flag), and any subscribed-but-vanished names (⚠️).
+cmd_get_mcp() {
+  local name="${1:?usage: get-mcp <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  local spec="$WORKERS_DIR/$name/spec.json" catalog sub
+  catalog="$(mcp_catalog)"
+  # Classify EXACTLY like the launcher (claude-auto-run) so the bot view matches what the
+  # worker will actually load: absent/null → null (inherit all); array → the names; anything
+  # else (malformed) → [] (strict-zero), NOT null — else the menu would wrongly show "inherit
+  # all" and the first toggle would materialize from the wrong baseline.
+  sub="$(jq -c 'if (has("mcp_servers")|not) or (.mcp_servers|type)=="null" then null
+                elif (.mcp_servers|type)=="array" then (.mcp_servers|map(select(type=="string"))|unique)
+                else [] end' "$spec" 2>/dev/null)"
+  [ -n "$sub" ] || sub="null"
+  jq -nc --argjson catalog "$catalog" --argjson sub "$sub" '
+    { subscribed: $sub,
+      catalog: ($catalog | to_entries | map({name:.key, stdio:(.value|has("command"))}) | sort_by(.name)),
+      missing: (if $sub==null then [] else [ $sub[] | select(. as $k | ($catalog|has($k))|not) ] end) }'
+}
+
+# mcp-suggest --session <origin-id> — least-privilege recommendation for /go-autonomous:
+# the MCP servers the origin session actually called, ∩ catalog. Prints JSON
+# {suggested:[…], catalog:[{name,stdio}…]}.
+cmd_mcp_suggest() {
+  local session=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) session="${2:-}"; shift 2 ;;
+      *) die "mcp-suggest: unknown arg $1" ;;
+    esac
+  done
+  [ -n "$session" ] || die "usage: mcp-suggest --session <origin-id>"
+  local trans; trans="$(ls -1 "$HOME/.claude/projects"/*/"$session.jsonl" 2>/dev/null | head -1)"
+  [ -n "$trans" ] || die "mcp-suggest: transcript for session '$session' not found under ~/.claude/projects"
+  local catalog used; catalog="$(mcp_catalog)"
+  # Walk every JSONL event; collect distinct mcp__<server>__* tool_use names → <server>.
+  used="$(jq -rn '[ inputs | .. | objects | select(.type? == "tool_use") | .name? // empty
+                    | select(startswith("mcp__")) | split("__")[1] ] | unique' "$trans" 2>/dev/null)"
+  [ -n "$used" ] || used="[]"
+  jq -n --argjson catalog "$catalog" --argjson used "$used" '
+    { suggested: ($used | map(select(. as $s | $catalog|has($s)))),
+      catalog: ($catalog | to_entries | map({name:.key, stdio:(.value|has("command"))}) | sort_by(.name)) }'
+}
+
+# set-mcp <name> [server…] — REPLACE the subscription wholesale (every name must be in
+# the catalog). Zero servers → [] (strict-zero). Used by the skill + bulk edits.
+cmd_set_mcp() {
+  local name="${1:?usage: set-mcp <name> [server…]}"
+  worker_exists "$name" || die "no worker '$name'"; shift
+  local catalog _s; catalog="$(mcp_catalog)"
+  local -a servers=()
+  for _s in "$@"; do
+    [ -n "$_s" ] || continue
+    mcp_valid_name "$_s" || die "set-mcp: bad server name '$_s' (use [a-zA-Z0-9_-])"
+    jq -e --arg k "$_s" 'has($k)' <<<"$catalog" >/dev/null 2>&1 \
+      || die "set-mcp: '$_s' is not in the MCP catalog (~/.claude.json mcpServers)"
+    servers+=("$_s")
+  done
+  local arr; arr="$(printf '%s\n' "${servers[@]:-}" | sed '/^$/d' | jq -R . | jq -s 'unique')"
+  spec_rmw "$name" '.mcp_servers = $a' --argjson a "$arr"
+  echo "set-mcp: '$name' subscription → [$(jq -r 'join(", ")' <<<"$arr")] ($(jq 'length' <<<"$arr") server(s)). Restart to apply: claude-auto restart $name"
+}
+
+# mcp-add <name> <server> — add one server (must be in the catalog). If the worker had
+# no subscription, this CREATES one ([server]); the bot materializes the full set first
+# for inherit-all workers, so realistic callers add to an existing subscription.
+cmd_mcp_add() {
+  local name="${1:?usage: mcp-add <name> <server>}" server="${2:-}"
+  [ -n "$server" ] || die "usage: mcp-add <name> <server>"
+  worker_exists "$name" || die "no worker '$name'"
+  mcp_valid_name "$server" || die "mcp-add: bad server name '$server' (use [a-zA-Z0-9_-])"
+  jq -e --arg k "$server" 'has($k)' <<<"$(mcp_catalog)" >/dev/null 2>&1 \
+    || die "mcp-add: '$server' is not in the MCP catalog (~/.claude.json mcpServers)"
+  spec_rmw "$name" '.mcp_servers = ((.mcp_servers // []) + [$s] | unique)' --arg s "$server"
+  echo "mcp-add: '$server' added to '$name' subscription. Restart to apply: claude-auto restart $name"
+}
+
+# mcp-rm <name> <server> — remove one server. Allowed even for a vanished name (not in
+# catalog). No-op if the worker has no subscription (inherit-all has no list to edit).
+cmd_mcp_rm() {
+  local name="${1:?usage: mcp-rm <name> <server>}" server="${2:-}"
+  [ -n "$server" ] || die "usage: mcp-rm <name> <server>"
+  worker_exists "$name" || die "no worker '$name'"
+  mcp_valid_name "$server" || die "mcp-rm: bad server name '$server' (use [a-zA-Z0-9_-])"
+  spec_rmw "$name" 'if has("mcp_servers") then .mcp_servers = (.mcp_servers - [$s]) else . end' --arg s "$server"
+  echo "mcp-rm: '$server' removed from '$name' subscription (if present). Restart to apply: claude-auto restart $name"
+}
+
+# mcp-reset <name> — drop the subscription entirely → back to inherit-ALL.
+cmd_mcp_reset() {
+  local name="${1:?usage: mcp-reset <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  spec_rmw "$name" 'del(.mcp_servers)'
+  echo "mcp-reset: '$name' subscription cleared — now inherits ALL catalog servers. Restart to apply: claude-auto restart $name"
+}
+
+# restart <name> — stop + start (kills tmux, brings up a fresh `claude --resume <W>`),
+# the way MCP-set changes take effect (settings/argv are read only at launch). Honors
+# worker_busy: never kills a worker mid-turn / over a prompt (would lose input) — instead
+# DEFERS (the new set applies on the next launch anyway, since launch re-resolves spec).
+cmd_restart() {
+  local name="${1:?usage: restart <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  if worker_busy "$name"; then
+    echo "restart: '$name' is busy (turn running / prompt open) — DEFERRED, not interrupting. The new config applies on the next restart (natural crash/reboot, or retry when idle)."
+    return 0
+  fi
+  cmd_stop "$name"
+  cmd_start "$name"
+}
+
 # upgrade <name> — retrofit an EXISTING worker to the current template WITHOUT a
 # re-adopt (which would re-fork the origin and lose the worker's accumulated
 # conversation). Idempotently: (1) wire the SessionStart identity hook into
@@ -1037,6 +1216,15 @@ CLAUDE.md) и свой поток событий (датчики event-bridge).
   set-probe-limit <имя> <N>    потолок самообслуживания: сколько датчиков воркер
                                навесит на себя сам (1..100; дефолт 20; живьём)
 
+MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
+  get-mcp <имя>                JSON: подписка + каталог + исчезнувшие (для бота)
+  mcp-suggest --session <id>   рекомендуемый минимум по дёрнутым в origin-сессии (для скилла)
+  set-mcp <имя> [server…]      заменить подписку целиком (имена из каталога; 0 = strict-zero)
+  mcp-add <имя> <server>       добавить один сервер из каталога
+  mcp-rm <имя> <server>        убрать один сервер
+  mcp-reset <имя>              очистить подписку → наследовать ВСЕ серверы каталога
+  (изменения применяются при следующем рестарте: claude-auto restart <имя>)
+
 БЕЛЫЙ СПИСОК (кому воркер пишет БЕЗ подтверждения: TG + почта)
   allow list <имя>                       показать белый список воркера
   allow add <имя> tg:<chat_id>|email:<addr>     добавить контакт
@@ -1045,6 +1233,8 @@ CLAUDE.md) и свой поток событий (датчики event-bridge).
 ЖИЗНЕННЫЙ ЦИКЛ
   start <имя>                  запустить / поднять юнит
   stop <имя>                   остановить + отключить юнит (файлы сохраняются)
+  restart <имя>                stop+start с resume (для применения MCP-набора; не трогает
+                               занятого воркера — откладывает)
   upgrade <имя>                подтянуть воркера к текущему шаблону (auto mode,
                                awareness, забор) без re-adopt; рестарт с resume —
                                контекст и датчики целы
@@ -1107,6 +1297,13 @@ case "$sub" in
   get-probes) cmd_get_probes "$@" ;;
   set-probes) cmd_set_probes "$@" ;;
   set-probe-limit) cmd_set_probe_limit "$@" ;;
+  get-mcp) cmd_get_mcp "$@" ;;
+  mcp-suggest) cmd_mcp_suggest "$@" ;;
+  set-mcp) cmd_set_mcp "$@" ;;
+  mcp-add) cmd_mcp_add "$@" ;;
+  mcp-rm) cmd_mcp_rm "$@" ;;
+  mcp-reset) cmd_mcp_reset "$@" ;;
+  restart) cmd_restart "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
   allow) cmd_allow "$@" ;;
   install-units) cmd_install_units ;;
