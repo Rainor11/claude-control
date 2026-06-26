@@ -68,6 +68,28 @@ msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037')"
 snapshot() { tmux -L "$socket" capture-pane -p -t "$pane" 2>/dev/null; }
 ms_sleep() { local ms="$1"; sleep "$(awk "BEGIN{print $ms/1000}")"; }
 
+# Empty the input box of any stale text. A prior injection whose Enter was dropped
+# leaves its payload sitting in the input; the caller then retries and we would
+# otherwise paste-append to it, submitting a duplicated/merged message. Backspace
+# deletes leftward across newlines, and the cursor sits at the END of such stale
+# text (a dropped Enter never moves it), so a burst clears it. Loop in bursts
+# until the pane stops changing: an already-empty input makes the first burst a
+# harmless no-op and returns at once (verified: backspace on an empty prompt does
+# nothing). Bounded (10 bursts × 60) so it can never spin. Call only AFTER the
+# wait-loop has confirmed the session is idle (so nothing is mid-render).
+clear_input() {
+  local i prev cur
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    prev="$(snapshot)"
+    # shellcheck disable=SC2046  # intentional word-split: 60 BSpace key tokens
+    tmux -L "$socket" send-keys -t "$pane" $(printf 'BSpace %.0s' $(seq 1 60)) 2>/dev/null
+    ms_sleep 200
+    cur="$(snapshot)"
+    [ "$prev" = "$cur" ] && return 0
+  done
+  return 0
+}
+
 # per-target lock so two injectors don't interleave.
 # NOTE: do NOT append `2>/dev/null` to an `exec` redirection — on `exec` with no
 # command the redirection applies to the WHOLE shell permanently, silently
@@ -101,7 +123,9 @@ while :; do
   break  # idle + stable
 done
 
-# Deliver: bracketed paste keeps multiline as a single input block, then Enter.
+# Deliver: clear any stale input first (avoids paste-append duplication on a
+# caller retry), then bracketed-paste keeps multiline as a single input block.
+clear_input
 buf="session-inject-$$"
 printf '%s' "$msg" | tmux -L "$socket" load-buffer -b "$buf" - 2>/dev/null || { echo "session-inject: load-buffer failed" >&2; exit 1; }
 tmux -L "$socket" paste-buffer -p -d -b "$buf" -t "$pane" 2>/dev/null || { echo "session-inject: paste-buffer failed" >&2; exit 1; }
