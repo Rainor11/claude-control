@@ -226,20 +226,41 @@ def _live_ctx_from_transcript(name):
         return None
 
 
+# Default autocompact threshold — KEEP IN SYNC with claude-auto-heartbeat's
+# CLAUDE_AUTO_COMPACT_THRESHOLD default. Per-worker override (when set) lives in
+# spec.json `.compact_threshold`; absent → this default.
+_DEFAULT_COMPACT_THRESHOLD = 900000
+
+
+def _worker_compact_threshold(name):
+    """The threshold the worker's heartbeat WILL use for autocompact — resolved the same
+    way it does (spec.json `.compact_threshold` override, else the default). Read THIS, not
+    the `threshold` field snapshotted in context.json, so the % reflects the CURRENT config
+    immediately — an idle worker's context.json keeps the OLD threshold until its next Stop
+    hook, which otherwise shows a stale (e.g. 700k-based) percentage after a default change."""
+    try:
+        with open(os.path.join(WORKERS_DIR, name, "spec.json")) as f:
+            v = json.load(f).get("compact_threshold")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
+    return _DEFAULT_COMPACT_THRESHOLD
+
+
 def _worker_ctx(name):
-    """(ctx_tokens, threshold). Prefer a LIVE recompute from the transcript so the
-    number reflects reality immediately; fall back to the context.json snapshot (which
-    only refreshes on the worker's Stop hook), then to defaults."""
-    snap, thr = 0, 900000
+    """(ctx_tokens, threshold). ctx is LIVE-recomputed from the transcript (immediate);
+    threshold is the CURRENT effective value (spec override / default), NOT the possibly
+    stale snapshot in context.json — so % is correct right after a threshold change even
+    before the worker's next heartbeat fires."""
+    snap = 0
     try:
         with open(os.path.join(WORKERS_DIR, name, "state", "context.json")) as f:
-            d = json.load(f)
-        snap = int(d.get("ctx_tokens") or 0)
-        thr = int(d.get("threshold") or 900000)
+            snap = int(json.load(f).get("ctx_tokens") or 0)
     except Exception:  # noqa: BLE001
         pass
     live = _live_ctx_from_transcript(name)
-    return (live if live is not None else snap), thr
+    return (live if live is not None else snap), _worker_compact_threshold(name)
 
 
 def _worker_probes(name):
