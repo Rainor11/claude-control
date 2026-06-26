@@ -46,11 +46,16 @@ msg="${1:?usage: session-inject <target> <message|->}"
 [ "$msg" = "-" ] && msg="$(cat)"
 
 command -v tmux >/dev/null 2>&1 || { echo "session-inject: tmux required" >&2; exit 2; }
-tmux has-session -t "$target" 2>/dev/null || { echo "session-inject: no tmux target '$target'" >&2; exit 2; }
+# Per-worker tmux socket: $target is the session name (claude-<worker>), which is ALSO
+# the worker's dedicated -L socket name. Every server call below uses -L "$socket"; the
+# -t flag still addresses the resolved pane id ($pane). NEVER use -L "$pane". (Each worker
+# runs its own tmux server in its own cgroup — see claude-auto-run.)
+socket="$target"
+tmux -L "$socket" has-session -t "$target" 2>/dev/null || { echo "session-inject: no tmux target '$target'" >&2; exit 2; }
 
 # Resolve to a concrete pane id (the active pane of the target's active window).
-pane="$(tmux list-panes -t "$target" -F '#{pane_active} #{pane_id}' 2>/dev/null | awk '$1==1{print $2; exit}')"
-[ -n "$pane" ] || pane="$(tmux list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | head -1)"
+pane="$(tmux -L "$socket" list-panes -t "$target" -F '#{pane_active} #{pane_id}' 2>/dev/null | awk '$1==1{print $2; exit}')"
+[ -n "$pane" ] || pane="$(tmux -L "$socket" list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | head -1)"
 [ -n "$pane" ] || { echo "session-inject: no pane for '$target'" >&2; exit 2; }
 
 BUSY_RE="${INJECT_BUSY_RE:-esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc}"
@@ -60,7 +65,7 @@ APPROVAL_RE="${INJECT_APPROVAL_RE:-Do you want|Would you like|❯ *[0-9]+\.|[0-9
 msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037')"
 [ -n "$msg" ] || { echo "session-inject: empty message" >&2; exit 2; }
 
-snapshot() { tmux capture-pane -p -t "$pane" 2>/dev/null; }
+snapshot() { tmux -L "$socket" capture-pane -p -t "$pane" 2>/dev/null; }
 ms_sleep() { local ms="$1"; sleep "$(awk "BEGIN{print $ms/1000}")"; }
 
 # per-target lock so two injectors don't interleave.
@@ -98,18 +103,49 @@ done
 
 # Deliver: bracketed paste keeps multiline as a single input block, then Enter.
 buf="session-inject-$$"
-printf '%s' "$msg" | tmux load-buffer -b "$buf" - 2>/dev/null || { echo "session-inject: load-buffer failed" >&2; exit 1; }
-tmux paste-buffer -p -d -b "$buf" -t "$pane" 2>/dev/null || { echo "session-inject: paste-buffer failed" >&2; exit 1; }
+printf '%s' "$msg" | tmux -L "$socket" load-buffer -b "$buf" - 2>/dev/null || { echo "session-inject: load-buffer failed" >&2; exit 1; }
+tmux -L "$socket" paste-buffer -p -d -b "$buf" -t "$pane" 2>/dev/null || { echo "session-inject: paste-buffer failed" >&2; exit 1; }
 # small beat so the TUI registers the paste before Enter
 ms_sleep 250
-tmux send-keys -t "$pane" Enter 2>/dev/null
+post_paste="$(snapshot)" || { echo "session-inject: snapshot failed after paste for $target ($pane)" >&2; exit 1; }
+# Baseline count of the busy hint BEFORE submit. The wait-loop guaranteed the
+# session was idle at paste time (BUSY_RE includes "esc to interrupt"), so any
+# *increase* in this count after Enter means our turn actually started. Counting
+# (vs slicing the bottom N rows) is immune to (a) payload text — it contributes
+# equally to base and post-submit — and (b) the bottom chrome varying between
+# sessions (some show extra "new task? /clear…" / "/rc" rows below the hint,
+# which would push a fixed tail window off the real hint line).
+busy_base="$(printf '%s\n' "$post_paste" | grep -cF 'esc to interrupt')"
 
-# best-effort acceptance: the input area should no longer hold our last line
-ms_sleep 400
-after="$(snapshot | tail -n 6)"
-last_line="$(printf '%s' "$msg" | tail -n1)"
-if [ -n "$last_line" ] && printf '%s' "$after" | grep -qF "$last_line"; then
-  echo "session-inject: warning — payload may still be in the input box (not confirmed submitted)" >&2
+# Confirm-and-retry submit. A single Enter can be silently dropped while the TUI
+# is still rendering — most often right after a very long turn ends (observed: a
+# 32-min turn left the payload sitting un-submitted in the input box while this
+# script still reported success). Policy (Codex-reviewed):
+#   - SUCCESS: the "esc to interrupt" line-count rose vs the post-paste baseline
+#     => a new turn started => our message was submitted.
+#   - RETRY another Enter ONLY on strong negative evidence: the pane is byte-
+#     identical to the post-paste snapshot => the Enter was definitely dropped.
+#   - any other (ambiguous) change, or exhausting retries => exit non-zero so the
+#     caller retries instead of recording a false "delivered". Never mash Enter
+#     into a session that may now be busy or showing an approval/permission prompt.
+submitted=0
+for attempt in 1 2 3 4; do
+  tmux -L "$socket" send-keys -t "$pane" Enter 2>/dev/null || { echo "session-inject: send Enter failed for $target ($pane)" >&2; exit 1; }
+  ms_sleep "$(( 300 + attempt * 150 ))"
+  snap="$(snapshot)" || { echo "session-inject: snapshot failed after Enter for $target ($pane)" >&2; exit 1; }
+  busy_now="$(printf '%s\n' "$snap" | grep -cF 'esc to interrupt')"
+  if [ "$busy_now" -gt "$busy_base" ]; then
+    submitted=1; break   # a turn started — submitted
+  fi
+  if [ "$snap" != "$post_paste" ]; then
+    echo "session-inject: submit state ambiguous after Enter for $target ($pane) — not retrying" >&2
+    exit 1
+  fi
+done
+
+if [ "$submitted" -ne 1 ]; then
+  echo "session-inject: Enter not accepted after retries — payload still in input box for $target ($pane)" >&2
+  exit 1
 fi
 echo "session-inject: delivered to $target ($pane)"
 exit 0
