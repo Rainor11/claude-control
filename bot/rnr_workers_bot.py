@@ -230,12 +230,12 @@ def _worker_ctx(name):
     """(ctx_tokens, threshold). Prefer a LIVE recompute from the transcript so the
     number reflects reality immediately; fall back to the context.json snapshot (which
     only refreshes on the worker's Stop hook), then to defaults."""
-    snap, thr = 0, 700000
+    snap, thr = 0, 900000
     try:
         with open(os.path.join(WORKERS_DIR, name, "state", "context.json")) as f:
             d = json.load(f)
         snap = int(d.get("ctx_tokens") or 0)
-        thr = int(d.get("threshold") or 700000)
+        thr = int(d.get("threshold") or 900000)
     except Exception:  # noqa: BLE001
         pass
     live = _live_ctx_from_transcript(name)
@@ -294,7 +294,7 @@ def render_overview():
     return (
         f"📋 <b>Воркеры</b> · 🟢 {up} / 🔴 {down}\n"
         + table
-        + "\n<i>ctx — контекст из 700k · загр — загрузка% · дат — датчиков · ! ≥90%</i>"
+        + "\n<i>ctx — контекст из 900k · загр — загрузка% · дат — датчиков · ! ≥90%</i>"
     )
 
 

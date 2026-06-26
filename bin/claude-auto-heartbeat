@@ -7,7 +7,7 @@
 # keeps two OPERATIONAL concerns, both under ~/.claude-control/workers/<name>/state/:
 #
 #   1) Controlled compaction: estimate context size from the transcript's latest
-#      model-request usage; past CLAUDE_AUTO_COMPACT_THRESHOLD (default 700000)
+#      model-request usage; past CLAUDE_AUTO_COMPACT_THRESHOLD (default 900000)
 #      drop a `compact_requested` flag that claude-auto-run honors by injecting a
 #      typed /compact. (Unchanged behavior; the flag path is stable.)
 #   2) Ops observability: last_seen.json / last_step.json / context.json so
@@ -29,10 +29,10 @@ name="${1:-unknown}"
 [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || name="unknown"
 
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
-THRESHOLD="${CLAUDE_AUTO_COMPACT_THRESHOLD:-700000}"
+THRESHOLD="${CLAUDE_AUTO_COMPACT_THRESHOLD:-900000}"
 # Validate once: a non-numeric env would break the `-gt` test AND the --argjson
 # write below, silently disabling both compaction and context.json.
-case "$THRESHOLD" in ''|*[!0-9]*) THRESHOLD=700000 ;; esac
+case "$THRESHOLD" in ''|*[!0-9]*) THRESHOLD=900000 ;; esac
 STATE_DIR="$CONTROL_DIR/workers/$name/state"
 
 command -v jq >/dev/null 2>&1 || exit 0
