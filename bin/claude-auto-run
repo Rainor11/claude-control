@@ -281,11 +281,59 @@ maybe_compact() {
   fi
 }
 
+# Liveness watchdog (Phase 1: ALERT-ONLY, no auto-recovery). An unattended worker can
+# WEDGE on a blocking interactive TUI prompt nobody will answer — a first-run upsell
+# (the "fullscreen renderer" modal), a folder-trust / "new MCP server" dialog from a
+# future Claude Code update, or an `ask`-rule permission prompt. While wedged the main
+# loop is frozen: it stops processing event-bridge wakeups. `tui:"default"` kills the one
+# known upsell, but this catches the GENERAL class. We only ALERT the operator (never
+# auto-dismiss — sending a key could wrongly answer a real prompt; Codex). Detection:
+# a CHOICE/confirm dialog (not a running turn) whose pane region stays UNCHANGED for
+# >= CLAUDE_AUTO_WEDGE_MINUTES (a real prompt during work clears fast; a wedge persists).
+# One alert per episode (dedup by signature); cleared the moment the dialog goes away.
+WEDGE_FLAG="$home/state/.wedge"
+WEDGE_MIN="${CLAUDE_AUTO_WEDGE_MINUTES:-15}"
+[[ "$WEDGE_MIN" =~ ^[0-9]+$ ]] || WEDGE_MIN=15   # sanitize env override
+maybe_alert_wedged() {
+  local pane tail sig now osig first alerted
+  pane="$(tmux capture-pane -pt "$sess" 2>/dev/null)" || return 0
+  # A running turn ('esc to interrupt') is progress, NOT a wedge → reset and bail.
+  if printf '%s' "$pane" | grep -qiE 'esc to interrupt'; then rm -f "$WEDGE_FLAG" 2>/dev/null; return 0; fi
+  # Look ONLY at the active bottom region — a blocking dialog always lives at the input
+  # line; matching the whole pane would false-trigger on prompt-like TEXT scrolled up in
+  # history (tool output / event payloads). Patterns aligned with worker_busy + session-inject.
+  tail="$(printf '%s' "$pane" | grep -vE '^[[:space:]]*$' | tail -8)"
+  if ! printf '%s' "$tail" | grep -qiE 'Do you want to|Would you like|Enter to confirm|permission to use|Allow .* to (run|use|edit|create|read)|Allow this|❯ ?[0-9]+\.|[0-9]+\. (Yes|No|Allow|Deny)|Continue\?|new MCP server|trust .*(folder|directory)|resume .*(summary|session)'; then
+    rm -f "$WEDGE_FLAG" 2>/dev/null; return 0   # no dialog in the tail → worker progressed → reset
+  fi
+  # Signature of the dialog tail. Stable while wedged; a live turn's spinner/clock would
+  # change it (and 'esc to interrupt' is excluded above anyway).
+  sig="$(printf '%s' "$tail" | sha1sum 2>/dev/null | cut -c1-12)"
+  now="$(date +%s)"
+  if [ -f "$WEDGE_FLAG" ]; then
+    read -r osig first alerted < "$WEDGE_FLAG" 2>/dev/null || { osig=""; first="$now"; alerted=0; }
+    [[ "$first" =~ ^[0-9]+$ ]] || first="$now"     # decimal-only (avoid octal/arith crash)
+    [[ "$alerted" =~ ^[01]$ ]] || alerted=0
+    if [ "$osig" != "$sig" ]; then printf '%s %s 0\n' "$sig" "$now" > "$WEDGE_FLAG"; return 0; fi
+  else
+    printf '%s %s 0\n' "$sig" "$now" > "$WEDGE_FLAG"; return 0
+  fi
+  [ "$alerted" = "1" ] && return 0                              # already alerted this episode
+  [ $(( (now - 10#$first) / 60 )) -ge "$WEDGE_MIN" ] || return 0 # not stable long enough yet
+  local mins=$(( (now - 10#$first) / 60 )) excerpt
+  excerpt="$(printf '%s' "$tail" | tail -6 | tr -d '\000-\010\013\014\016-\037' | cut -c1-200)"
+  say "WEDGE: stuck on an interactive prompt for >=${WEDGE_MIN}m — alerting operator"
+  notify_operator "⚠️ Воркер «$name» завис на интерактивном промпте уже ~${mins} мин — не обрабатывает события. Открой 'tmux attach -t claude-$name' и реши, или перезапусти ('claude-auto restart $name'). Низ экрана:
+$excerpt"
+  printf '%s %s 1\n' "$sig" "$first" > "$WEDGE_FLAG"
+}
+
 # Block until the session ends. This keeps the systemd unit's main process alive
 # for the worker's lifetime; when claude exits/crashes the loop returns, the unit
 # exits, and Restart=always brings it back (resuming the pinned session).
 while tmux has-session -t "$sess" 2>/dev/null; do
   flip_seeded_if_ready
+  maybe_alert_wedged
   maybe_compact
   sleep 5
 done
