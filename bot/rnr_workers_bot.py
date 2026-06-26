@@ -58,6 +58,7 @@ BTN_OVERVIEW = "📊 Сводка"
 BTN_PROBES = "📡 Датчики"          # legacy (folded into the worker card; handler kept)
 BTN_ATTACH = "🔗 Терминал"         # legacy (folded into the worker card; handler kept)
 BTN_WHITELIST = "🤖 Воркеры"
+BTN_CMDS = "📟 Команды"
 TG_LIMIT = 3900  # safe chunk size under Telegram's 4096
 
 sys.path.insert(0, HERE)
@@ -461,6 +462,7 @@ def make_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_OVERVIEW), KeyboardButton(text=BTN_WHITELIST)],
+            [KeyboardButton(text=BTN_CMDS)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -483,6 +485,53 @@ def render_attach():
     return "\n".join(lines)
 
 
+def render_commands():
+    """Шпаргалка терминальных команд управления воркерами. Каждая команда — в
+    <code>, чтобы тапом скопировать в Telegram. Запускать в терминале на ai-dev-1;
+    <имя> заменить на имя воркера (см. кнопку 🤖 Воркеры)."""
+    L = [
+        "📟 <b>Команды управления воркерами</b>",
+        "<i>терминал на ai-dev-1 · тапни команду — скопируется · «&lt;имя&gt;» замени на имя воркера</i>",
+        "",
+        "<b>📋 Обзор</b>",
+        "<code>claude-auto list</code>",
+        "— список воркеров и статус юнита",
+        "<code>claude-auto overview</code>",
+        "— все разом: статус, бюджет контекста, датчики",
+        "<code>claude-auto status &lt;имя&gt;</code>",
+        "— детали одного: spec, юнит, tmux, свежесть памяти",
+        "",
+        "<b>🔄 Жизненный цикл</b>",
+        "<code>claude-auto stop &lt;имя&gt;</code>",
+        "— усыпить (файлы целы, потом можно разбудить)",
+        "<code>claude-auto start &lt;имя&gt;</code>",
+        "— разбудить",
+        "<code>claude-auto restart &lt;имя&gt;</code>",
+        "— перезапуск, чтобы применить изменения конфига",
+        "<code>claude-auto remove &lt;имя&gt;</code>",
+        "— удалить совсем (сносит папку воркера; необратимо)",
+        "",
+        "<b>📡 Датчики</b>",
+        "<code>claude-auto get-probes &lt;имя&gt;</code>",
+        "— показать датчики воркера",
+        "<code>claude-auto set-probe-limit &lt;имя&gt; &lt;N&gt;</code>",
+        "— потолок самообслуживания датчиков",
+        "",
+        "<b>🔗 Подключиться к сессии</b>",
+        "<code>tmux -L claude-&lt;имя&gt; attach -t claude-&lt;имя&gt;</code>",
+        "— открыть TUI воркера (выход: Ctrl-b, затем d)",
+        "",
+        "<b>⚙️ Обслуживание</b>",
+        "<code>claude-auto upgrade &lt;имя&gt;</code>",
+        "— подтянуть рамки/awareness до текущего шаблона",
+        "<code>claude-auto install-units</code>",
+        "— перерендерить systemd-юниты (после правок в репо)",
+        "",
+        "<i>Создать воркера — командой /go-autonomous из живой Claude-сессии, не отсюда.</i>",
+    ]
+    return "\n".join(L)
+
+
 async def cmd_start(message: Message):
     if not authed_user_chat(message.from_user.id, message.chat.id):
         return
@@ -493,8 +542,9 @@ async def cmd_start(message: Message):
         "или <b>ответь реплаем</b>, и ответ уйдёт ему в сессию.\n"
         "• Воркер может запросить одобрение (whitelist / разовая отправка) — "
         "придёт карточка с ✅/❌.\n"
-        "• Кнопки внизу: <b>📊 Сводка</b> (флот одним взглядом) и "
-        "<b>🤖 Воркеры</b> (карточка по каждому: статус, контекст, датчики, доступы, терминал).",
+        "• Кнопки внизу: <b>📊 Сводка</b> (флот одним взглядом), "
+        "<b>🤖 Воркеры</b> (карточка по каждому: статус, контекст, датчики, доступы, терминал) и "
+        "<b>📟 Команды</b> (шпаргалка терминальных команд — тапни, чтобы скопировать).",
         parse_mode="HTML",
         reply_markup=make_keyboard(),
     )
@@ -532,6 +582,16 @@ async def cmd_attach_text(message: Message):
         await message.answer(text, parse_mode="HTML", reply_markup=make_keyboard())
     except Exception as e:  # noqa: BLE001
         log.warning("attach send failed: %s", e)
+
+
+async def cmd_commands_text(message: Message):
+    if not authed_user_chat(message.from_user.id, message.chat.id):
+        return
+    text = await asyncio.to_thread(render_commands)
+    try:
+        await message.answer(text, parse_mode="HTML", reply_markup=make_keyboard())
+    except Exception as e:  # noqa: BLE001
+        log.warning("commands send failed: %s", e)
 
 
 async def cb_ask(cb: CallbackQuery):
@@ -1713,6 +1773,7 @@ def build_dispatcher():
     dp.message.register(cmd_probes_text, F.text == BTN_PROBES)
     dp.message.register(cmd_attach_text, F.text == BTN_ATTACH)
     dp.message.register(cmd_whitelist_text, F.text == BTN_WHITELIST)
+    dp.message.register(cmd_commands_text, F.text == BTN_CMDS)
     dp.message.register(cmd_allow, Command("allow"))
     dp.callback_query.register(cb_ask, F.data.startswith("ask:"))
     dp.callback_query.register(cb_approval, F.data.startswith("appr:"))
