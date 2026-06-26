@@ -74,10 +74,16 @@ independently; two live copies over the same files just cause confusion.
 
 Reconnect anytime:
 ```
-tmux attach -t claude-<name>        # from a terminal / ssh / phone
-claude-auto status <name>           # spec + unit + tmux state
-claude-auto list                    # all workers
+tmux -L claude-<name> attach -t claude-<name>   # from a terminal / ssh / phone
+claude-auto status <name>                       # spec + unit + tmux state
+claude-auto list                                # all workers
 ```
+
+> **Per-worker tmux socket.** Each worker runs on its OWN tmux server, addressed by
+> `-L claude-<name>` (socket name == session name). That server lives inside the
+> worker's own systemd cgroup, so stopping/restarting/removing one worker reaps only
+> that worker — no shared-server cascade. This is why `attach` needs the `-L` flag;
+> a plain `tmux attach -t claude-<name>` (default socket) will not find the session.
 
 ### See the worker in the Claude app (optional, per-worker)
 
@@ -227,7 +233,7 @@ compaction.
 
 When an `ask`/out-of-allowlist action fires, the worker **blocks** at the prompt
 and `claude-auto-notify` pings you on Telegram (`🤖 autoworker <name> needs you …`,
-throttled). You then `tmux attach -t claude-<name>` and answer. (A per-worker
+throttled). You then `tmux -L claude-<name> attach -t claude-<name>` and answer. (A per-worker
 inline yes/no relay is not used by default: Telegram allows one getUpdates
 consumer per bot token, so co-loading the shared telegram channel in every worker
 would 409-conflict. For a single worker you can opt into the channel-mode relay.)

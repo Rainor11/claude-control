@@ -84,7 +84,7 @@ botflag=(); rnr_ok=0
 route=0; qid=""
 wname="$(resolve_name 2>/dev/null || true)"
 if [ "$rnr_ok" = 1 ] && [[ "$wname" =~ ^[a-zA-Z0-9_-]+$ ]] \
-   && command -v tmux >/dev/null 2>&1 && tmux has-session -t "claude-$wname" 2>/dev/null \
+   && command -v tmux >/dev/null 2>&1 && tmux -L "claude-$wname" has-session -t "claude-$wname" 2>/dev/null \
    && [ -f "$DB" ] && command -v python3 >/dev/null 2>&1; then
   qid="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
   if [ -n "$qid" ] && python3 "$DB" insert-ask --qid "$qid" --kind notify --worker "$wname" \

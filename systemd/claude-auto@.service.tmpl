@@ -9,6 +9,15 @@ Restart=always
 # Minimum delay between relaunches so a worker that dies on startup (auth
 # refresh, bad config) doesn't tight-loop.
 RestartSec=30
+# Reap the WHOLE cgroup on stop. This is the systemd default, but we set it EXPLICITLY
+# because it is now both safe and desirable: each worker runs its OWN tmux server on a
+# dedicated `-L claude-%i` socket (see bin/claude-auto-run), so that server — and the
+# claude/event-bridge processes under it — live in THIS unit's cgroup. control-group then
+# reaps exactly this worker on stop/restart, nothing else. (Before per-worker sockets all
+# workers shared the default-socket server, which lived in whichever worker started it
+# first; stopping THAT worker control-group-killed the shared server → the whole fleet's
+# sessions died → mass restart cascade. Per-socket isolation makes that impossible.)
+KillMode=control-group
 # claude (auth, --resume) and bun (event-bridge channel) must be on PATH.
 Environment=PATH=__BIN_DIR__:%h/.local/bin:%h/.bun/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__

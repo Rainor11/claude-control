@@ -75,7 +75,7 @@ stamp="$statedir/.last_notify"
 
 ⏳ ${human}
 
-👉 Открыть: tmux attach -t claude-$name
+👉 Открыть: tmux -L claude-$name attach -t claude-$name
    (выйти из окна: Ctrl-b, затем d)" >/dev/null 2>&1 || true
 } 2>/dev/null
 exit 0

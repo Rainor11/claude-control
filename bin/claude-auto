@@ -523,7 +523,7 @@ worker '$name' adopted and started.
 NEXT: close the ORIGIN session/window now. Its conversation has been forked into
 the worker (new id), so leaving the origin open does not corrupt the worker, but
 two copies acting on the same files is confusing. Reconnect anytime with:
-  tmux attach -t claude-$name
+  tmux -L claude-$name attach -t claude-$name
 EOF
 }
 
@@ -563,8 +563,10 @@ spec_rmw() {
 # dialog). Not running ⇒ not busy. Capture failure ⇒ assume busy (safer).
 worker_busy() {
   local sess="claude-$1" pane tailn
-  tmux has-session -t "$sess" 2>/dev/null || return 1
-  pane="$(tmux capture-pane -pt "$sess" 2>/dev/null)" || return 0   # capture failed ⇒ assume busy (safer)
+  # Per-worker tmux socket (-L "$sess"): each worker's session is on its own dedicated
+  # socket (named after the session) — see claude-auto-run. Address it with -L everywhere.
+  tmux -L "$sess" has-session -t "$sess" 2>/dev/null || return 1
+  pane="$(tmux -L "$sess" capture-pane -pt "$sess" 2>/dev/null)" || return 0   # capture failed ⇒ assume busy (safer)
   # Turn running, an approval/elicitation dialog, or a startup modal anywhere on screen.
   printf '%s' "$pane" | grep -qiE 'esc to interrupt|Do you want to|Allow .* to (run|use|edit|create|read)|trust (this )?(folder|directory)|new MCP server|resume .*session|Continue\?' && return 0
   # Unsent operator input: a live prompt line "❯ <text>" near the bottom (check only the
@@ -664,7 +666,7 @@ cmd_status() {
   worker_exists "$name" || die "no worker '$name'"
   echo "=== spec ==="; jq . "$WORKERS_DIR/$name/spec.json"
   echo "=== unit ==="; systemctl --user --no-pager status "claude-auto@$name.service" 2>&1 | head -12
-  echo "=== tmux ==="; tmux has-session -t "claude-$name" 2>/dev/null && echo "tmux session claude-$name: UP" || echo "tmux session claude-$name: down"
+  echo "=== tmux ==="; tmux -L "claude-$name" has-session -t "claude-$name" 2>/dev/null && echo "tmux session claude-$name: UP" || echo "tmux session claude-$name: down"
   echo "=== memory ==="; status_memory "$name"
 }
 
@@ -672,7 +674,7 @@ cmd_stop() {
   local name="${1:?usage: stop <name>}"
   worker_exists "$name" || die "no worker '$name'"
   systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
-  tmux kill-session -t "claude-$name" 2>/dev/null || true
+  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
   reg_update '.workers[$n].state="stopped"' --arg n "$name"
   echo "worker '$name' stopped + disabled (files kept; 'start' to resume, 'remove' to delete)"
 }
@@ -689,7 +691,7 @@ cmd_remove() {
   local name="${1:?usage: remove <name>}"
   worker_exists "$name" || die "no worker '$name'"
   systemctl --user disable --now "claude-auto@$name.service" 2>/dev/null || true
-  tmux kill-session -t "claude-$name" 2>/dev/null || true
+  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
   reg_update 'del(.workers[$n])' --arg n "$name"
   rm -rf "${WORKERS_DIR:?}/$name"
   echo "worker '$name' removed"
@@ -1201,7 +1203,7 @@ cmd_upgrade() {
     return 1
   fi
   rm -f "$pending" 2>/dev/null || true   # restart completed → clear the pending marker
-  echo "upgrade: '$name' done (auto mode + refreshed bounds/awareness). reconnect: tmux attach -t claude-$name"
+  echo "upgrade: '$name' done (auto mode + refreshed bounds/awareness). reconnect: tmux -L claude-$name attach -t claude-$name"
 }
 
 usage() {

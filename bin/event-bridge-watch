@@ -29,6 +29,9 @@ config="$home/event-bridge.config.json"
 statedir="$home/state"
 log="$home/logs/event-bridge.log"
 sess="claude-$name"
+# Per-worker tmux socket (-L "$sess"): the worker's session lives on its own dedicated
+# socket (named after the session), so we must address it with -L. session-inject is
+# invoked with "$sess" as its target and derives the same socket itself. (See claude-auto-run.)
 BASE_TICK="${EVENT_BRIDGE_TICK:-5}"
 
 command -v jq >/dev/null 2>&1 || { echo "event-bridge-watch: jq required" >&2; exit 2; }
@@ -75,7 +78,7 @@ ${line}"
 
 # main loop: honor each probe's interval via a per-probe lastrun stamp
 declare -A LASTRUN=()
-while tmux has-session -t "$sess" 2>/dev/null; do
+while tmux -L "$sess" has-session -t "$sess" 2>/dev/null; do
   now="$(date +%s)"
   # iterate probes from config (compact JSON per line)
   while IFS= read -r probe; do

@@ -84,6 +84,10 @@ STATE_DIR="$HOME_DIR/state"
 
 # Cross-check against the tmux session name when reachable (defense in depth; the
 # worker is also denied `tmux`). Mismatch ⇒ refuse. Unreachable ⇒ rely on /proc.
+# INTENTIONALLY socket-less (no `-L`): with per-worker sockets each pane's $TMUX points
+# to its own server, so a `-L`-free `tmux display-message` reads the ACTUAL session this
+# process runs in. Forcing `-L "claude-$NAME"` would address the socket derived from the
+# (possibly spoofed) resolved $NAME and defeat this anti-spoof cross-check.
 _sess="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
 if [ -n "$_sess" ] && [ "$_sess" != "claude-$NAME" ]; then
   die "tmux session '$_sess' != expected 'claude-$NAME' — refusing (identity mismatch)"

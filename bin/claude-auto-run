@@ -79,6 +79,12 @@ flip_seeded_if_ready() {
 mkdir -p "$home/logs" "$home/state"
 log="$home/logs/worker.log"
 sess="claude-$name"
+# Per-worker tmux socket (-L "$sess"): each worker runs its OWN tmux server, keyed by
+# its session name, so that server lives in THIS unit's cgroup. Stopping/restarting one
+# worker (KillMode=control-group) then reaps only its own socket — never a server shared
+# with other workers. (Before this, all workers shared the default socket; its server
+# lived in whichever worker started it first, so stopping THAT worker killed the whole
+# fleet. See systemd/claude-auto@.service.tmpl.) Socket name == session name everywhere.
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "$(ts) claude-auto-run[$name]: $*" | tee -a "$log" >&2; }
@@ -122,7 +128,7 @@ if [ -f "$trust_cfg" ] && command -v jq >/dev/null 2>&1; then
 fi
 
 # Already running? Then just attach our lifetime to it (don't double-launch).
-if tmux has-session -t "$sess" 2>/dev/null; then
+if tmux -L "$sess" has-session -t "$sess" 2>/dev/null; then
   say "tmux session $sess already running — supervising existing"
 else
   # Build claude argv.
@@ -228,7 +234,21 @@ else
   # to answer it and would WEDGE on every restart/reboot once its session grows.
   # Push both thresholds out of reach so the worker always resumes FULL (no context
   # loss) non-interactively; unbounded growth is handled by controlled compaction.
-  tmux new-session -d -s "$sess" -c "$cwd" \
+  #
+  # One-time migration safety: reap a stale OWN orphan on the DEFAULT socket before launching
+  # on our per-worker socket. Matters only during the switch to per-worker sockets: if this
+  # unit restarts (e.g. a supervisor crash) while an OLD default-socket session is still
+  # alive, a second `claude --resume <same id>` would double-write the transcript. We reap it
+  # first to prevent that. (TMUX= forces the default socket regardless of any inherited $TMUX.)
+  # Guard by the CLAUDE_AUTO_NAME marker the session was launched with (-e, below) so we kill
+  # ONLY our own worker orphan — never an unrelated default-socket session that merely shares
+  # the name, e.g. a claude-rc project session (also named claude-<x>; it sets CCR_*, never
+  # CLAUDE_AUTO_NAME). A harmless no-op once no worker uses the default socket.
+  if [ "$(TMUX= tmux show-environment -t "$sess" CLAUDE_AUTO_NAME 2>/dev/null)" = "CLAUDE_AUTO_NAME=$name" ]; then
+    TMUX= tmux kill-session -t "$sess" 2>/dev/null || true
+    say "reaped stale default-socket orphan $sess (pre-per-socket migration)"
+  fi
+  tmux -L "$sess" new-session -d -s "$sess" -c "$cwd" \
     -e "EVENT_BRIDGE_CONFIG=$home/event-bridge.config.json" \
     -e "EVENT_BRIDGE_STATE_DIR=$home/state" \
     -e "CLAUDE_AUTO_NAME=$name" \
@@ -296,7 +316,7 @@ WEDGE_MIN="${CLAUDE_AUTO_WEDGE_MINUTES:-15}"
 [[ "$WEDGE_MIN" =~ ^[0-9]+$ ]] || WEDGE_MIN=15   # sanitize env override
 maybe_alert_wedged() {
   local pane tail sig now osig first alerted
-  pane="$(tmux capture-pane -pt "$sess" 2>/dev/null)" || return 0
+  pane="$(tmux -L "$sess" capture-pane -pt "$sess" 2>/dev/null)" || return 0
   # A running turn ('esc to interrupt') is progress, NOT a wedge → reset and bail.
   if printf '%s' "$pane" | grep -qiE 'esc to interrupt'; then rm -f "$WEDGE_FLAG" 2>/dev/null; return 0; fi
   # Look ONLY at the active bottom region — a blocking dialog always lives at the input
@@ -323,7 +343,7 @@ maybe_alert_wedged() {
   local mins=$(( (now - 10#$first) / 60 )) excerpt
   excerpt="$(printf '%s' "$tail" | tail -6 | tr -d '\000-\010\013\014\016-\037' | cut -c1-200)"
   say "WEDGE: stuck on an interactive prompt for >=${WEDGE_MIN}m — alerting operator"
-  notify_operator "⚠️ Воркер «$name» завис на интерактивном промпте уже ~${mins} мин — не обрабатывает события. Открой 'tmux attach -t claude-$name' и реши, или перезапусти ('claude-auto restart $name'). Низ экрана:
+  notify_operator "⚠️ Воркер «$name» завис на интерактивном промпте уже ~${mins} мин — не обрабатывает события. Открой 'tmux -L claude-$name attach -t claude-$name' и реши, или перезапусти ('claude-auto restart $name'). Низ экрана:
 $excerpt"
   printf '%s %s 1\n' "$sig" "$first" > "$WEDGE_FLAG"
 }
@@ -331,7 +351,7 @@ $excerpt"
 # Block until the session ends. This keeps the systemd unit's main process alive
 # for the worker's lifetime; when claude exits/crashes the loop returns, the unit
 # exits, and Restart=always brings it back (resuming the pinned session).
-while tmux has-session -t "$sess" 2>/dev/null; do
+while tmux -L "$sess" has-session -t "$sess" 2>/dev/null; do
   flip_seeded_if_ready
   maybe_alert_wedged
   maybe_compact

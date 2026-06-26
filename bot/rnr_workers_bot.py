@@ -478,7 +478,7 @@ def render_attach():
     lines = ["🔗 <b>Подключиться к сессии</b> (терминал на ai-dev-1) — тапни команду, чтобы скопировать:", ""]
     for n in names:
         lines.append(f"<b>{esc(n)}</b>")
-        lines.append(f"<code>tmux attach -t claude-{esc(n)}</code>")
+        lines.append(f"<code>tmux -L claude-{esc(n)} attach -t claude-{esc(n)}</code>")
     lines += ["", "<i>выйти из сессии: Ctrl-b, затем d</i>"]
     return "\n".join(lines)
 
@@ -1395,7 +1395,7 @@ def wl_worker_view(worker):
     lines.append("🧩 <b>MCP</b>: " + ("наследует все" if mcp_sum == "все"
                  else "подписка повреждена ⚠️" if mcp_sum == "⚠"
                  else f"подписка на {mcp_sum} серв."))
-    lines.append(f"\n🔗 <code>tmux attach -t claude-{esc(worker)}</code>")
+    lines.append(f"\n🔗 <code>tmux -L claude-{esc(worker)} attach -t claude-{esc(worker)}</code>")
 
     rows = []
     for i, (kind, val) in enumerate(entries):
@@ -1688,7 +1688,7 @@ async def deliver(bot: Bot, row):
         rnr_db.mark_failed(qid)
         await alert_operator(
             bot, f"❌ Не доставил ответ воркеру «{worker}» (#{qid}) за {attempts} попыток. "
-                 f"Загляни в сессию вручную: tmux attach -t {target}")
+                 f"Загляни в сессию вручную: tmux -L {target} attach -t {target}")
 
 
 async def delivery_loop(bot: Bot):
