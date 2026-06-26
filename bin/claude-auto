@@ -468,6 +468,11 @@ cmd_adopt() {
   # modal (which blocks the main loop + Remote Control registration on every
   # start/reboot — nobody is there to press Enter). Server-enable is NOT tool-allow:
   # MCP tool calls are still gated by permissions.allow/ask/deny below.
+  # tui:"default": pin the classic inline renderer so the one-time "Try the new
+  # fullscreen renderer?" upsell NEVER shows — that modal is interactive and WEDGES an
+  # unattended worker (the show-predicate exits early when settings.tui is defined).
+  # "default" (not "fullscreen") keeps the inline renderer that tmux send-keys /
+  # session-inject / capture-pane (worker_busy) rely on — no alt-screen surprises.
   jq -n \
     --argjson allow "$allow_json" --argjson ask "$ask_json" --argjson deny "$deny_json" \
     --arg identity "$BIN_DIR/claude-auto-identity $name" \
@@ -477,6 +482,7 @@ cmd_adopt() {
     --arg gledger "$BIN_DIR/claude-auto-gmail-self-ledger $home/state" \
     --arg pgate "$BIN_DIR/claude-auto-people-gate $name" \
     '{enableAllProjectMcpServers: true,
+      tui: "default",
       permissions:{allow:$allow, ask:$ask, deny:$deny},
       hooks:{
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
@@ -1008,6 +1014,7 @@ cmd_upgrade() {
   jq --arg idcmd "$idcmd" --arg ledgercmd "$ledgercmd" --arg gledgercmd "$gledgercmd" --arg pgatecmd "$pgatecmd" \
      --arg repo "${REPO_DIR#/}" --arg bin "$BIN_DIR" --arg whome "${home#/}" --arg cdir "${CONTROL_DIR#/}" '
     .enableAllProjectMcpServers = true
+    | .tui = (.tui // "default")
     | .hooks = (.hooks // {})
     | (if ([.hooks.SessionStart[]?.hooks[]?.command // empty | select(test("claude-auto-identity"))] | length) > 0
         then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [{hooks:[{type:"command", command:$idcmd}]}]) end)
