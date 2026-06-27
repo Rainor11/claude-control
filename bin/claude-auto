@@ -802,12 +802,58 @@ cmd_set_probes() {
   ( umask 077; printf '%s\n' "$normalized" > "$t" ) || { rm -f "$t"; die "set-probes: write failed"; }
   jq -e . "$t" >/dev/null 2>&1 || { rm -f "$t"; die "set-probes: normalized config invalid"; }
   chmod 600 "$t" 2>/dev/null || true
+  # Capture the OUTGOING probe set (before the swap) so the cleanup block at the end
+  # of this function can drop state for any probe this change removes.
+  local _old_json; _old_json="$(cat "$cfg" 2>/dev/null)"; [ -n "$_old_json" ] || _old_json='{"probes":[]}'
   mv "$t" "$cfg" || { rm -f "$t"; die "set-probes: mv failed"; }
 
   local count; count="$(jq '.probes | length' "$cfg")"
   echo "set-probes: '$name' now has $count probe(s); event-bridge-watch reloads within ~5s (no restart)."
   systemctl --user is-active --quiet "claude-auto@$name.service" \
     || echo "  note: worker is not running — the new config applies on next start."
+
+  # --- B: clean state for probes removed by THIS change (after the atomic mv, under
+  # the RMW lock). A removed probe used to orphan its `.seen`/baseline; a stale
+  # write-once asana baseline then made a later re-add re-fire old comments. Drop the
+  # removed probe's per-name state, and its asana baseline ONLY when no surviving probe
+  # shares the same task[-author] key. Durable `.deadletter-*` evidence is KEPT.
+  # Best-effort: must never fail an already-applied set-probes (no `set -e` here).
+  local _eb_keyjq='
+    (.cmd // []) as $c
+    | if (($c|length)>0) and (($c[0]|split("/")|map(select(length>0))|last)=="asana-comments")
+      then (reduce range(1; ($c|length)) as $i
+              ({t:"",a:"",pos:""};
+               (($c[$i] // "") | if type=="string" then . else tostring end) as $x
+               | if   $x=="--task"   then .t=(($c[$i+1]//"")|tostring)
+                 elif $x=="--author" then .a=(($c[$i+1]//"")|tostring)
+                 elif ($x|startswith("--")) then .
+                 elif (.t=="" and .pos=="") then .pos=$x
+                 else . end))
+           | (if .t=="" then .pos else .t end) as $task
+           | "asana\t\($task)\t\(.a)"
+      else "other" end'
+  local _old_names="" _new_names="" _surv_keys="" _old_meta="" _nm=""
+  _old_names="$(printf '%s' "$_old_json" | jq -r '.probes[]?.name // empty' 2>/dev/null || true)"
+  _new_names="$(jq -r '.probes[]?.name // empty' "$cfg" 2>/dev/null || true)"
+  _old_meta="$(printf '%s' "$_old_json" | jq -r "[.probes[]? | {name, k:($_eb_keyjq)}] | .[] | \"\(.name)\t\(.k)\"" 2>/dev/null || true)"
+  _surv_keys="$(jq -r "[.probes[]? | ($_eb_keyjq)] | .[]" "$cfg" 2>/dev/null | awk -F'\t' '$1=="asana"{k=$2; if($3!="")k=$2"-"$3; print k}' || true)"
+  while IFS= read -r _nm; do
+    [ -n "$_nm" ] || continue
+    printf '%s\n' "$_new_names" | grep -qxF -- "$_nm" && continue   # still present -> keep
+    local _id; _id="$(printf '%s' "$_nm" | tr -c 'A-Za-z0-9_-' '_')"
+    rm -f "$statedir/$_id.seen" "$statedir/.lastrun-$_id" "$statedir/$_id.dead" 2>/dev/null || true
+    local _line _kind _task _author _key
+    _line="$(printf '%s\n' "$_old_meta" | awk -F'\t' -v n="$_nm" '$1==n{print; exit}')"
+    _kind="$(printf '%s' "$_line" | awk -F'\t' '{print $2}')"
+    if [ "$_kind" = "asana" ]; then
+      _task="$(printf '%s' "$_line" | awk -F'\t' '{print $3}')"
+      _author="$(printf '%s' "$_line" | awk -F'\t' '{print $4}')"
+      if [[ "$_task" =~ ^[0-9]+$ ]] && { [ -z "$_author" ] || [[ "$_author" =~ ^[0-9]+$ ]]; }; then
+        _key="$_task"; [ -n "$_author" ] && _key="${_task}-${_author}"
+        printf '%s\n' "$_surv_keys" | grep -qxF -- "$_key" || rm -f "$statedir/.asana-comments-$_key.baseline" 2>/dev/null || true
+      fi
+    fi
+  done <<< "$_old_names"
 }
 
 # set-probe-limit <name> <N> — set the worker's SELF-SERVICE probe ceiling (how many

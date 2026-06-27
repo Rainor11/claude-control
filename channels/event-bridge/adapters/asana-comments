@@ -95,13 +95,20 @@ fi
 # would never be re-printed and would be lost. So we re-print the (small) window
 # of post-baseline author comments each poll; the bridge dedups what it already
 # delivered. The baseline only caps how far back we ever look (set on first run).
-printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" --arg self "$self_gids" '
+# When EB_ASANA_EMIT_ID=1 (set only by a marker-aware event-bridge-watch), prepend a
+# HIDDEN stable-id marker  \x1eebid=<story_gid>\x1e  so the watcher can dedup by the
+# immutable story gid instead of the whole line (an edited comment no longer re-fires).
+# The VISIBLE part after the marker is byte-identical to the legacy line, so an old
+# (marker-unaware) watcher — which never sets the env — keeps getting the exact prior
+# output, and the watcher's legacy-hash back-compat path recognizes already-seen lines.
+printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" --arg self "$self_gids" --arg emitid "${EB_ASANA_EMIT_ID:-}" '
   ($self | split("\n") | map(select(length>0))) as $selfids
   | .data[]
   | select(.type=="comment")
   | select(.created_at > $ts)
   | select($author=="" or (.created_by.gid==$author))
   | select(((.gid // "") | tostring) as $g | ($g=="" or ($selfids | index($g) | not)))
-  | "[asana \(.created_at)] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
+  | (if $emitid=="1" then "ebid=\((.gid // "")|tostring)" else "" end)
+    + "[asana \(.created_at)] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
 '
 exit 0
