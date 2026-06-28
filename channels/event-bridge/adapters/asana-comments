@@ -58,6 +58,39 @@ printf 'header = "Authorization: Bearer %s"\n' "$ASANA_TOKEN" > "$CURL_CFG"
 
 now_ts() { date -u '+%Y-%m-%dT%H:%M:%S.000Z'; }
 
+# Anti-runaway guard (NOT a data limit): caps the pagination loop so a buggy/cyclic
+# offset from Asana can't spin forever if this adapter is ever run outside the watcher's
+# `timeout`. 1000 pages = 100k stories — unreachable in practice. The real bound is the
+# probe's `timeout` in event-bridge-watch (~30s ≈ 50 fast pages).
+SANITY_MAX_PAGES="${ASANA_COMMENTS_MAX_PAGES:-1000}"
+{ [[ "$SANITY_MAX_PAGES" =~ ^[0-9]+$ ]] && [ "$SANITY_MAX_PAGES" -ge 1 ]; } || SANITY_MAX_PAGES=1000
+
+# Fetch ALL pages of stories and emit one combined {data:[...]} on stdout.
+# Asana returns stories OLDEST-FIRST, so recent comments live on the LAST page — we
+# MUST follow next_page to the end (a single page silently loses recent comments once
+# a task accumulates >100 stories). Any page failure -> return 1 so the caller fail-opens
+# (exit 0, retry next poll) and never emits a partial view.
+fetch_all_stories() {
+  local pages="" page i=0
+  # Follow Asana's own next_page.uri (opaque, already URL-encoded) rather than
+  # hand-building &offset= — never assume the token's character set.
+  local next="https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=gid,created_at,created_by.gid,created_by.name,text,type"
+  while [ -n "$next" ]; do
+    i=$((i+1))
+    if [ "$i" -gt "$SANITY_MAX_PAGES" ]; then
+      echo "asana-comments: SANITY page guard ($SANITY_MAX_PAGES) hit for task $TASK_GID — aborting (likely API/offset bug)" >&2
+      return 1
+    fi
+    page=$(curl -fsS --max-time 30 --config "$CURL_CFG" "$next" 2>/dev/null) || return 1
+    # Require data to be a real array — a malformed {"data":null} must NOT pass as an
+    # empty page (that would silently drop this page's stories).
+    printf '%s' "$page" | jq -e '(.data | type) == "array"' >/dev/null 2>&1 || return 1
+    pages="${pages}${page}"$'\n'
+    next=$(printf '%s' "$page" | jq -r '.next_page.uri // empty' 2>/dev/null)
+  done
+  printf '%s' "$pages" | jq -s '{data: (map(.data[]?))}'
+}
+
 # First run: set baseline=now, print nothing.
 if [ ! -f "$BASELINE_FILE" ]; then
   now_ts > "$BASELINE_FILE"
@@ -66,10 +99,8 @@ fi
 BASELINE_TS=$(cat "$BASELINE_FILE" 2>/dev/null)
 [ -n "$BASELINE_TS" ] || { BASELINE_TS=$(now_ts); echo "$BASELINE_TS" > "$BASELINE_FILE"; }
 
-resp=$(curl -fsS --max-time 30 --config "$CURL_CFG" \
-  "https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=gid,created_at,created_by.gid,created_by.name,text,type" \
-  2>/dev/null) || exit 0
-printf '%s' "$resp" | jq -e 'has("data")' >/dev/null 2>&1 || exit 0
+combined=$(fetch_all_stories) || exit 0
+printf '%s' "$combined" | jq -e '(.data | type) == "array"' >/dev/null 2>&1 || exit 0
 
 # Self-echo suppression: the worker posts comments under the SAME Asana identity
 # as the human (Maxim), so we cannot filter by author. Instead, a PostToolUse hook
@@ -101,7 +132,7 @@ fi
 # The VISIBLE part after the marker is byte-identical to the legacy line, so an old
 # (marker-unaware) watcher — which never sets the env — keeps getting the exact prior
 # output, and the watcher's legacy-hash back-compat path recognizes already-seen lines.
-printf '%s' "$resp" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" --arg self "$self_gids" --arg emitid "${EB_ASANA_EMIT_ID:-}" '
+printf '%s' "$combined" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GID" --arg self "$self_gids" --arg emitid "${EB_ASANA_EMIT_ID:-}" '
   ($self | split("\n") | map(select(length>0))) as $selfids
   | .data[]
   | select(.type=="comment")
