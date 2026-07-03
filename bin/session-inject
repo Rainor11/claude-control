@@ -31,6 +31,8 @@ set -u
 TIMEOUT=90
 SETTLE_MS=600
 POLL_MS=1500
+CONFIRM_TIMEOUT="${INJECT_CONFIRM_TIMEOUT:-8}"  # seconds to watch for the turn to START after Enter
+CONFIRM_POLL_MS=150                             # sample cadence while confirming the submit
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --timeout) TIMEOUT="${2:?}"; shift 2 ;;
@@ -141,34 +143,49 @@ post_paste="$(snapshot)" || { echo "session-inject: snapshot failed after paste 
 # which would push a fixed tail window off the real hint line).
 busy_base="$(printf '%s\n' "$post_paste" | grep -cF 'esc to interrupt')"
 
-# Confirm-and-retry submit. A single Enter can be silently dropped while the TUI
-# is still rendering — most often right after a very long turn ends (observed: a
-# 32-min turn left the payload sitting un-submitted in the input box while this
-# script still reported success). Policy (Codex-reviewed):
-#   - SUCCESS: the "esc to interrupt" line-count rose vs the post-paste baseline
-#     => a new turn started => our message was submitted.
-#   - RETRY another Enter ONLY on strong negative evidence: the pane is byte-
-#     identical to the post-paste snapshot => the Enter was definitely dropped.
-#   - any other (ambiguous) change, or exhausting retries => exit non-zero so the
-#     caller retries instead of recording a false "delivered". Never mash Enter
-#     into a session that may now be busy or showing an approval/permission prompt.
+# Confirm submit by watching for the turn to actually START, not by a single early
+# snapshot. A submitted message begins a turn that shows the busy hint ("esc to
+# interrupt") for the whole API round-trip (seconds) — but that hint appears a BEAT
+# AFTER Enter (network/TUI spin-up), and a fast turn (e.g. the worker instantly
+# recognizing a duplicate #qid and doing nothing) starts and ends within ~1s. The OLD
+# code sampled once ~450ms after Enter and, if the hint was not visible YET while the
+# pane had already changed (input cleared, message moved into the transcript), declared
+# the submit "ambiguous" and exited non-zero — so a genuinely-delivered answer was
+# reported as failed and the caller re-injected it indefinitely (observed in prod: 26×
+# duplicate delivery of one answer). Policy (Codex-reviewed):
+#   - Poll for the busy hint over a bounded window (CONFIRM_TIMEOUT) instead of bailing
+#     on the first sample. A rise vs the post-paste baseline => a turn started => submitted.
+#   - RETRY another Enter ONLY on strong negative evidence: the pane is byte-identical to
+#     post_paste => the Enter was dropped (payload untouched in the input box). Bounded,
+#     so we never mash Enter into a session that just went busy or shows an approval prompt.
+#   - A pane that merely CHANGED without the hint yet is NOT a failure — keep polling
+#     (the turn may still be spinning up, or a fast turn's hint flew past between samples).
+#   - Give up (non-zero, caller retries) ONLY after the whole window elapses with no turn
+#     ever observed. Success requires actually seeing the turn begin => never a false
+#     "delivered".
 submitted=0
-for attempt in 1 2 3 4; do
-  tmux -L "$socket" send-keys -t "$pane" Enter 2>/dev/null || { echo "session-inject: send Enter failed for $target ($pane)" >&2; exit 1; }
-  ms_sleep "$(( 300 + attempt * 150 ))"
+enter_sends=0
+tmux -L "$socket" send-keys -t "$pane" Enter 2>/dev/null || { echo "session-inject: send Enter failed for $target ($pane)" >&2; exit 1; }
+enter_sends=1
+ms_sleep 350   # let the TUI repaint before the first sample (avoid a pre-redraw false 'dropped')
+confirm_deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
+while :; do
   snap="$(snapshot)" || { echo "session-inject: snapshot failed after Enter for $target ($pane)" >&2; exit 1; }
   busy_now="$(printf '%s\n' "$snap" | grep -cF 'esc to interrupt')"
   if [ "$busy_now" -gt "$busy_base" ]; then
     submitted=1; break   # a turn started — submitted
   fi
-  if [ "$snap" != "$post_paste" ]; then
-    echo "session-inject: submit state ambiguous after Enter for $target ($pane) — not retrying" >&2
-    exit 1
+  if [ "$snap" = "$post_paste" ] && [ "$enter_sends" -lt 4 ]; then
+    # Payload untouched => the Enter was dropped => re-press it (bounded).
+    tmux -L "$socket" send-keys -t "$pane" Enter 2>/dev/null || { echo "session-inject: send Enter failed for $target ($pane)" >&2; exit 1; }
+    enter_sends=$(( enter_sends + 1 ))
   fi
+  [ "$(date +%s)" -ge "$confirm_deadline" ] && break
+  ms_sleep "$CONFIRM_POLL_MS"
 done
 
 if [ "$submitted" -ne 1 ]; then
-  echo "session-inject: Enter not accepted after retries — payload still in input box for $target ($pane)" >&2
+  echo "session-inject: submit not confirmed within ${CONFIRM_TIMEOUT}s for $target ($pane) — no turn started (payload may be unsent)" >&2
   exit 1
 fi
 echo "session-inject: delivered to $target ($pane)"
