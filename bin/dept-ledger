@@ -126,14 +126,24 @@ function cmdList(args) {
   let rows = events;
   if (args.kind) rows = rows.filter((e) => e.kind === args.kind);
   for (const f of args.filter) {
-    const [k, v] = f.split('=');
+    // indexOf, не split('=') — split теряет всё после второго '=' (--filter subject=a=b терял "=b"),
+    // и --filter без значения (argv кончился) даёт f===undefined → упасть чисто, а не TypeError'ом.
+    const eq = typeof f === 'string' ? f.indexOf('=') : -1;
+    if (eq < 0) die('list: --filter требует формат k=v, получено: ' + f);
+    const k = f.slice(0, eq), v = f.slice(eq + 1);
     rows = rows.filter((e) => String(e.data[k]) === v);
   }
   if (args.status) { // effective status для message/approval/incident
     const statusKind = args.kind + '_status';
     rows = rows.filter((e) => effectiveStatus(events, e, statusKind, e.data.status || 'open') === args.status);
   }
-  if (args.limit) rows = rows.slice(-Number(args.limit));
+  if (args.limit !== undefined) {
+    // Number('0') истинно как непустая строка — старое `if (args.limit)` пропускало --limit 0
+    // (отдавало ВСЁ вместо ничего). Явная проверка целого неотрицательного числа + спецкейс n===0.
+    const n = Number(args.limit);
+    if (!Number.isInteger(n) || n < 0) die('list: --limit должен быть целым неотрицательным числом');
+    rows = n === 0 ? [] : rows.slice(-n);
+  }
   for (const e of rows) process.stdout.write(JSON.stringify(e) + '\n');
 }
 

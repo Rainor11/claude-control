@@ -13,9 +13,15 @@ const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
 const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
 const STATE_FILE = path.join(DEPT, 'watchdog-state.json');
 const BIN = __dirname;
+// Number(garbage) === NaN, и NaN "просачивался" бы во все сравнения decide() как false —
+// это ОТКЛЮЧАЕТ и fresh-check, и hung-порог разом (см. /bug-раунд), а не просто ломает дефолт.
+function numEnv(name, def) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
 const CFG = {
-  hungMin: Number(process.env.LIVENESS_HUNG_MIN || 30),
-  reincidentMin: Number(process.env.LIVENESS_REINCIDENT_MIN || 60),
+  hungMin: numEnv('LIVENESS_HUNG_MIN', 30),
+  reincidentMin: numEnv('LIVENESS_REINCIDENT_MIN', 60),
 };
 const ENFORCE = process.env.LIVENESS_ENFORCE === '1'; // без него — alert-only (обкатка)
 const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
@@ -37,7 +43,42 @@ module.exports = { decide };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
-function sh(cmd, args) { try { return execFileSync(cmd, args, { encoding: 'utf8' }); } catch { return null; } }
+
+// Best-effort лок: ручной запуск (напр. --dry-run для отладки) параллельно с таймером иначе
+// делает read-modify-write watchdog-state.json без синхронизации — кто сохранил последним,
+// тот и победил, откатывая alerted/restartedAt другого прогона (пропуск шага лестницы или
+// задержка эскалации). 15 мин "протухания" — 3x интервал таймера (5 мин), с большим запасом
+// на нормальное время выполнения (секунды), чтобы не звать stale замок за живой прогон.
+const LOCK_FILE = path.join(DEPT, 'liveness.lock');
+const LOCK_STALE_MS = 15 * 60_000;
+function acquireLock() {
+  fs.mkdirSync(DEPT, { recursive: true });
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    try {
+      if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK_FILE); return acquireLock(); }
+    } catch {}
+    return false;
+  }
+}
+if (!acquireLock()) {
+  console.log('liveness: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на watchdog-state.json');
+  return;
+}
+// 'exit' — не try/finally: тоже снимает лок при незапойманном исключении в цикле ниже,
+// не только при штатном завершении (иначе один сбой навсегда блокирует следующие прогоны
+// на 15 мин, а не только на текущий тик).
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
+
+// timeout: подвисший tmux/systemctl/dept-ledger (напр. мёртвый tmux-сервер) иначе вешает
+// execFileSync навсегда — сам watchdog зависает вместо детекта чужого зависания, и ни один
+// воркер ПОСЛЕ зависшего в цикле не проверяется, saveState() не вызывается.
+function sh(cmd, args) { try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: 10_000 }); } catch { return null; } }
 // ВАЖНО: и сокет, и сессия называются claude-<name> (см. claude-auto-run) —
 // цель capture-pane именно claude-<name>, не <name>.
 function screen(name) { return sh('tmux', ['-L', `claude-${name}`, 'capture-pane', '-p', '-t', `claude-${name}`]); }
@@ -108,4 +149,11 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     }
   }
 }
-saveState(state);
+// Воркеры, пропавшие из autonomous.json (снесены/переименованы) — их записи в state иначе
+// никогда не трогаются циклом выше и копятся в файле навечно.
+const known = new Set(Object.keys(reg.workers || reg));
+for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
+// dry-run обязан быть чисто read-only (см. docs/department.md): раньше saveState() писал
+// БЕЗУСЛОВНО, и alerted:true из превью-прогона "съедал" ступень лестницы у следующего
+// боевого прогона — watchdog прыгал сразу к restart, ни разу не послав настоящий alert.
+if (!dry) saveState(state);
