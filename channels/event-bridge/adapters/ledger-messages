@@ -1,0 +1,27 @@
+#!/bin/bash
+# ledger-messages — эмитит queued-сообщения шины отдела, адресованные воркеру.
+# Контракт адаптера event-bridge: печатает по одной ДЕТЕРМИНИРОВАННОЙ строке
+# на новое событие в stdout, exit 0. Дедуп делает bridge (хэш строки/g:-маркер).
+# Сообщение исчезает из выдачи после `dept-ledger ack <event_id>` воркером.
+set -euo pipefail
+worker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --worker) worker="$2"; shift 2 ;;
+    --state-dir) shift 2 ;;    # состояние не нужно: статус живёт в ledger
+    *) shift ;;
+  esac
+done
+[ -n "$worker" ] || { echo "usage: ledger-messages --worker <name>" >&2; exit 1; }
+DL="$(cd "$(dirname "$0")/../../../bin" && pwd)/dept-ledger"
+"$DL" list --kind message --filter "to=$worker" --status queued 2>/dev/null | while IFS= read -r line; do
+  node -e '
+    const e = JSON.parse(process.argv[1]);
+    // line-safety: любой control-символ (включая \n и \x1e) в полях → пробел
+    const clean = (s) => String(s ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+    const body = clean(e.data.body).slice(0, 300);
+    // \x1eebid=<id>\x1e — скрытый стабильный маркер дедупа event-bridge (см. Step 1)
+    console.log(`\x1eebid=${e.event_id}\x1e[dept-message type=${clean(e.data.type)} from=${clean(e.data.from)}] ${clean(e.data.subject)} :: ${body} :: подтвердить: dept-ledger ack ${e.event_id}`);
+  ' "$line"
+done
+exit 0
