@@ -1,0 +1,29 @@
+#!/bin/bash
+# dept-approve — открыть аппрув в ledger и спросить оператора через существующий
+# TG-канал (claude-auto-ask, кнопки). Ответ оператора приходит воркеру обычным
+# turn'ом; воркер обязан закрыть аппрув: dept-ledger approval-resolve <id> --status …
+set -euo pipefail
+kind_of="" summary="" detail="" actor="${CLAUDE_AUTO_NAME:-operator}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind-of) kind_of="$2"; shift 2 ;;
+    --summary) summary="$2"; shift 2 ;;
+    --detail) detail="$2"; shift 2 ;;
+    --actor) actor="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$kind_of" ] && [ -n "$summary" ] || { echo 'usage: dept-approve --kind-of <k> --summary <s> [--detail <d>]' >&2; exit 1; }
+DL="$(cd "$(dirname "$0")" && pwd)/dept-ledger"
+out="$("$DL" approval-open --kind-of "$kind_of" --summary "$summary" --actor "$actor")"
+eid="$(echo "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+q="[отдел/approve $eid] ${summary}"
+[ -n "$detail" ] && q="$q — $detail"
+q="$q (после ответа выполни: dept-ledger approval-resolve $eid --status approved|denied)"
+# КРИТИЧНО: ошибку уведомления НЕ глотать — иначе открытый аппрув повиснет,
+# а оператор о нём не узнает (это главный safety-gate отдела).
+if ! claude-auto-ask --question "$q" --options-json '["✅ Одобряю","❌ Отклоняю"]'; then
+  echo "dept-approve: НЕ удалось уведомить оператора (approval $eid остаётся open). Эскалируй другим каналом (claude-auto-tg) и повтори." >&2
+  exit 1
+fi
+echo "$out"
