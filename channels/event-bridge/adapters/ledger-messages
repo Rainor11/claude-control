@@ -3,7 +3,7 @@
 # Контракт адаптера event-bridge: печатает по одной ДЕТЕРМИНИРОВАННОЙ строке
 # на новое событие в stdout, exit 0. Дедуп делает bridge (хэш строки/g:-маркер).
 # Сообщение исчезает из выдачи после `dept-ledger ack <event_id>` воркером.
-set -euo pipefail
+set -u
 worker=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -14,7 +14,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$worker" ] || { echo "usage: ledger-messages --worker <name>" >&2; exit 1; }
 DL="$(cd "$(dirname "$0")/../../../bin" && pwd)/dept-ledger"
-"$DL" list --kind message --filter "to=$worker" --status queued 2>/dev/null | while IFS= read -r line; do
+"$DL" list --kind message --filter "to=$worker" --status queued | while IFS= read -r line; do
   node -e '
     const e = JSON.parse(process.argv[1]);
     // line-safety: любой control-символ (включая \n и \x1e) в полях → пробел
