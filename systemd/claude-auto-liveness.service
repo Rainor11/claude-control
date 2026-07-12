@@ -1,0 +1,14 @@
+[Unit]
+Description=claude-auto liveness watchdog (dept)
+
+[Service]
+Type=oneshot
+# systemd user-юниты не наследуют шелл-профиль (nvm PATH). Проверено на repo:
+# claude-auto-reconciler.service.tmpl / claude-control-watchdog.service.tmpl уже
+# решают это без nvm-специфичного пути — /usr/bin/node системный (v20.20.2,
+# apt-пакет) уже покрывается хвостом /usr/local/bin:/usr/bin:/bin, как и tmux
+# (/usr/bin/tmux). meeting-analyzer.service идёт ещё дальше и зовёт /usr/bin/node
+# напрямую в ExecStart, минуя PATH-резолюцию. Здесь — тот же хвост, что и в
+# claude-auto-reconciler.service.tmpl (bin-каталог репо первым для dept-ledger).
+Environment=PATH=/opt/projects/active/claude-control/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/projects/active/claude-control/bin/claude-auto-liveness
