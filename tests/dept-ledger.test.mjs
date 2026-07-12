@@ -84,3 +84,47 @@ test('--data null отклоняется чисто', () => {
     }
   );
 });
+
+test('send/ack/resolve — жизненный цикл сообщения', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const m = JSON.parse(run(home, ['send', '--type', 'question', '--to', 'руководитель',
+    '--subject', 'вопрос по скидке', '--body', 'можно ли 15%?', '--actor', 'mk-prodmash']));
+  let q = run(home, ['list', '--kind', 'message', '--filter', 'to=руководитель', '--status', 'queued']);
+  assert.equal(q.trim().split('\n').length, 1);
+  run(home, ['ack', m.event_id, '--actor', 'руководитель']);
+  q = run(home, ['list', '--kind', 'message', '--status', 'queued']).trim();
+  assert.equal(q, '');
+  run(home, ['resolve', m.event_id, '--status', 'handled', '--actor', 'руководитель']);
+  const h = run(home, ['list', '--kind', 'message', '--status', 'handled']).trim().split('\n');
+  assert.equal(h.length, 1);
+});
+
+test('registry set/get/list', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  run(home, ['registry-set', 'mk-prodmash', '--role', 'мк', '--client', 'продмаш']);
+  const w = JSON.parse(run(home, ['registry-get', 'mk-prodmash']));
+  assert.equal(w.role, 'мк');
+  assert.equal(w.client, 'продмаш');
+  assert.equal(w.escalates_to, 'operator'); // дефолт
+  const all = JSON.parse(run(home, ['registry-list']));
+  assert.ok(all.workers['mk-prodmash']);
+});
+
+test('incident-open создаёт инцидент и сообщение ТП из реестра', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  run(home, ['registry-set', 'dept-tp', '--role', 'тп']);
+  run(home, ['incident-open', '--about', 'mk-prodmash', '--severity', 'high',
+    '--summary', 'воркер завис', '--actor', 'watchdog']);
+  const inc = run(home, ['list', '--kind', 'incident', '--status', 'open']).trim().split('\n');
+  assert.equal(inc.length, 1);
+  const msg = run(home, ['list', '--kind', 'message', '--filter', 'to=dept-tp']).trim().split('\n');
+  assert.equal(msg.length, 1);
+  assert.equal(JSON.parse(msg[0]).data.type, 'incident');
+});
+
+test('валидация lifecycle: ack несуществующего ref и кривой approval-статус отклоняются', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  assert.throws(() => run(home, ['ack', 'evt_000_zzzz']));
+  const m = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 's']));
+  assert.throws(() => run(home, ['approval-resolve', m.event_id, '--status', 'maybe']));
+});

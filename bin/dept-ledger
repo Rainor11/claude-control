@@ -129,7 +129,76 @@ function cmdList(args) {
   for (const e of rows) process.stdout.write(JSON.stringify(e) + '\n');
 }
 
-const HANDLERS = { append: cmdAppend, list: cmdList };
+const REGISTRY = () => path.join(HOME, 'registry.json');
+function readRegistry() {
+  try { return JSON.parse(fs.readFileSync(REGISTRY(), 'utf8')); } catch { return { workers: {} }; }
+}
+function writeRegistry(reg) {
+  const tmp = REGISTRY() + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + '\n');
+  fs.renameSync(tmp, REGISTRY());
+}
+
+function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+function brief(e) { return { event_id: e.event_id, seq: e.seq }; }
+
+function cmdSend(a) {
+  const data = { type: a.type, from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
+    to: a.to, subject: a.subject, body: a.body || '', refs: (a.refs || '').split(',').filter(Boolean) };
+  out(brief(appendEvent('message', data, a.actor)));
+}
+function cmdAck(a) {
+  out(brief(appendEvent('message_status', { ref: a._[1], status: 'acked' }, a.actor)));
+}
+function cmdResolve(a) {
+  out(brief(appendEvent('message_status', { ref: a._[1], status: a.status }, a.actor)));
+}
+function cmdApprovalOpen(a) {
+  out(brief(appendEvent('approval', { kind_of: a['kind-of'],
+    from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
+    summary: a.summary, status: 'open' }, a.actor)));
+}
+function cmdApprovalResolve(a) {
+  out(brief(appendEvent('approval_status', { ref: a._[1], status: a.status }, a.actor || 'operator')));
+}
+function cmdIncidentOpen(a) {
+  const r = appendEvent('incident', { about_worker: a.about, severity: a.severity,
+    summary: a.summary, status: 'open', source: a.actor || 'operator' }, a.actor);
+  const reg = readRegistry();
+  const tp = Object.entries(reg.workers).find(([, w]) => w.role === 'тп');
+  if (tp) appendEvent('message', { type: 'incident', from: a.actor || 'operator', to: tp[0],
+    subject: `incident ${a.severity}: ${a.about}`, body: a.summary, refs: [r.event_id], status: 'queued' }, a.actor);
+  out(brief(r));
+}
+function cmdRegistrySet(a) {
+  const updated = withLock(() => {   // тот же лок — RMW реестра без гонок
+    const reg = readRegistry();
+    const name = a._[1];
+    const cur = reg.workers[name] || {};
+    reg.workers[name] = {
+      role: a.role || cur.role, client: a.client ?? cur.client ?? null,
+      escalates_to: a['escalates-to'] || cur.escalates_to || 'operator',
+      mission_version: a['mission-version'] || cur.mission_version || 'v1',
+    };
+    writeRegistry(reg);
+    return reg.workers[name];
+  });
+  appendEvent('registry_change', { worker: a._[1], ...updated }, a.actor);
+  out(updated);
+}
+function cmdRegistryGet(a) {
+  const w = readRegistry().workers[a._[1]];
+  if (!w) die('registry: не найден ' + a._[1]);
+  process.stdout.write(JSON.stringify(w) + '\n');
+}
+function cmdRegistryList() { process.stdout.write(JSON.stringify(readRegistry()) + '\n'); }
+
+const HANDLERS = {
+  append: cmdAppend, list: cmdList, send: cmdSend, ack: cmdAck, resolve: cmdResolve,
+  'approval-open': cmdApprovalOpen, 'approval-resolve': cmdApprovalResolve,
+  'incident-open': cmdIncidentOpen,
+  'registry-set': cmdRegistrySet, 'registry-get': cmdRegistryGet, 'registry-list': cmdRegistryList,
+};
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 (HANDLERS[cmd] || (() => die('usage: dept-ledger <append|list> …')))(args);
