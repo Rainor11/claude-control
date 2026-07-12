@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync, utimesSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,4 +39,48 @@ test('list фильтрует по kind и полям data', () => {
   const rows = out.trim().split('\n').map(JSON.parse);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].data.summary, 's1');
+});
+
+test('протухший лок не блокирует запись', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const lock = join(home, 'events.jsonl.lock');
+  writeFileSync(lock, '999999');
+  const past = new Date(Date.now() - 120000); // 2 минуты назад — старше порога протухания (60с)
+  utimesSync(lock, past, past);
+  const env = JSON.parse(run(home, ['append', '--kind', 'incident',
+    '--data', '{"about_worker":"x","severity":"high","summary":"stale-lock"}']));
+  assert.equal(env.seq, 1);
+});
+
+test('битая строка в журнале пропускается, seq продолжается', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  run(home, ['append', '--kind', 'incident',
+    '--data', '{"about_worker":"x","severity":"high","summary":"first"}']);
+  appendFileSync(join(home, 'events.jsonl'), '{broken\n');
+  const res = spawnSync(CLI, ['append', '--kind', 'incident',
+    '--data', '{"about_worker":"y","severity":"low","summary":"second"}'],
+    { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const env = JSON.parse(res.stdout);
+  assert.equal(env.seq, 2);
+  assert.match(res.stderr, /битая строка/);
+  const rows = run(home, ['list', '--kind', 'incident']).trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 2);
+});
+
+test('*_status с несуществующим ref отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  assert.throws(() => run(home, ['append', '--kind', 'message_status',
+    '--data', '{"ref":"evt_0_none","status":"acked"}']));
+});
+
+test('--data null отклоняется чисто', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  assert.throws(
+    () => run(home, ['append', '--kind', 'incident', '--data', 'null']),
+    (err) => {
+      assert.ok(!String(err.stderr).includes('TypeError'), `stderr: ${err.stderr}`);
+      return true;
+    }
+  );
 });
