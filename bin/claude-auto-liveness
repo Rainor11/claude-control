@@ -18,7 +18,7 @@ const CFG = {
   reincidentMin: Number(process.env.LIVENESS_REINCIDENT_MIN || 60),
 };
 const ENFORCE = process.env.LIVENESS_ENFORCE === '1'; // без него — alert-only (обкатка)
-const BUSY_RE = /esc to interrupt|ctrl\+b to run in background/i;
+const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
 const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monitor/telegram_notify.sh';
 
 // Чистая решающая функция (тестируется отдельно).
@@ -48,10 +48,15 @@ function transcriptMtime(name) {
     const f = path.join(projRoot, d, spec.session_id + '.jsonl');
     if (fs.existsSync(f)) return fs.statSync(f).mtimeMs;
   }
-  return 0;
+  return null; // транскрипт не найден — не считать древним (эпохальный tm=0 отключал бы fresh-check)
 }
 function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
-function saveState(s) { fs.mkdirSync(DEPT, { recursive: true }); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
+function saveState(s) {
+  fs.mkdirSync(DEPT, { recursive: true });
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
+}
 function notify(msg) { if (!dry) sh(NOTIFY, [msg]); else console.log('[dry] notify:', msg); }
 
 const reg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
@@ -60,8 +65,17 @@ const now = Date.now();
 for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (!meta || typeof meta !== 'object' || meta.state !== 'active') continue;
   const scr = screen(name);
-  if (scr === null) { if (dry) console.log(`[dry] ${name}: tmux недоступен (зона reconciler)`); continue; }
-  let tm = 0; try { tm = transcriptMtime(name); } catch { if (dry) console.log(`[dry] ${name}: транскрипт не найден`); continue; }
+  if (scr === null) {
+    if (dry) console.log(`[dry] ${name}: tmux недоступен (зона reconciler)`);
+    else console.log(`liveness: ${name}: tmux недоступен — зона reconciler`);
+    continue;
+  }
+  let tm;
+  try { tm = transcriptMtime(name); } catch { if (dry) console.log(`[dry] ${name}: транскрипт не найден`); continue; }
+  if (tm === null) {
+    console.log(`liveness: ${name}: транскрипт не найден — пропуск (проверь spec.json session_id)`);
+    continue;
+  }
   const cur = { ts: now, busy: BUSY_RE.test(scr), screenHash: crypto.createHash('sha1').update(scr).digest('hex'), transcriptMtime: tm };
   if (dry) console.log(`[dry] ${name}: busy=${cur.busy} hash=${cur.screenHash.slice(0, 8)} transcript_age_min=${Math.round((now - tm) / 60000)}`);
   const prev = state[name] || null;
@@ -86,7 +100,8 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
       notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
       state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
     } else {
-      notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`);
+      if (!prev.wouldIncidentNotified) notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`);
+      state[name] = { ...prev, wouldIncidentNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
     }
   }
 }
