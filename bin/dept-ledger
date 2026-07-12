@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+// dept-ledger — единственный писатель журнала цифрового отдела.
+// Append-only JSONL + lockfile; статусы меняются событиями *_status (ref=event_id).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+const HOME = process.env.DEPT_HOME || '/home/rainor/.claude-control/department';
+const LEDGER = path.join(HOME, 'events.jsonl');
+const LOCK = LEDGER + '.lock';
+const KINDS = new Set(['message', 'message_status', 'approval', 'approval_status',
+  'incident', 'incident_status', 'agent_run', 'registry_change']);
+// обязательные поля data по kind (минимальная схема фазы 1)
+const REQUIRED = {
+  message: ['type', 'from', 'to', 'subject'],
+  message_status: ['ref', 'status'],
+  approval: ['kind_of', 'from', 'summary'],
+  approval_status: ['ref', 'status'],
+  incident: ['about_worker', 'severity', 'summary'],
+  incident_status: ['ref', 'status'],
+  agent_run: ['worker', 'run_kind'],
+  registry_change: ['worker'],
+};
+const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff']); // §5 спеки; НЕ выдумывать новые
+const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
+
+function die(msg) { process.stderr.write(msg + '\n'); process.exit(1); }
+
+function parseArgs(argv) {
+  const args = { _: [] , filter: []};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--filter') args.filter.push(argv[++i]);
+    else if (a.startsWith('--')) args[a.slice(2)] = argv[++i];
+    else args._.push(a);
+  }
+  return args;
+}
+
+function withLock(fn) {
+  fs.mkdirSync(HOME, { recursive: true }); // ДО лока — иначе openSync упадёт с ENOENT на свежем DEPT_HOME
+  const deadline = Date.now() + 10000;
+  for (;;) {
+    try { const fd = fs.openSync(LOCK, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      // протухший лок (>60с — append никогда столько не живёт) снимаем
+      try { if (Date.now() - fs.statSync(LOCK).mtimeMs > 60000) fs.unlinkSync(LOCK); } catch {}
+      if (Date.now() > deadline) die('ledger: lock timeout');
+      const until = Date.now() + 50; while (Date.now() < until) {} // короткий спин
+    }
+  }
+  try { return fn(); } finally { try { fs.unlinkSync(LOCK); } catch {} }
+}
+
+function readAll() {
+  if (!fs.existsSync(LEDGER)) return [];
+  const rows = [];
+  for (const l of fs.readFileSync(LEDGER, 'utf8').split('\n')) {
+    if (!l.trim()) continue;
+    try { rows.push(JSON.parse(l)); }
+    catch { process.stderr.write('ledger: пропущена битая строка\n'); }
+  }
+  return rows;
+}
+
+function effectiveStatus(events, ev, statusKind, initial) {
+  let st = initial;
+  for (const e of events) if (e.kind === statusKind && e.data.ref === ev.event_id) st = e.data.status;
+  return st;
+}
+
+function assertRefExists(ref) {
+  if (!readAll().some((e) => e.event_id === ref)) die('ledger: ref не найден: ' + ref);
+}
+
+// Общая точка записи (и для CLI, и для внутренних вызовов сабкоманд — без подпроцессов).
+function appendEvent(kind, data, actor) {
+  if (!KINDS.has(kind)) die('append: неизвестный kind: ' + kind);
+  for (const f of REQUIRED[kind]) if (data[f] === undefined) die(`append: ${kind} требует поле data.${f}`);
+  if (kind === 'message' && !MSG_TYPES.has(data.type)) die('append: message.type ∉ ' + [...MSG_TYPES]);
+  if (kind === 'message_status') {
+    if (!MSG_STATUSES.has(data.status)) die('append: message_status.status ∉ ' + [...MSG_STATUSES]);
+    assertRefExists(data.ref);
+  }
+  if (kind === 'approval_status') {
+    if (!['approved', 'denied'].includes(data.status)) die('append: approval_status.status ∉ approved|denied');
+    assertRefExists(data.ref);
+  }
+  if (kind === 'incident_status') assertRefExists(data.ref);
+  if (kind === 'message' && data.status === undefined) data.status = 'queued';
+  return withLock(() => {
+    const events = readAll();
+    const seq = events.length ? events[events.length - 1].seq + 1 : 1;
+    const e = {
+      v: 1,
+      event_id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      seq, ts: new Date().toISOString(),
+      actor: actor || process.env.CLAUDE_AUTO_NAME || 'operator',
+      kind, data,
+    };
+    fs.appendFileSync(LEDGER, JSON.stringify(e) + '\n');
+    return e;
+  });
+}
+
+function cmdAppend(args) {
+  const kind = args.kind || die('append: --kind обязателен');
+  let data;
+  try { data = JSON.parse(args.data || ''); } catch { die('append: --data не валидный JSON'); }
+  const env = appendEvent(kind, data, args.actor);
+  process.stdout.write(JSON.stringify({ event_id: env.event_id, seq: env.seq }) + '\n');
+}
+
+function cmdList(args) {
+  const events = readAll();
+  let rows = events;
+  if (args.kind) rows = rows.filter((e) => e.kind === args.kind);
+  for (const f of args.filter) {
+    const [k, v] = f.split('=');
+    rows = rows.filter((e) => String(e.data[k]) === v);
+  }
+  if (args.status) { // effective status для message/approval/incident
+    const statusKind = args.kind + '_status';
+    rows = rows.filter((e) => effectiveStatus(events, e, statusKind, e.data.status || 'open') === args.status);
+  }
+  if (args.limit) rows = rows.slice(-Number(args.limit));
+  for (const e of rows) process.stdout.write(JSON.stringify(e) + '\n');
+}
+
+const HANDLERS = { append: cmdAppend, list: cmdList };
+const args = parseArgs(process.argv.slice(2));
+const cmd = args._[0];
+(HANDLERS[cmd] || (() => die('usage: dept-ledger <append|list> …')))(args);
