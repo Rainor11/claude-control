@@ -128,3 +128,16 @@ test('валидация lifecycle: ack несуществующего ref и к
   const m = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 's']));
   assert.throws(() => run(home, ['approval-resolve', m.event_id, '--status', 'maybe']));
 });
+
+test('registry-set без имени воркера отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  assert.throws(() => run(home, ['registry-set', '--role', 'тп']));
+});
+
+test('битый registry.json не перезаписывается', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const registryPath = join(home, 'registry.json');
+  writeFileSync(registryPath, '{oops');
+  assert.throws(() => run(home, ['registry-set', 'mk-prodmash', '--role', 'мк']));
+  assert.equal(readFileSync(registryPath, 'utf8'), '{oops');
+});

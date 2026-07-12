@@ -74,8 +74,8 @@ function assertRefExists(ref) {
   if (!readAll().some((e) => e.event_id === ref)) die('ledger: ref не найден: ' + ref);
 }
 
-// Общая точка записи (и для CLI, и для внутренних вызовов сабкоманд — без подпроцессов).
-function appendEvent(kind, data, actor) {
+// Валидация без побочных эффектов на файл (можно звать до входа в лок).
+function validateEvent(kind, data) {
   if (!KINDS.has(kind)) die('append: неизвестный kind: ' + kind);
   for (const f of REQUIRED[kind]) if (data[f] === undefined) die(`append: ${kind} требует поле data.${f}`);
   if (kind === 'message' && !MSG_TYPES.has(data.type)) die('append: message.type ∉ ' + [...MSG_TYPES]);
@@ -89,19 +89,27 @@ function appendEvent(kind, data, actor) {
   }
   if (kind === 'incident_status') assertRefExists(data.ref);
   if (kind === 'message' && data.status === undefined) data.status = 'queued';
-  return withLock(() => {
-    const events = readAll();
-    const seq = events.length ? events[events.length - 1].seq + 1 : 1;
-    const e = {
-      v: 1,
-      event_id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      seq, ts: new Date().toISOString(),
-      actor: actor || process.env.CLAUDE_AUTO_NAME || 'operator',
-      kind, data,
-    };
-    fs.appendFileSync(LEDGER, JSON.stringify(e) + '\n');
-    return e;
-  });
+}
+
+// Сама запись строки в журнал. ПРЕДПОЛАГАЕТ, что лок уже взят вызывающим (withLock).
+function writeEventUnlocked(kind, data, actor) {
+  const events = readAll();
+  const seq = events.length ? events[events.length - 1].seq + 1 : 1;
+  const e = {
+    v: 1,
+    event_id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    seq, ts: new Date().toISOString(),
+    actor: actor || process.env.CLAUDE_AUTO_NAME || 'operator',
+    kind, data,
+  };
+  fs.appendFileSync(LEDGER, JSON.stringify(e) + '\n');
+  return e;
+}
+
+// Общая точка записи (и для CLI, и для внутренних вызовов сабкоманд — без подпроцессов).
+function appendEvent(kind, data, actor) {
+  validateEvent(kind, data);
+  return withLock(() => writeEventUnlocked(kind, data, actor));
 }
 
 function cmdAppend(args) {
@@ -130,8 +138,24 @@ function cmdList(args) {
 }
 
 const REGISTRY = () => path.join(HOME, 'registry.json');
-function readRegistry() {
-  try { return JSON.parse(fs.readFileSync(REGISTRY(), 'utf8')); } catch { return { workers: {} }; }
+// strict=true (registry-set): битый JSON — не глотать, отменить запись (иначе перезапишем реестр с нуля).
+// strict=false/omitted (registry-get/list, incident-open): битый JSON — warning в stderr, вернуть пустой реестр.
+// Бросаем обычный Error (не die()) на strict, чтобы withLock корректно снял лок через finally —
+// process.exit() внутри withLock() пропускает finally и оставляет lock-файл висеть.
+function readRegistry(strict) {
+  let raw;
+  try { raw = fs.readFileSync(REGISTRY(), 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') return { workers: {} }; throw e; }
+  try { return JSON.parse(raw); }
+  catch {
+    if (strict) {
+      const err = new Error('registry: registry.json повреждён — почини вручную, запись отменена');
+      err.registryCorrupt = true;
+      throw err;
+    }
+    process.stderr.write('registry: registry.json повреждён, использую пустой реестр\n');
+    return { workers: {} };
+  }
 }
 function writeRegistry(reg) {
   const tmp = REGISTRY() + '.tmp';
@@ -159,7 +183,7 @@ function cmdApprovalOpen(a) {
     summary: a.summary, status: 'open' }, a.actor)));
 }
 function cmdApprovalResolve(a) {
-  out(brief(appendEvent('approval_status', { ref: a._[1], status: a.status }, a.actor || 'operator')));
+  out(brief(appendEvent('approval_status', { ref: a._[1], status: a.status }, a.actor)));
 }
 function cmdIncidentOpen(a) {
   const r = appendEvent('incident', { about_worker: a.about, severity: a.severity,
@@ -171,19 +195,30 @@ function cmdIncidentOpen(a) {
   out(brief(r));
 }
 function cmdRegistrySet(a) {
-  const updated = withLock(() => {   // тот же лок — RMW реестра без гонок
-    const reg = readRegistry();
-    const name = a._[1];
-    const cur = reg.workers[name] || {};
-    reg.workers[name] = {
-      role: a.role || cur.role, client: a.client ?? cur.client ?? null,
-      escalates_to: a['escalates-to'] || cur.escalates_to || 'operator',
-      mission_version: a['mission-version'] || cur.mission_version || 'v1',
-    };
-    writeRegistry(reg);
-    return reg.workers[name];
-  });
-  appendEvent('registry_change', { worker: a._[1], ...updated }, a.actor);
+  const name = a._[1];
+  if (!name) die('usage: dept-ledger registry-set <worker> --role <r> …');
+  let updated;
+  try {
+    // Один withLock на RMW реестра + аудит-событие — иначе под конкуренцией порядок
+    // «запись registry.json» vs «appendEvent(registry_change)» может разъехаться.
+    updated = withLock(() => {
+      const reg = readRegistry(true); // strict — битый реестр не перезаписываем
+      const cur = reg.workers[name] || {};
+      reg.workers[name] = {
+        role: a.role || cur.role, client: a.client ?? cur.client ?? null,
+        escalates_to: a['escalates-to'] || cur.escalates_to || 'operator',
+        mission_version: a['mission-version'] || cur.mission_version || 'v1',
+      };
+      writeRegistry(reg);
+      const data = { worker: name, ...reg.workers[name] };
+      validateEvent('registry_change', data);
+      writeEventUnlocked('registry_change', data, a.actor);
+      return reg.workers[name];
+    });
+  } catch (e) {
+    if (e && e.registryCorrupt) die(e.message);
+    throw e;
+  }
   out(updated);
 }
 function cmdRegistryGet(a) {
