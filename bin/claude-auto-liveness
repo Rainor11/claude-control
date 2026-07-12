@@ -57,7 +57,10 @@ function saveState(s) {
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
-function notify(msg) { if (!dry) sh(NOTIFY, [msg]); else console.log('[dry] notify:', msg); }
+function notify(msg) {
+  if (dry) { console.log('[dry] notify:', msg); return; }
+  if (sh(NOTIFY, [msg]) === null) console.log('liveness: notify FAILED:', msg);
+}
 
 const reg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
 const state = loadState();
@@ -71,7 +74,7 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     continue;
   }
   let tm;
-  try { tm = transcriptMtime(name); } catch { if (dry) console.log(`[dry] ${name}: транскрипт не найден`); continue; }
+  try { tm = transcriptMtime(name); } catch { console.log(`liveness: ${name}: ошибка чтения spec/транскрипта — пропуск`); continue; }
   if (tm === null) {
     console.log(`liveness: ${name}: транскрипт не найден — пропуск (проверь spec.json session_id)`);
     continue;
