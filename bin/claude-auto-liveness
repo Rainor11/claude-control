@@ -130,19 +130,34 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     state[name] = { ...prev, alerted: true };
   } else if (d.action === 'restart') {
     if (ENFORCE) {
-      if (!dry) sh('systemctl', ['--user', 'restart', `claude-auto@${name}.service`]);
-      notify(`🔄 liveness: воркер ${name} перезапущен (resume той же сессии).`);
-      state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: now };
+      // dry всегда "успех" (симуляция, systemctl не вызывается); в боевом прогоне —
+      // честно проверяем результат: раньше упавший systemctl restart всё равно слал
+      // «перезапущен» и чистил alerted/firstSeen, из-за чего лестница молча теряла воркера.
+      const restarted = dry || sh('systemctl', ['--user', 'restart', `claude-auto@${name}.service`]) !== null;
+      if (restarted) {
+        notify(`🔄 liveness: воркер ${name} перезапущен (resume той же сессии).`);
+        state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: now };
+      } else {
+        notify(`🚨 liveness: рестарт ${name} НЕ УДАЛСЯ (systemctl error) — вмешайся вручную`);
+        // state НЕ обновляем — prev остаётся alerted, лестница продолжит на следующем тике
+      }
     } else {
       if (!prev.wouldNotified) notify(`⚠️ liveness [would-restart]: ${name} всё ещё висит. Включи LIVENESS_ENFORCE=1 или перезапусти вручную: systemctl --user restart claude-auto@${name}`);
       state[name] = { ...prev, wouldNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
     }
   } else if (d.action === 'incident') {
     if (ENFORCE) {
-      if (!dry) sh(path.join(BIN, 'dept-ledger'), ['incident-open', '--about', name, '--severity', 'high',
-        '--summary', 'воркер виснет повторно после рестарта', '--actor', 'watchdog']);
-      notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
-      state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
+      // тот же принцип: упавший dept-ledger incident-open раньше всё равно "закрывал"
+      // наблюдение (чистил state), хотя инцидент для ТП фактически не открылся.
+      const opened = dry || sh(path.join(BIN, 'dept-ledger'), ['incident-open', '--about', name, '--severity', 'high',
+        '--summary', 'воркер виснет повторно после рестарта', '--actor', 'watchdog']) !== null;
+      if (opened) {
+        notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
+        state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
+      } else {
+        notify(`🚨 liveness: не удалось открыть incident по ${name} — открой вручную`);
+        // state НЕ обновляем
+      }
     } else {
       if (!prev.wouldIncidentNotified) notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`);
       state[name] = { ...prev, wouldIncidentNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран

@@ -70,8 +70,14 @@ function effectiveStatus(events, ev, statusKind, initial) {
   return st;
 }
 
-function assertRefExists(ref) {
-  if (!readAll().some((e) => e.event_id === ref)) die('ledger: ref не найден: ' + ref);
+function assertRefExists(ref, expectedKind) {
+  const e = readAll().find((e) => e.event_id === ref);
+  if (!e) die('ledger: ref не найден: ' + ref);
+  // без проверки kind approval-resolve/incident-open/ack принимали ref ЛЮБОГО события
+  // (например, event_id сообщения) и "успешно" закрывали несуществующий approval/incident.
+  if (expectedKind && e.kind !== expectedKind) {
+    die(`ledger: ref ${ref} имеет kind ${e.kind}, ожидался ${expectedKind}`);
+  }
 }
 
 // Валидация без побочных эффектов на файл (можно звать до входа в лок).
@@ -81,13 +87,13 @@ function validateEvent(kind, data) {
   if (kind === 'message' && !MSG_TYPES.has(data.type)) die('append: message.type ∉ ' + [...MSG_TYPES]);
   if (kind === 'message_status') {
     if (!MSG_STATUSES.has(data.status)) die('append: message_status.status ∉ ' + [...MSG_STATUSES]);
-    assertRefExists(data.ref);
+    assertRefExists(data.ref, 'message');
   }
   if (kind === 'approval_status') {
     if (!['approved', 'denied'].includes(data.status)) die('append: approval_status.status ∉ approved|denied');
-    assertRefExists(data.ref);
+    assertRefExists(data.ref, 'approval');
   }
-  if (kind === 'incident_status') assertRefExists(data.ref);
+  if (kind === 'incident_status') assertRefExists(data.ref, 'incident');
   if (kind === 'message' && data.status === undefined) data.status = 'queued';
 }
 
@@ -198,10 +204,16 @@ function cmdApprovalResolve(a) {
 function cmdIncidentOpen(a) {
   const r = appendEvent('incident', { about_worker: a.about, severity: a.severity,
     summary: a.summary, status: 'open', source: a.actor || 'operator' }, a.actor);
+  // non-strict: инцидент обязан открыться, даже если реестр битый/пустой/без роли 'тп' —
+  // но тогда честно предупреждаем, а не молча теряем маршрутизацию к ТП.
   const reg = readRegistry();
   const tp = Object.entries(reg.workers).find(([, w]) => w.role === 'тп');
-  if (tp) appendEvent('message', { type: 'incident', from: a.actor || 'operator', to: tp[0],
-    subject: `incident ${a.severity}: ${a.about}`, body: a.summary, refs: [r.event_id], status: 'queued' }, a.actor);
+  if (tp) {
+    appendEvent('message', { type: 'incident', from: a.actor || 'operator', to: tp[0],
+      subject: `incident ${a.severity}: ${a.about}`, body: a.summary, refs: [r.event_id], status: 'queued' }, a.actor);
+  } else {
+    process.stderr.write("incident-open: инцидент открыт, но НЕ маршрутизирован ТП (роль 'тп' не найдена в реестре)\n");
+  }
   out(brief(r));
 }
 function cmdRegistrySet(a) {
@@ -231,12 +243,19 @@ function cmdRegistrySet(a) {
   }
   out(updated);
 }
+// registry-get/registry-list — диагностические команды, fail-loud: битый registry.json
+// не должен молча притворяться пустым реестром (в отличие от incident-open, которому
+// нужно открыться в любом случае).
+function readRegistryStrict() {
+  try { return readRegistry(true); }
+  catch (e) { if (e && e.registryCorrupt) die(e.message); throw e; }
+}
 function cmdRegistryGet(a) {
-  const w = readRegistry().workers[a._[1]];
+  const w = readRegistryStrict().workers[a._[1]];
   if (!w) die('registry: не найден ' + a._[1]);
   process.stdout.write(JSON.stringify(w) + '\n');
 }
-function cmdRegistryList() { process.stdout.write(JSON.stringify(readRegistry()) + '\n'); }
+function cmdRegistryList() { process.stdout.write(JSON.stringify(readRegistryStrict()) + '\n'); }
 
 const HANDLERS = {
   append: cmdAppend, list: cmdList, send: cmdSend, ack: cmdAck, resolve: cmdResolve,

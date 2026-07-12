@@ -141,3 +141,29 @@ test('битый registry.json не перезаписывается', () => {
   assert.throws(() => run(home, ['registry-set', 'mk-prodmash', '--role', 'мк']));
   assert.equal(readFileSync(registryPath, 'utf8'), '{oops');
 });
+
+test('*_status с ref чужого kind отклоняется: approval-resolve по event_id сообщения', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const m = JSON.parse(run(home, ['send', '--type', 'question', '--to', 'руководитель',
+    '--subject', 'вопрос', '--body', 'тело', '--actor', 'mk-x']));
+  assert.throws(() => run(home, ['approval-resolve', m.event_id, '--status', 'approved']));
+});
+
+test('*_status с ref чужого kind отклоняется: ack по event_id approval', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const ap = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 's']));
+  assert.throws(() => run(home, ['ack', ap.event_id]));
+});
+
+test('incident-open без ТП в реестре — успешен, но предупреждает в stderr', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const res = spawnSync(CLI, ['incident-open', '--about', 'mk-prodmash', '--severity', 'high',
+    '--summary', 'воркер завис', '--actor', 'watchdog'],
+    { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stderr, /не маршрутизирован/i);
+  const inc = run(home, ['list', '--kind', 'incident', '--status', 'open']).trim().split('\n');
+  assert.equal(inc.length, 1);
+  const msg = run(home, ['list', '--kind', 'message']).trim();
+  assert.equal(msg, ''); // сообщение ТП не создано — маршрутизировать некому
+});
