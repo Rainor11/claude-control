@@ -3,19 +3,24 @@
 # TG-канал (claude-auto-ask, кнопки). Ответ оператора приходит воркеру обычным
 # turn'ом; воркер обязан закрыть аппрув: dept-ledger approval-resolve <id> --status …
 set -euo pipefail
-kind_of="" summary="" detail="" actor="${CLAUDE_AUTO_NAME:-operator}"
+kind_of="" summary="" detail=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --kind-of) kind_of="$2"; shift 2 ;;
     --summary) summary="$2"; shift 2 ;;
     --detail) detail="$2"; shift 2 ;;
-    --actor) actor="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+actor="${CLAUDE_AUTO_NAME:-}"
+[ -n "$actor" ] || { echo 'dept-approve: запускается только из сессии воркера (нет CLAUDE_AUTO_NAME)' >&2; exit 1; }
 [ -n "$kind_of" ] && [ -n "$summary" ] || { echo 'usage: dept-approve --kind-of <k> --summary <s> [--detail <d>]' >&2; exit 1; }
 DL="$(cd "$(dirname "$0")" && pwd)/dept-ledger"
-out="$("$DL" approval-open --kind-of "$kind_of" --summary "$summary" --actor "$actor")"
+# Policy-турникет (§6 спеки: решение «по памяти» запрещено механически). Без исключений.
+"$DL" policy-check --worker "$actor" >/dev/null || exit 1
+args=(approval-open --kind-of "$kind_of" --summary "$summary" --actor "$actor")
+[ -n "$detail" ] && args+=(--detail "$detail")
+out="$("$DL" "${args[@]}")"
 eid="$(echo "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 q="[отдел/approve $eid] ${summary}"
 [ -n "$detail" ] && q="$q — $detail"
