@@ -10,24 +10,41 @@
    - dept-head, dept-archivist: `cd /home/rainor/brain && claude`
    - dept-tp: `cd /home/rainor/server && claude`
 2. В сессии: `/go-autonomous <имя>`; миссию вставь из
-   `examples/department/<имя>/mission.md`. Рамки (bounds) задай в диалоге:
+   `examples/department/<имя>/mission.md`. Рамки (bounds) задай в диалоге.
+   ВАЖНО: в auto-режиме воркера отсутствие allow НЕ равно запрету — Edit/Write
+   вне allow проходят молча. Гарантия — только явные deny-правила; задавай их
+   в диалоге /go-autonomous вместе с allow. `claude-auto-ask` уже в
+   baseline-allow каждого воркера (добавляет adopt автоматически) — отдельно
+   разрешать не нужно.
    - всем: allow `Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)`,
      `Bash(/opt/projects/active/claude-control/bin/dept-approve:*)`; deny
      `Bash(sudo:*)`; исходящие людям — НЕ разрешать (гейт через dept-approve).
-   - dept-head: + allow `Bash(/opt/projects/active/claude-control/bin/claude-auto-ask:*)`;
-     Edit/Write НЕ разрешать (пишет только в шину).
-   - dept-archivist: + Edit/Write в
+   - dept-head: deny `Edit(/home/rainor/brain/**)`, `Write(/home/rainor/brain/**)`
+     — руководитель ничего не пишет в файлы, только шина.
+   - dept-archivist: allow Edit/Write ТОЛЬКО
      `/home/rainor/brain/wiki/work/ai-dev/продукты/alp-gpt/база-знаний/**`,
-     `/home/rainor/brain/wiki/work/ai-dev/отдел/**`; прочее brain — read-only.
+     `/home/rainor/brain/wiki/work/ai-dev/отдел/правила/**`,
+     `/home/rainor/brain/wiki/work/ai-dev/отдел/тп-знания.md`; deny Edit/Write
+     `/home/rainor/brain/wiki/work/ai-dev/отдел/роли/**`,
+     `/home/rainor/brain/wiki/work/ai-dev/отдел/CLAUDE.md`,
+     `/home/rainor/brain/wiki/work/ai-dev/клиенты/**` (роли и манифест отдела
+     меняет только Оракул-сессия; клиентские папки пишут МК). Неизменяемость
+     старых policy-vN — правило канона (механически не выражается): новая
+     версия = только новый файл policy-vN+1.md.
    - dept-tp: + Edit/Write в `/opt/projects/active/**`; ask на
-     `Bash(systemctl:*)`; deny на правку `/opt/projects/active/claude-control/bin/**`,
-     `bot/**`, `channels/event-bridge/**` (self-protection дополнит остальное).
+     `Bash(systemctl:*)`; явные deny
+     `Edit(/opt/projects/active/claude-control/bin/**)`,
+     `Write(/opt/projects/active/claude-control/bin/**)`, то же для
+     `/opt/projects/active/claude-control/bot/**` и
+     `/opt/projects/active/claude-control/channels/event-bridge/**`;
+     `~/.claude-control/` и собственный workers-каталог закрывает
+     автоматический self-protection.
 3. Закрой origin-окно (правило adopt).
-4. Пробы: `claude-auto set-probes <имя> examples/department/<имя>/probes.json`
+4. Пробы: `claude-auto set-probes <имя> /opt/projects/active/claude-control/examples/department/<имя>/probes.json`
 5. Реестр: `dept-ledger registry-set <имя> --role <руководитель|архивариус|тп> --mission-version v2`
 6. Смок: `dept-ledger send --type question --to <имя> --subject 'смок' --body
    'ответь ack и resolve' --actor operator` → в течение ~минуты воркер ack'ает
-   (проверь `dept-ledger list --kind message --status queued` — пусто).
+   (проверь `dept-ledger list --kind message --filter to=<имя> --status queued` — пусто).
 
 ## МК (миграция существующего deal-воркера)
 
