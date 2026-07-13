@@ -10,15 +10,18 @@ const { execFile } = require('child_process');
 const PORT = Number(process.env.DEPT_INBOX_PORT || 8377);
 const DL = process.env.DEPT_LEDGER_BIN || path.join(__dirname, 'dept-ledger');
 
-let lastReadError = null; // ошибка чтения ledger не должна маскироваться под «пустой инбокс»
+// Ошибка чтения ledger не должна маскироваться под «пустой инбокс» / «не найдено».
+// Результат per-call ({rows, error}) — общий mutable lastReadError давал гонку:
+// параллельный запрос затирал ошибку соседнего (или забирал её в свой успешный ответ).
 function dl(args) {
   return new Promise((resolve) => {
     execFile(DL, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) { lastReadError = String(stderr || err.message).slice(0, 300); return resolve([]); }
-      if (!stdout || !stdout.trim()) return resolve([]);
+      if (err) return resolve({ rows: [], error: String(stderr || err.message).slice(0, 300) });
       const rows = [];
-      for (const l of stdout.trim().split('\n')) { try { rows.push(JSON.parse(l)); } catch {} }
-      resolve(rows);
+      if (stdout && stdout.trim()) {
+        for (const l of stdout.trim().split('\n')) { try { rows.push(JSON.parse(l)); } catch {} }
+      }
+      resolve({ rows, error: null });
     });
   });
 }
@@ -50,6 +53,12 @@ th{color:#8b93a1;font-weight:600} a{color:#7ab7ff} h1{font-size:1.4rem} h2{margi
 </style></head><body><h1>Цифровой отдел</h1>${body}</body></html>`;
 }
 
+// Единый стиль баннера ошибки чтения для инбокса и карточки аппрува.
+function errBanner(readError) {
+  return readError
+    ? `<p style="color:#ff8f7a;border:1px solid #7a3a2e;padding:.4rem .8rem">⚠️ Ошибка чтения журнала — данные могут быть неполными: ${esc(readError)}</p>` : '';
+}
+
 function renderInbox(d) {
   const apr = d.approvals.map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.from)}</td>
 <td>${esc(e.data.kind_of)}</td><td><a href="/a/${esc(e.event_id)}">${esc(e.data.summary)}</a></td></tr>`).join('')
@@ -60,9 +69,7 @@ function renderInbox(d) {
   const rec = d.recent.map((e) => `<tr><td>${esc((e.ts || '').slice(0, 16).replace('T', ' '))}</td>
 <td>${esc(e.actor)}</td><td>${esc(e.kind)}</td><td>${esc(summaryOf(e))}</td></tr>`).join('');
   const workers = Object.keys((d.registry && d.registry.workers) || {}).length;
-  const errBanner = d.readError
-    ? `<p style="color:#ff8f7a;border:1px solid #7a3a2e;padding:.4rem .8rem">⚠️ Ошибка чтения журнала — данные могут быть неполными: ${esc(d.readError)}</p>` : '';
-  return page('Отдел — инбокс', `${errBanner}
+  return page('Отдел — инбокс', `${errBanner(d.readError)}
 <p class="meta">правила: ${esc(d.policy.version || '?')} · воркеров в реестре: ${workers} · автообновление 60с</p>
 <h2>⏳ Ждут решения (${d.approvals.length})</h2>
 <table><tr><th>висит</th><th>кто</th><th>тип</th><th>что</th></tr>${apr}</table>
@@ -72,11 +79,17 @@ function renderInbox(d) {
 <table><tr><th>когда (UTC)</th><th>кто</th><th>вид</th><th>что</th></tr>${rec}</table>`);
 }
 
-function renderApproval(e, statuses) {
-  if (!e) return page('не найдено', '<p>Аппрув не найден.</p><p><a href="/">← в инбокс</a></p>');
+function renderApproval(e, statuses, readError) {
+  if (!e) {
+    // при ошибке чтения НЕ выдавать «не найдено» — реальное состояние аппрува неизвестно
+    if (readError) return page('ошибка чтения журнала', `${errBanner(readError)}
+<p>Не удалось прочитать журнал — состояние аппрува неизвестно, обнови страницу.</p>
+<p><a href="/">← в инбокс</a></p>`);
+    return page('не найдено', '<p>Аппрув не найден.</p><p><a href="/">← в инбокс</a></p>');
+  }
   const st = statuses.length ? statuses[statuses.length - 1].data.status : (e.data.status || 'open');
   const hist = statuses.map((s) => `<li>${esc(s.ts)} — <b>${esc(s.data.status)}</b> (${esc(s.actor)})</li>`).join('');
-  return page(`Аппрув ${e.event_id}`, `
+  return page(`Аппрув ${e.event_id}`, `${errBanner(readError)}
 <p><a href="/">← в инбокс</a></p>
 <h2>${esc(e.data.summary)}</h2>
 <p class="meta">${esc(e.event_id)} · от ${esc(e.data.from)} · тип ${esc(e.data.kind_of)} · открыт ${esc(e.ts)} (${esc(age(e.ts))} назад) · статус: <b>${esc(st)}</b></p>
@@ -86,16 +99,17 @@ ${hist ? `<h2>История</h2><ul>${hist}</ul>` : ''}
 }
 
 async function collectInbox() {
-  lastReadError = null;
-  const [approvals, incidents, recent, regRows, polRows] = await Promise.all([
+  const res = await Promise.all([
     dl(['list', '--kind', 'approval', '--status', 'open']),
     dl(['list', '--kind', 'incident', '--status', 'open']),
     dl(['list', '--limit', '50']),
     dl(['registry-list']),
     dl(['policy-current']),
   ]);
-  return { approvals: approvals.reverse(), incidents: incidents.reverse(), recent: recent.reverse(),
-    registry: regRows[0] || { workers: {} }, policy: polRows[0] || {}, readError: lastReadError };
+  const [approvals, incidents, recent, reg, pol] = res;
+  return { approvals: approvals.rows.reverse(), incidents: incidents.rows.reverse(), recent: recent.rows.reverse(),
+    registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
+    readError: res.map((r) => r.error).find(Boolean) || null };
 }
 
 if (require.main === module) {
@@ -109,8 +123,9 @@ if (require.main === module) {
         const eid = u.pathname.slice(3);
         const [aprs, sts] = await Promise.all([dl(['list', '--kind', 'approval']),
           dl(['list', '--kind', 'approval_status'])]);
-        html = renderApproval(aprs.find((e) => e.event_id === eid),
-          sts.filter((s) => s.data && s.data.ref === eid));
+        html = renderApproval(aprs.rows.find((e) => e.event_id === eid),
+          sts.rows.filter((s) => s.data && s.data.ref === eid),
+          aprs.error || sts.error || null);
       }
       if (html === null) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); return; }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8',
