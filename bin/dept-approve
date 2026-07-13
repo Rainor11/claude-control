@@ -1,7 +1,10 @@
 #!/bin/bash
-# dept-approve — открыть аппрув в ledger и спросить оператора через существующий
-# TG-канал (claude-auto-ask, кнопки). Ответ оператора приходит воркеру обычным
-# turn'ом; воркер обязан закрыть аппрув: dept-ledger approval-resolve <id> --status …
+# dept-approve — открыть аппрув в ledger и запросить решение оператора через
+# structured-approval бота (@RnR_Workers, карточка ✅/❌). Решение в ledger
+# записывает БОТ (approval-resolve) — воркер сам аппрув НЕ закрывает, а ждёт
+# инжект исхода и действует по нему.
+# WORKER-ONLY: идентичность — из CLAUDE_AUTO_NAME (ставит супервизор); флага
+# --actor нет намеренно (он позволял бы обходить policy-турникет подменой имени).
 set -euo pipefail
 kind_of="" summary="" detail=""
 while [ $# -gt 0 ]; do
@@ -15,20 +18,21 @@ done
 actor="${CLAUDE_AUTO_NAME:-}"
 [ -n "$actor" ] || { echo 'dept-approve: запускается только из сессии воркера (нет CLAUDE_AUTO_NAME)' >&2; exit 1; }
 [ -n "$kind_of" ] && [ -n "$summary" ] || { echo 'usage: dept-approve --kind-of <k> --summary <s> [--detail <d>]' >&2; exit 1; }
-DL="$(cd "$(dirname "$0")" && pwd)/dept-ledger"
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RQ="$BINDIR/claude-auto-request"
 # Policy-турникет (§6 спеки: решение «по памяти» запрещено механически). Без исключений.
 "$DL" policy-check --worker "$actor" >/dev/null || exit 1
 args=(approval-open --kind-of "$kind_of" --summary "$summary" --actor "$actor")
 [ -n "$detail" ] && args+=(--detail "$detail")
 out="$("$DL" "${args[@]}")"
 eid="$(echo "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
-q="[отдел/approve $eid] ${summary}"
-[ -n "$detail" ] && q="$q — $detail"
-q="$q (после ответа выполни: dept-ledger approval-resolve $eid --status approved|denied)"
-# КРИТИЧНО: ошибку уведомления НЕ глотать — иначе открытый аппрув повиснет,
+# КРИТИЧНО: ошибку постановки запроса НЕ глотать — иначе открытый аппрув повиснет,
 # а оператор о нём не узнает (это главный safety-gate отдела).
-if ! claude-auto-ask --question "$q" --options-json '["✅ Одобряю","❌ Отклоняю"]'; then
-  echo "dept-approve: НЕ удалось уведомить оператора (approval $eid остаётся open). Эскалируй другим каналом (claude-auto-tg) и повтори." >&2
+rq_args=(--action dept-approval --event-id "$eid" --summary "$summary")
+[ -n "$detail" ] && rq_args+=(--detail "$detail")
+if ! "$RQ" "${rq_args[@]}"; then
+  echo "dept-approve: НЕ удалось передать запрос оператору (approval $eid остаётся open). Эскалируй другим каналом (claude-auto-tg) и повтори." >&2
   exit 1
 fi
 echo "$out"

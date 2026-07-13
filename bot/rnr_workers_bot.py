@@ -80,6 +80,7 @@ ACTION_LABEL = {
     "whitelist-remove": "🗑 Убрать из whitelist",
     "one-time-send": "✉️ Разовая отправка (Telegram)",
     "mcp-add": "🧩 Подключить MCP-сервер",
+    "dept-approval": "решение по аппруву отдела",
 }
 
 log = logging.getLogger("rnr-workers-bot")
@@ -777,10 +778,17 @@ def render_approval(row):
     elif action == "mcp-add":
         srv = _clean(str(row.get("arg_value")))
         lines.append(f"MCP-сервер: <code>{esc(srv)}</code>")
+    elif action == "dept-approval":
+        lines.append(f"Аппрув отдела: <code>{esc(_clean(str(row.get('arg_value'))))}</code>")
+        if row.get("payload"):
+            lines.append(f"<blockquote>{esc(_clean(row['payload']))}</blockquote>")
     if row.get("reason"):
         lines.append(f"\n💬 <i>Причина (со слов воркера): {esc(_clean(row['reason']))}</i>")
     if action == "mcp-add":
         lines.append("\n<i>Это добавит MCP-сервер в набор воркера и перезапустит его. Реши.</i>")
+    elif action == "dept-approval":
+        lines.append("\n<i>Решение запишется в журнал отдела; воркер получит исход и"
+                     " выполнит (или отменит) действие. Реши.</i>")
     else:
         lines.append("\n<i>Это меняет права/отправку. Проверь контакт и реши.</i>")
     return "\n".join(lines)
@@ -861,6 +869,25 @@ def exec_mcp_add(row):
         return False, f"exec error: {e}"
 
 
+DEPT_LEDGER = "/opt/projects/active/claude-control/bin/dept-ledger"
+
+
+def exec_dept_resolve(row, approved):
+    """Record the operator's decision in the department ledger. Idempotent: a repeat
+    approval_status with the SAME status doesn't change the effective status — retry-safe
+    (dept-ledger's own dedup, Task 1)."""
+    status = "approved" if approved else "denied"
+    try:
+        p = subprocess.run([DEPT_LEDGER, "approval-resolve", str(row["arg_value"]),
+                            "--status", status, "--actor", "operator"],
+                           capture_output=True, timeout=30)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip() \
+            or (p.stderr or b"").decode("utf-8", "replace").strip()
+        return p.returncode == 0, out[:300]
+    except Exception as e:  # noqa: BLE001
+        return False, f"exec error: {e}"
+
+
 async def cb_approval(cb: CallbackQuery):
     chat_id = cb.message.chat.id if cb.message else 0
     if not authed_user_chat(cb.from_user.id, chat_id):
@@ -912,9 +939,11 @@ async def notify_worker_outcome(bot: Bot, row, approved, ok, detail):
     if not approved:
         body = f"Оператор ОТКЛОНИЛ запрос: {human}{argd}. Не повторяй; действуй иначе или эскалируй."
     elif ok:
-        # mcp-add: surface the exact state (restarted / restart-deferred) — a deferred restart
-        # means the server is added but NOT loaded yet, so the worker must NOT assume it's live.
-        if row["action"] == "mcp-add" and detail:
+        # mcp-add / dept-approval: surface the exact state (mcp-add's restarted / restart-
+        # deferred — a deferred restart means the server is added but NOT loaded yet, so the
+        # worker must NOT assume it's live; dept-approval's ledger-recorded confirmation)
+        # instead of the generic "done" line below.
+        if row["action"] in ("mcp-add", "dept-approval") and detail:
             body = f"Оператор ОДОБРИЛ: {human}{argd}. {detail}."
         else:
             body = f"Оператор ОДОБРИЛ, выполнено: {human}{argd}. Можешь продолжать."
@@ -933,6 +962,24 @@ async def process_approval(bot: Bot, row):
     attempts = rnr_db.record_attempt_appr(qid)
 
     if status == "denied":
+        if action == "dept-approval":
+            ok, detail = await asyncio.to_thread(exec_dept_resolve, row, False)
+            if not ok:
+                if attempts < APPR_MAX_ATTEMPTS:
+                    return  # retry: the denial MUST reach the ledger (approval-resolve is idempotent)
+                # Ledger never got the denial recorded — do NOT tell the worker (it would think
+                # the denial is final while the ledger still says 'open'); operator fixes by hand.
+                await alert_operator(
+                    bot, f"❌ Не смог записать denied в ledger отдела (#{qid}): {detail}. "
+                         f"Аппрув в ledger остаётся open; воркер НЕ уведомлён.")
+                rnr_db.mark_exec_failed(qid, detail)
+                # mark_notified (not just mark_exec_failed): status is now 'failed' with
+                # notified_at still NULL, which would make the generic "executed/failed →
+                # notify" fallback below re-pick this row later and tell the worker
+                # approved=True — wrong, since that fallback assumes 'failed' only ever
+                # follows an APPROVED exec. This closes the loop without notifying anyone else.
+                rnr_db.mark_notified(qid)
+                return
         await notify_worker_outcome(bot, row, approved=False, ok=None, detail="")
         return
 
@@ -969,6 +1016,19 @@ async def process_approval(bot: Bot, row):
                 rnr_db.mark_exec_failed(qid, detail)
                 await alert_operator(
                     bot, f"❌ Не смог подключить MCP-сервер для «{worker}» (#{qid}) за "
+                         f"{attempts} попыток: {detail}")
+            # else: leave 'approved' → backoff retry (idempotent)
+            return
+        if action == "dept-approval":
+            ok, detail = await asyncio.to_thread(exec_dept_resolve, row, True)
+            if ok:
+                rnr_db.mark_executed(qid, detail)
+                await notify_worker_outcome(bot, row, approved=True, ok=True,
+                                            detail="решение записано в журнал отдела — выполняй утверждённое")
+            elif attempts >= APPR_MAX_ATTEMPTS:
+                rnr_db.mark_exec_failed(qid, detail)
+                await alert_operator(
+                    bot, f"❌ Не смог записать approved в ledger отдела (#{qid}) за "
                          f"{attempts} попыток: {detail}")
             # else: leave 'approved' → backoff retry (idempotent)
             return

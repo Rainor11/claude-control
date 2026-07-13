@@ -13,6 +13,10 @@
 #                                                    permanently whitelisting (TG only)
 #   mcp-add          --server <name>                add an MCP server (from the catalog
 #                                                    ONLY) to MY subscription + restart me
+#   dept-approval    --event-id evt_… --summary '<s>' [--detail '<d>']
+#                                                    ask the operator to resolve a
+#                                                    department-ledger approval (bot writes
+#                                                    approval-resolve itself, not me)
 #
 # Operator-only BY CONSTRUCTION (same guarantees as claude-auto-ask):
 #   * worker identity is the spoof-resistant /proc ancestor (resolve_name), NOT
@@ -35,6 +39,8 @@ DB="/opt/projects/active/claude-control/bot/rnr_db.py"
 MCP_CATALOG_FILE="${MCP_CATALOG_FILE:-$HOME/.claude.json}"  # MCP catalog (source of truth)
 BODY_MAX=2000
 REASON_MAX=400
+SUMMARY_MAX=400
+DETAIL_MAX=2000
 
 die() { echo "claude-auto-request: $*" >&2; exit 1; }
 
@@ -59,23 +65,27 @@ resolve_name() {
 
 # ---- args ----
 ACTION=""; ENTRY=""; TO=""; BODY=""; SUBJECT=""; REASON=""; SERVER=""
+EVENT_ID=""; SUMMARY=""; DETAIL=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --action)  ACTION="${2-}";  shift 2 || die "missing --action value" ;;
-    --entry)   ENTRY="${2-}";   shift 2 || die "missing --entry value" ;;
-    --to)      TO="${2-}";      shift 2 || die "missing --to value" ;;
-    --body)    BODY="${2-}";    shift 2 || die "missing --body value" ;;
-    --subject) SUBJECT="${2-}"; shift 2 || die "missing --subject value" ;;
-    --server)  SERVER="${2-}";  shift 2 || die "missing --server value" ;;
-    --reason)  REASON="${2-}";  shift 2 || die "missing --reason value" ;;
+    --action)   ACTION="${2-}";   shift 2 || die "missing --action value" ;;
+    --entry)    ENTRY="${2-}";    shift 2 || die "missing --entry value" ;;
+    --to)       TO="${2-}";       shift 2 || die "missing --to value" ;;
+    --body)     BODY="${2-}";     shift 2 || die "missing --body value" ;;
+    --subject)  SUBJECT="${2-}";  shift 2 || die "missing --subject value" ;;
+    --server)   SERVER="${2-}";   shift 2 || die "missing --server value" ;;
+    --reason)   REASON="${2-}";   shift 2 || die "missing --reason value" ;;
+    --event-id) EVENT_ID="${2-}"; shift 2 || die "missing --event-id value" ;;
+    --summary)  SUMMARY="${2-}";  shift 2 || die "missing --summary value" ;;
+    --detail)   DETAIL="${2-}";   shift 2 || die "missing --detail value" ;;
     *) die "unknown arg '$1'" ;;
   esac
 done
 
 case "$ACTION" in
-  whitelist-add|whitelist-remove|one-time-send|mcp-add) ;;
-  "") die "missing --action (whitelist-add|whitelist-remove|one-time-send|mcp-add)" ;;
-  *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send|mcp-add)" ;;
+  whitelist-add|whitelist-remove|one-time-send|mcp-add|dept-approval) ;;
+  "") die "missing --action (whitelist-add|whitelist-remove|one-time-send|mcp-add|dept-approval)" ;;
+  *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send|mcp-add|dept-approval)" ;;
 esac
 
 command -v python3 >/dev/null 2>&1 || die "python3 required"
@@ -126,6 +136,25 @@ case "$ACTION" in
     [ -f "$MCP_CATALOG_FILE" ] && jq -e --arg k "$SERVER" '(.mcpServers // {}) | has($k)' "$MCP_CATALOG_FILE" >/dev/null 2>&1 \
       || die "mcp-add: '$SERVER' is not in the MCP catalog ($MCP_CATALOG_FILE) — you may request only a catalog server"
     ARG_KIND=mcp; ARG_VALUE="$SERVER"
+    ;;
+  dept-approval)
+    # Called by dept-approve (department flow), not typed ad hoc — event_id comes from a
+    # dept-ledger approval-open row it already holds. arg_value carries the event_id; the
+    # bot resolves it (approval-resolve) on decision — no reason field for this action.
+    [ -n "$EVENT_ID" ] || die "--event-id required for dept-approval"
+    printf '%s' "$EVENT_ID" | grep -qE '^evt_[0-9]+_[a-z0-9]{4}$' || die "malformed --event-id: '$EVENT_ID'"
+    [ -n "$SUMMARY" ] || die "--summary required for dept-approval"
+    # strip control bytes first (mirrors --body/--reason below) so invisible padding can't
+    # trip the length die, then cap — summary is a headline the operator decides from, so an
+    # oversized one is REJECTED (not silently mangled, unlike the more free-form detail).
+    SUMMARY="$(printf '%s' "$SUMMARY" | tr -d '\000-\010\013\014\016-\037')"
+    [ "${#SUMMARY}" -le "$SUMMARY_MAX" ] || die "--summary too long (>${SUMMARY_MAX} chars)"
+    [ -n "$DETAIL" ] && DETAIL="$(printf '%s' "$DETAIL" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$DETAIL_MAX")"
+    ARG_KIND=event_id; ARG_VALUE="$EVENT_ID"
+    PAYLOAD="$SUMMARY"
+    [ -n "$DETAIL" ] && PAYLOAD="$SUMMARY
+
+$DETAIL"
     ;;
 esac
 
