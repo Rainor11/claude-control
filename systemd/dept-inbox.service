@@ -1,0 +1,11 @@
+[Unit]
+Description=dept-inbox — read-only веб-инбокс цифрового отдела
+
+[Service]
+Environment=PATH=/home/rainor/.nvm/versions/node/v20.19.2/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/projects/active/claude-control/bin/dept-inbox
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

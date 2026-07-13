@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+// dept-inbox — read-only веб-инбокс оператора поверх ledger отдела.
+// Слушает ТОЛЬКО 127.0.0.1; наружу — через Angie-vhost с basic auth.
+// Никаких записей: решения — кнопками в TG-боте (дашборд с действиями — фаза 3+).
+'use strict';
+const http = require('http');
+const path = require('path');
+const { execFile } = require('child_process');
+
+const PORT = Number(process.env.DEPT_INBOX_PORT || 8377);
+const DL = process.env.DEPT_LEDGER_BIN || path.join(__dirname, 'dept-ledger');
+
+let lastReadError = null; // ошибка чтения ledger не должна маскироваться под «пустой инбокс»
+function dl(args) {
+  return new Promise((resolve) => {
+    execFile(DL, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) { lastReadError = String(stderr || err.message).slice(0, 300); return resolve([]); }
+      if (!stdout || !stdout.trim()) return resolve([]);
+      const rows = [];
+      for (const l of stdout.trim().split('\n')) { try { rows.push(JSON.parse(l)); } catch {} }
+      resolve(rows);
+    });
+  });
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function age(ts) {
+  const m = Math.max(0, Math.round((Date.now() - Date.parse(ts)) / 60000));
+  if (m < 60) return m + ' мин';
+  if (m < 1440) return Math.floor(m / 60) + ' ч ' + (m % 60) + ' мин';
+  return Math.floor(m / 1440) + ' дн';
+}
+
+function summaryOf(e) {
+  const d = e.data || {};
+  return d.summary || d.subject || (d.status ? `${d.status} → ${d.ref || ''}` : '') || d.worker || '';
+}
+
+function page(title, body) {
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
+<title>${esc(title)}</title><style>
+body{font:15px/1.5 system-ui,sans-serif;margin:1rem auto;max-width:60rem;padding:0 1rem;background:#14161a;color:#d7dae0}
+table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}
+td,th{border-bottom:1px solid #2c313a;padding:.35rem .5rem;text-align:left;vertical-align:top}
+th{color:#8b93a1;font-weight:600} a{color:#7ab7ff} h1{font-size:1.4rem} h2{margin:1.2rem 0 .3rem;font-size:1.1rem}
+.meta{color:#7b8290} blockquote{border-left:3px solid #3a4150;margin:.5rem 0;padding:.2rem .8rem;white-space:pre-wrap}
+</style></head><body><h1>Цифровой отдел</h1>${body}</body></html>`;
+}
+
+function renderInbox(d) {
+  const apr = d.approvals.map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.from)}</td>
+<td>${esc(e.data.kind_of)}</td><td><a href="/a/${esc(e.event_id)}">${esc(e.data.summary)}</a></td></tr>`).join('')
+    || '<tr><td colspan="4">пусто — решений никто не ждёт</td></tr>';
+  const inc = d.incidents.map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.severity)}</td>
+<td>${esc(e.data.about_worker)}</td><td>${esc(e.data.summary)}</td></tr>`).join('')
+    || '<tr><td colspan="4">пусто</td></tr>';
+  const rec = d.recent.map((e) => `<tr><td>${esc((e.ts || '').slice(0, 16).replace('T', ' '))}</td>
+<td>${esc(e.actor)}</td><td>${esc(e.kind)}</td><td>${esc(summaryOf(e))}</td></tr>`).join('');
+  const workers = Object.keys((d.registry && d.registry.workers) || {}).length;
+  const errBanner = d.readError
+    ? `<p style="color:#ff8f7a;border:1px solid #7a3a2e;padding:.4rem .8rem">⚠️ Ошибка чтения журнала — данные могут быть неполными: ${esc(d.readError)}</p>` : '';
+  return page('Отдел — инбокс', `${errBanner}
+<p class="meta">правила: ${esc(d.policy.version || '?')} · воркеров в реестре: ${workers} · автообновление 60с</p>
+<h2>⏳ Ждут решения (${d.approvals.length})</h2>
+<table><tr><th>висит</th><th>кто</th><th>тип</th><th>что</th></tr>${apr}</table>
+<h2>🚨 Открытые инциденты (${d.incidents.length})</h2>
+<table><tr><th>возраст</th><th>severity</th><th>о ком</th><th>что</th></tr>${inc}</table>
+<h2>Последние события</h2>
+<table><tr><th>когда (UTC)</th><th>кто</th><th>вид</th><th>что</th></tr>${rec}</table>`);
+}
+
+function renderApproval(e, statuses) {
+  if (!e) return page('не найдено', '<p>Аппрув не найден.</p><p><a href="/">← в инбокс</a></p>');
+  const st = statuses.length ? statuses[statuses.length - 1].data.status : (e.data.status || 'open');
+  const hist = statuses.map((s) => `<li>${esc(s.ts)} — <b>${esc(s.data.status)}</b> (${esc(s.actor)})</li>`).join('');
+  return page(`Аппрув ${e.event_id}`, `
+<p><a href="/">← в инбокс</a></p>
+<h2>${esc(e.data.summary)}</h2>
+<p class="meta">${esc(e.event_id)} · от ${esc(e.data.from)} · тип ${esc(e.data.kind_of)} · открыт ${esc(e.ts)} (${esc(age(e.ts))} назад) · статус: <b>${esc(st)}</b></p>
+${e.data.detail ? `<blockquote>${esc(e.data.detail)}</blockquote>` : '<p class="meta">детали не приложены</p>'}
+${hist ? `<h2>История</h2><ul>${hist}</ul>` : ''}
+<p class="meta">Решение — кнопками в Telegram (@RnR_Workers). Эта страница только показывает.</p>`);
+}
+
+async function collectInbox() {
+  lastReadError = null;
+  const [approvals, incidents, recent, regRows, polRows] = await Promise.all([
+    dl(['list', '--kind', 'approval', '--status', 'open']),
+    dl(['list', '--kind', 'incident', '--status', 'open']),
+    dl(['list', '--limit', '50']),
+    dl(['registry-list']),
+    dl(['policy-current']),
+  ]);
+  return { approvals: approvals.reverse(), incidents: incidents.reverse(), recent: recent.reverse(),
+    registry: regRows[0] || { workers: {} }, policy: polRows[0] || {}, readError: lastReadError };
+}
+
+if (require.main === module) {
+  http.createServer(async (req, res) => {
+    try {
+      const u = new URL(req.url, 'http://x');
+      if (u.pathname === '/healthz') { res.writeHead(200); res.end('ok'); return; }
+      let html = null;
+      if (u.pathname === '/') html = renderInbox(await collectInbox());
+      else if (u.pathname.startsWith('/a/')) {
+        const eid = u.pathname.slice(3);
+        const [aprs, sts] = await Promise.all([dl(['list', '--kind', 'approval']),
+          dl(['list', '--kind', 'approval_status'])]);
+        html = renderApproval(aprs.find((e) => e.event_id === eid),
+          sts.filter((s) => s.data && s.data.ref === eid));
+      }
+      if (html === null) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+        'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+      res.end(html);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('inbox error: ' + e.message);
+    }
+  }).listen(PORT, '127.0.0.1', () => console.log('dept-inbox on 127.0.0.1:' + PORT));
+}
+module.exports = { renderInbox, renderApproval, summaryOf };
