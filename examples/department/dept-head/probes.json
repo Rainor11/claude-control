@@ -1,0 +1,5 @@
+{ "probes": [
+  { "name": "dept-bus", "source": "ledger", "interval_sec": 60, "timeout_sec": 30,
+    "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/ledger-messages",
+            "--worker", "dept-head"] }
+] }
