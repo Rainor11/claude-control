@@ -20,8 +20,9 @@ DL="$(cd "$(dirname "$0")/../../../bin" && pwd)/dept-ledger"
     // line-safety: любой control-символ (включая \n и \x1e) в полях → пробел
     const clean = (s) => String(s ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
     const body = clean(e.data.body).slice(0, 300);
+    const subj = clean(e.data.subject).slice(0, 200);
     // \x1eebid=<id>\x1e — скрытый стабильный маркер дедупа event-bridge (см. Step 1)
-    console.log(`\x1eebid=${e.event_id}\x1e[dept-message type=${clean(e.data.type)} from=${clean(e.data.from)}] ${clean(e.data.subject)} :: ${body} :: подтвердить: dept-ledger ack ${e.event_id}`);
+    console.log(`\x1eebid=${e.event_id}\x1e[dept-message type=${clean(e.data.type)} from=${clean(e.data.from)}] ${subj} :: ${body} :: подтвердить: dept-ledger ack ${e.event_id}`);
   ' "$line"
 done
 exit 0

@@ -16,4 +16,27 @@ out2="$("$LM" --worker dept-head)"
 eid="$(echo "$out1" | grep -o 'evt_[0-9]*_[a-z0-9]*' | head -1)"
 "$DIR/bin/dept-ledger" ack "$eid" --actor dept-head >/dev/null
 [ -z "$("$LM" --worker dept-head)" ] || { echo 'FAIL: acked сообщение всё ещё эмитится'; exit 1; }
+
+# кап subject: 500-символьная тема не раздувает строку события
+longsubj="$(printf 'ы%.0s' $(seq 1 500))"
+"$DIR/bin/dept-ledger" send --type question --to capworker --subject "$longsubj" --body 'b' --actor mk-x >/dev/null
+caplen="$("$LM" --worker capworker | head -1 | wc -m)"
+[ "$caplen" -lt 700 ] || { echo "FAIL: subject не закапан (длина строки $caplen)"; exit 1; }
+# позиция ebid-маркера: строка НАЧИНАЕТСЯ со скрытого маркера
+"$LM" --worker capworker | head -1 | od -An -c | head -1 | grep -q '^ *036' || { echo 'FAIL: ebid-маркер не в начале строки'; exit 1; }
+
+# нагрузочный смок шины (§14 спеки: валидация до расширения): 10 подписчиков ×
+# 5 сообщений, параллельные вызовы адаптера, после ack повторной выдачи нет
+for w in $(seq 1 10); do for m in $(seq 1 5); do
+  "$DIR/bin/dept-ledger" send --type question --to "load-w$w" --subject "m$m" --body 'x' --actor operator >/dev/null &
+done; done; wait
+for w in $(seq 1 10); do
+  cnt="$("$LM" --worker "load-w$w" | wc -l)"
+  [ "$cnt" = 5 ] || { echo "FAIL: load-w$w получил $cnt событий вместо 5"; exit 1; }
+done
+# параллельный fanout адаптера не мешает друг другу
+for w in $(seq 1 10); do "$LM" --worker "load-w$w" >/dev/null & done; wait
+eids="$("$LM" --worker load-w1 | grep -o 'evt_[0-9]*_[a-z0-9]*' | sort -u)"
+for e in $eids; do "$DIR/bin/dept-ledger" ack "$e" --actor load-w1 >/dev/null; done
+[ -z "$("$LM" --worker load-w1)" ] || { echo 'FAIL: после ack события всё ещё эмитятся'; exit 1; }
 echo PASS

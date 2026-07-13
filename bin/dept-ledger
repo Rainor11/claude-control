@@ -4,12 +4,13 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const HOME = process.env.DEPT_HOME || '/home/rainor/.claude-control/department';
 const LEDGER = path.join(HOME, 'events.jsonl');
 const LOCK = LEDGER + '.lock';
 const KINDS = new Set(['message', 'message_status', 'approval', 'approval_status',
-  'incident', 'incident_status', 'agent_run', 'registry_change']);
+  'incident', 'incident_status', 'agent_run', 'registry_change', 'policy_ack']);
 // обязательные поля data по kind (минимальная схема фазы 1)
 const REQUIRED = {
   message: ['type', 'from', 'to', 'subject'],
@@ -20,9 +21,14 @@ const REQUIRED = {
   incident_status: ['ref', 'status'],
   agent_run: ['worker', 'run_kind'],
   registry_change: ['worker'],
+  policy_ack: ['worker', 'policy_version'],
 };
 const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff']); // §5 спеки; НЕ выдумывать новые
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
+const POLICY_DIR = process.env.DEPT_POLICY_DIR || '/home/rainor/brain/wiki/work/ai-dev/отдел/правила';
+const ACK_TTL_MS = Number(process.env.DEPT_POLICY_ACK_TTL_HOURS || 24) * 3600_000;
+const ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп', 'legacy']);
+const INCIDENT_RESOLVE_STATUSES = ['resolved', 'wontfix', 'duplicate'];
 
 function die(msg) { process.stderr.write(msg + '\n'); process.exit(1); }
 
@@ -139,6 +145,7 @@ function cmdList(args) {
     const k = f.slice(0, eq), v = f.slice(eq + 1);
     rows = rows.filter((e) => String(e.data[k]) === v);
   }
+  if (args.status && !args.kind) die('list: --status работает только вместе с --kind');
   if (args.status) { // effective status для message/approval/incident
     const statusKind = args.kind + '_status';
     rows = rows.filter((e) => effectiveStatus(events, e, statusKind, e.data.status || 'open') === args.status);
@@ -183,7 +190,16 @@ function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 function brief(e) { return { event_id: e.event_id, seq: e.seq }; }
 
 function cmdSend(a) {
-  const data = { type: a.type, from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
+  const from = a.actor || process.env.CLAUDE_AUTO_NAME || 'operator';
+  const reg = readRegistry();
+  const roleOf = (n) => (reg.workers[n] || {}).role;
+  if (roleOf(from) === 'мк' && roleOf(a.to) === 'мк') {
+    die('send: прямое сообщение МК→МК запрещено (policy 3.1) — отправь question руководителю');
+  }
+  if (roleOf(a.to) === 'руководитель' && !['question', 'proposal'].includes(a.type)) {
+    die('send: руководителю идут только question/proposal (§5 спеки) — handoff шли профильному штабному, incident открывай через incident-open');
+  }
+  const data = { type: a.type, from,
     to: a.to, subject: a.subject, body: a.body || '', refs: (a.refs || '').split(',').filter(Boolean) };
   out(brief(appendEvent('message', data, a.actor)));
 }
@@ -193,13 +209,35 @@ function cmdAck(a) {
 function cmdResolve(a) {
   out(brief(appendEvent('message_status', { ref: a._[1], status: a.status }, a.actor)));
 }
+function policyCurrentSafe() { // approval обязан открыться даже без каталога правил
+  try {
+    const files = fs.readdirSync(POLICY_DIR);
+    let best = null;
+    for (const f of files) {
+      const m = /^policy-v(\d+)\.md$/.exec(f);
+      if (m && (!best || Number(m[1]) > best.n)) best = { n: Number(m[1]), f };
+    }
+    return best ? 'v' + best.n : null;
+  } catch { return null; }
+}
 function cmdApprovalOpen(a) {
-  out(brief(appendEvent('approval', { kind_of: a['kind-of'],
+  const data = { kind_of: a['kind-of'],
     from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
-    summary: a.summary, status: 'open' }, a.actor)));
+    summary: a.summary, status: 'open' };
+  if (a.detail) data.detail = String(a.detail).slice(0, 4000);
+  const pv = policyCurrentSafe();
+  if (pv) data.policy_version_seen = pv;
+  out(brief(appendEvent('approval', data, a.actor)));
 }
 function cmdApprovalResolve(a) {
-  out(brief(appendEvent('approval_status', { ref: a._[1], status: a.status }, a.actor)));
+  const ref = a._[1];
+  const events = readAll();
+  const apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
+  if (apr && effectiveStatus(events, apr, 'approval_status', 'open') === a.status) {
+    out({ event_id: ref, deduped: true });
+    return;
+  }
+  out(brief(appendEvent('approval_status', { ref, status: a.status }, a.actor)));
 }
 function cmdIncidentOpen(a) {
   const r = appendEvent('incident', { about_worker: a.about, severity: a.severity,
@@ -231,6 +269,15 @@ function cmdRegistrySet(a) {
         escalates_to: a['escalates-to'] || cur.escalates_to || 'operator',
         mission_version: a['mission-version'] || cur.mission_version || 'v1',
       };
+      const next = reg.workers[name];
+      if (!ROLES.has(next.role)) {
+        const err = new Error(`registry: роль «${next.role}» ∉ {${[...ROLES].join(', ')}}`);
+        err.cliError = true; throw err;
+      }
+      if (next.role === 'мк' && !next.client) {
+        const err = new Error('registry: роль «мк» требует --client');
+        err.cliError = true; throw err;
+      }
       writeRegistry(reg);
       const data = { worker: name, ...reg.workers[name] };
       validateEvent('registry_change', data);
@@ -238,7 +285,7 @@ function cmdRegistrySet(a) {
       return reg.workers[name];
     });
   } catch (e) {
-    if (e && e.registryCorrupt) die(e.message);
+    if (e && (e.registryCorrupt || e.cliError)) die(e.message);
     throw e;
   }
   out(updated);
@@ -257,11 +304,68 @@ function cmdRegistryGet(a) {
 }
 function cmdRegistryList() { process.stdout.write(JSON.stringify(readRegistryStrict()) + '\n'); }
 
+function policyCurrent() {
+  let files;
+  try { files = fs.readdirSync(POLICY_DIR); }
+  catch { die('policy: каталог правил недоступен: ' + POLICY_DIR); }
+  let best = null;
+  for (const f of files) {
+    const m = /^policy-v(\d+)\.md$/.exec(f);
+    if (m && (!best || Number(m[1]) > best.n)) best = { n: Number(m[1]), f };
+  }
+  if (!best) die('policy: в ' + POLICY_DIR + ' нет файлов policy-vN.md');
+  const file = path.join(POLICY_DIR, best.f);
+  return { version: 'v' + best.n, file, mtimeMs: fs.statSync(file).mtimeMs };
+}
+function cmdPolicyCurrent() { const c = policyCurrent(); out({ version: c.version, file: c.file }); }
+function cmdPolicyAck(a) {
+  if (!a.version) die('policy-ack: --version обязателен (какую версию правил ты прочитал)');
+  const cur = policyCurrent();
+  if (a.version !== cur.version) {
+    die(`policy-ack: действующая версия ${cur.version}, ты указал ${a.version} — перечитай ${cur.file} и повтори: dept-ledger policy-ack --version ${cur.version}`);
+  }
+  const worker = a.actor || process.env.CLAUDE_AUTO_NAME || 'operator';
+  out(brief(appendEvent('policy_ack', { worker, policy_version: a.version }, worker)));
+}
+function cmdPolicyCheck(a) {
+  const worker = a.worker || die('policy-check: --worker обязателен');
+  const cur = policyCurrent();
+  const fail = (why) => die(`policy-check: ${why}. Перечитай ${cur.file} и выполни: dept-ledger policy-ack --version ${cur.version} --actor ${worker}`);
+  const acks = readAll().filter((e) => e.kind === 'policy_ack' && e.data.worker === worker);
+  const last = acks[acks.length - 1];
+  if (!last) fail(`у «${worker}» нет ни одного policy-ack`);
+  if (last.data.policy_version !== cur.version) fail(`последний ack на ${last.data.policy_version}, действует ${cur.version}`);
+  const ts = Date.parse(last.ts);
+  if (ts < cur.mtimeMs) fail('правила изменились после последнего прочтения');
+  if (Date.now() - ts > ACK_TTL_MS) fail('последнее прочтение правил слишком старое');
+  out({ ok: true, policy_version: cur.version, acked_at: last.ts });
+}
+function cmdIncidentResolve(a) {
+  const status = a.status || die('incident-resolve: --status обязателен (' + INCIDENT_RESOLVE_STATUSES.join('|') + ')');
+  if (!INCIDENT_RESOLVE_STATUSES.includes(status)) die('incident-resolve: --status ∉ ' + INCIDENT_RESOLVE_STATUSES.join('|'));
+  if (!a._[1]) die('usage: dept-ledger incident-resolve <event_id> --status <s> [--ref-main <event_id основного при duplicate>]');
+  const data = { ref: a._[1], status };
+  if (a['ref-main']) data.ref_main = a['ref-main'];
+  out(brief(appendEvent('incident_status', data, a.actor)));
+}
+function cmdSnapshot() {
+  fs.mkdirSync(HOME, { recursive: true });
+  const g = (...gargs) => execFileSync('git', ['-C', HOME, ...gargs], { encoding: 'utf8' });
+  try { g('rev-parse', '--git-dir'); } catch { g('init'); }
+  if (!g('status', '--porcelain').trim()) { out({ committed: false }); return; }
+  g('add', '-A');
+  g('-c', 'user.email=dept@local', '-c', 'user.name=dept-ledger',
+    'commit', '-m', 'snapshot ' + new Date().toISOString());
+  out({ committed: true });
+}
+
 const HANDLERS = {
   append: cmdAppend, list: cmdList, send: cmdSend, ack: cmdAck, resolve: cmdResolve,
   'approval-open': cmdApprovalOpen, 'approval-resolve': cmdApprovalResolve,
   'incident-open': cmdIncidentOpen,
   'registry-set': cmdRegistrySet, 'registry-get': cmdRegistryGet, 'registry-list': cmdRegistryList,
+  'policy-current': cmdPolicyCurrent, 'policy-ack': cmdPolicyAck, 'policy-check': cmdPolicyCheck,
+  'incident-resolve': cmdIncidentResolve, snapshot: cmdSnapshot,
 };
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
