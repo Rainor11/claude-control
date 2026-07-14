@@ -18,6 +18,10 @@ done
 actor="${CLAUDE_AUTO_NAME:-}"
 [ -n "$actor" ] || { echo 'dept-approve: запускается только из сессии воркера (нет CLAUDE_AUTO_NAME)' >&2; exit 1; }
 [ -n "$kind_of" ] && [ -n "$summary" ] || { echo 'usage: dept-approve --kind-of <k> --summary <s> [--detail <d>]' >&2; exit 1; }
+# Пре-валидация ДО открытия аппрува в ledger: claude-auto-request отвергает summary >400
+# уже ПОСЛЕ approval-open, оставляя orphan-open аппрув (оператор увидит открытый, но
+# никогда не доставленный запрос). Отсекаем здесь, до первой записи в ledger.
+[ "${#summary}" -le 400 ] || { echo 'dept-approve: --summary длиннее 400 символов — сократи (полный текст клади в --detail)' >&2; exit 1; }
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"
 RQ="$BINDIR/claude-auto-request"

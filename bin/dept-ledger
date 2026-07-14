@@ -26,7 +26,11 @@ const REQUIRED = {
 const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff']); // §5 спеки; НЕ выдумывать новые
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
 const POLICY_DIR = process.env.DEPT_POLICY_DIR || '/home/rainor/brain/wiki/work/ai-dev/отдел/правила';
-const ACK_TTL_MS = Number(process.env.DEPT_POLICY_ACK_TTL_HOURS || 24) * 3600_000;
+// Number(garbage) → NaN, а `x > NaN` всегда false — старое `Number(env || 24)` при кривом
+// значении молча ВЫКЛЮЧАЛО TTL (policy-check в cmdPolicyCheck ниже никогда не считал ack
+// протухшим). Guard: невалидное/неположительное значение → дефолт 24, а не NaN.
+const ttlH = Number(process.env.DEPT_POLICY_ACK_TTL_HOURS);
+const ACK_TTL_MS = (Number.isFinite(ttlH) && ttlH > 0 ? ttlH : 24) * 3600_000;
 const ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп', 'legacy']);
 const INCIDENT_RESOLVE_STATUSES = ['resolved', 'wontfix', 'duplicate'];
 

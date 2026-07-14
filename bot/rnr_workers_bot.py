@@ -972,13 +972,15 @@ async def process_approval(bot: Bot, row):
                 await alert_operator(
                     bot, f"❌ Не смог записать denied в ledger отдела (#{qid}): {detail}. "
                          f"Аппрув в ledger остаётся open; воркер НЕ уведомлён.")
-                rnr_db.mark_exec_failed(qid, detail)
-                # mark_notified (not just mark_exec_failed): status is now 'failed' with
-                # notified_at still NULL, which would make the generic "executed/failed →
-                # notify" fallback below re-pick this row later and tell the worker
-                # approved=True — wrong, since that fallback assumes 'failed' only ever
-                # follows an APPROVED exec. This closes the loop without notifying anyone else.
+                # mark_notified BEFORE mark_exec_failed: next_actionable() gates re-processing
+                # solely on notified_at IS NULL (status is not part of that guard). If we set
+                # notified_at first and the process crashes right after, the row is left at
+                # status='denied' (stale label, harmless) with notified_at SET — never re-picked.
+                # The reverse order has a real crash window of status='failed' + notified_at=NULL,
+                # which the generic "executed/failed → notify" fallback below would then re-pick
+                # and tell the worker approved=True — wrong, since this was actually a denial.
                 rnr_db.mark_notified(qid)
+                rnr_db.mark_exec_failed(qid, detail)
                 return
         await notify_worker_outcome(bot, row, approved=False, ok=None, detail="")
         return

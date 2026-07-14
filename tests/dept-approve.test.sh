@@ -63,4 +63,12 @@ eid3="$(echo "$out3" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("en
 grep -q "RQ_CALLED --action dept-approval --event-id $eid3 --summary с деталями и запросом --detail деталь для бота" "$MOCK_LOG" \
   || { echo 'FAIL: claude-auto-request не получил --detail вместе с --event-id/--summary'; exit 1; }
 
+# summary длиннее 400 символов — пре-валидация ДО открытия аппрува в ledger (иначе orphan-open:
+# claude-auto-request отвергает >400 уже ПОСЛЕ записи в ledger)
+long_summary="$(printf 'A%.0s' $(seq 1 401))"
+if CLAUDE_AUTO_NAME=mk-prodmash "$SANDBOX/dept-approve" --kind-of outgoing --summary "$long_summary" 2>/dev/null; then
+  echo 'FAIL: dept-approve принял summary длиннее 400 символов'; exit 1
+fi
+"$DIR/bin/dept-ledger" list --kind approval --filter "summary=$long_summary" | grep -q . && { echo 'FAIL: аппрув с длинным summary всё же создан в ledger'; exit 1; }
+
 echo PASS

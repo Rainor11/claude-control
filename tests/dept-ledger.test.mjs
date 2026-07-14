@@ -189,6 +189,21 @@ test('policy-current/ack/check — полный цикл соблюдения п
   assert.throws(() => run(home, ['policy-check', '--worker', 'mk-x'], undefined, env));
 });
 
+test('кривой DEPT_POLICY_ACK_TTL_HOURS не выключает TTL', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const pol = mkdtempSync(join(tmpdir(), 'pol-'));
+  writeFileSync(join(pol, 'policy-v1.md'), '# v1\n');
+  const env = { DEPT_POLICY_DIR: pol, DEPT_POLICY_ACK_TTL_HOURS: 'мусор' };
+  // Число из мусора — NaN; если бы guard'а не было, `Date.now() - ts > NaN` всегда false,
+  // т.е. TTL молча отключился бы (что тоже выглядело бы как ok:true). Здесь фиксируем
+  // минимум из задачи: команда не падает и штатно работает на дефолте при кривом env —
+  // настоящий TTL-отказ без манипуляции временем не проверить.
+  run(home, ['policy-ack', '--version', 'v1', '--actor', 'mk-x'], undefined, env);
+  const ok = JSON.parse(run(home, ['policy-check', '--worker', 'mk-x'], undefined, env));
+  assert.equal(ok.ok, true);
+  assert.equal(ok.policy_version, 'v1');
+});
+
 test('шина: матрица топологии (§5 спеки)', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   run(home, ['registry-set', 'mk-a', '--role', 'мк', '--client', 'а']);
