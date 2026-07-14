@@ -5,6 +5,7 @@
 ## allow
 - Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)
 - Bash(/opt/projects/active/claude-control/bin/dept-approve:*)
+- Bash(/opt/projects/active/claude-control/bin/claude-auto-self-probes:*)
 - Edit(//home/rainor/brain/wiki/work/ai-dev/клиенты/вам-мебель/**)
 - Write(//home/rainor/brain/wiki/work/ai-dev/клиенты/вам-мебель/**)
 

@@ -19,7 +19,8 @@
    одинарный `/` в Claude Code означает путь от корня проекта и НЕ сматчит
    абсолютный.
    - всем: allow `Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)`,
-     `Bash(/opt/projects/active/claude-control/bin/dept-approve:*)`; deny
+     `Bash(/opt/projects/active/claude-control/bin/dept-approve:*)`,
+     `Bash(/opt/projects/active/claude-control/bin/claude-auto-self-probes:*)` (свои датчики — self-service); deny
      `Bash(sudo:*)`, `AskUserQuestion` (интерактивный вопрос в сессии — оператор
      его не увидит; вопросы оператору только через claude-auto-ask, кнопки в TG);
      исходящие людям — НЕ разрешать (гейт через dept-approve).

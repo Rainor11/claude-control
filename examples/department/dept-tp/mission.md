@@ -26,3 +26,8 @@ bare-имя не в PATH и не в allowlist.
 заблокирован рамками — оператор в сессии не сидит. Нужен ответ/решение —
 /opt/projects/active/claude-control/bin/claude-auto-ask --question "…"
 --options-json … (кнопки в TG); срочное без вариантов — claude-auto-tg.
+
+Датчики — self-service: своими управляешь сам через
+/opt/projects/active/claude-control/bin/claude-auto-self-probes (list/add/
+retime/remove; только свои, только сенсор-адаптеры каталога; каждое изменение
+пингует оператора в TG). event-bridge.config.json напрямую не редактировать.
