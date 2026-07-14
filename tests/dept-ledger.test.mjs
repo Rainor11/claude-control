@@ -1,9 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, utimesSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileP = promisify(execFile);
 
 const CLI = new URL('../bin/dept-ledger', import.meta.url).pathname;
 const run = (home, args, input, extraEnv = {}) =>
@@ -257,6 +260,23 @@ test('approval-resolve идемпотентен: повторный resolve те
   assert.equal(run(home, ['list', '--kind', 'approval_status']).trim().split('\n').length, 2);
 });
 
+test('approval-resolve: два параллельных resolve одним статусом дают ровно одно событие (атомарность под локом)', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'other', '--summary', 's']));
+  const resolveOnce = () => execFileP(CLI, ['approval-resolve', a.event_id, '--status', 'approved'],
+    { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
+  // старый баг: дедуп-чтение (readAll + effectiveStatus) происходило ДО withLock — гонка
+  // двух resolve могла дать ОБОИМ увидеть "ещё не resolved" раньше, чем любой из них
+  // дописывал событие, и оба писали approval_status (дубль). Теперь readAll + решение
+  // deduped/write — под одним withLock, так что второй вызов застаёт уже записанный статус.
+  const [{ stdout: o1 }, { stdout: o2 }] = await Promise.all([resolveOnce(), resolveOnce()]);
+  const results = [JSON.parse(o1), JSON.parse(o2)];
+  const rows = run(home, ['list', '--kind', 'approval_status']).trim().split('\n');
+  assert.equal(rows.length, 1); // ровно одна запись, несмотря на два одновременных resolve
+  assert.equal(results.filter((r) => r.deduped === true).length, 1);
+  assert.equal(results.filter((r) => r.deduped !== true).length, 1);
+});
+
 test('registry-set валидирует роль и клиента для мк', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   assert.throws(() => run(home, ['registry-set', 'x', '--role', 'посторонний']));
@@ -279,6 +299,33 @@ test('incident-resolve закрывает инцидент; duplicate несёт
   run(home, ['incident-resolve', d.event_id, '--status', 'duplicate', '--ref-main', r.event_id]);
   const st = run(home, ['list', '--kind', 'incident_status']).trim().split('\n').map(JSON.parse);
   assert.equal(st[st.length - 1].data.ref_main, r.event_id);
+});
+
+test('incident-resolve: --status duplicate без --ref-main отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const r = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 's']));
+  assert.throws(() => run(home, ['incident-resolve', r.event_id, '--status', 'duplicate']));
+});
+
+test('incident-resolve: --ref-main на несуществующий event_id отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const r = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 's']));
+  assert.throws(() => run(home, ['incident-resolve', r.event_id, '--status', 'duplicate', '--ref-main', 'evt_0_none']));
+});
+
+test('incident-resolve: --ref-main на событие не-incident kind отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const r = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 's']));
+  const m = JSON.parse(run(home, ['send', '--type', 'question', '--to', 'руководитель',
+    '--subject', 's', '--actor', 'x']));
+  assert.throws(() => run(home, ['incident-resolve', r.event_id, '--status', 'duplicate', '--ref-main', m.event_id]));
+});
+
+test('incident-resolve: --ref-main без --status duplicate отклоняется', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const r = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 's']));
+  const d = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 'd']));
+  assert.throws(() => run(home, ['incident-resolve', d.event_id, '--status', 'resolved', '--ref-main', r.event_id]));
 });
 
 test('approval-open --detail сохраняет detail и policy_version_seen', () => {

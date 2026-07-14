@@ -3,9 +3,37 @@
 # structured-approval бота (@RnR_Workers, карточка ✅/❌). Решение в ledger
 # записывает БОТ (approval-resolve) — воркер сам аппрув НЕ закрывает, а ждёт
 # инжект исхода и действует по нему.
-# WORKER-ONLY: идентичность — из CLAUDE_AUTO_NAME (ставит супервизор); флага
-# --actor нет намеренно (он позволял бы обходить policy-турникет подменой имени).
+# WORKER-ONLY: идентичность — spoof-resistant /proc-предок (resolve_name,
+# дословно из claude-auto-request), НЕ env CLAUDE_AUTO_NAME текущего процесса.
+# Раньше идентичность читалась из env CLAUDE_AUTO_NAME напрямую — лазейка:
+# `CLAUDE_AUTO_NAME=чужое dept-approve …` подписывался чужим именем и обходил
+# policy-турникет. resolve_name() поднимается по /proc-предкам до процесса с
+# `--resume` в cmdline и exe внутри доверенного CLAUDE_INSTALL, и читает
+# CLAUDE_AUTO_NAME из ЕГО собственного /proc/<pid>/environ — подмена в своём
+# окружении ничего не даёт. Флага --actor нет намеренно (он позволял бы
+# обходить policy-турникет подменой имени).
 set -euo pipefail
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
+
+# ---- identity (spoof-resistant) — дословно из claude-auto-request resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
 kind_of="" summary="" detail=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -15,8 +43,11 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
-actor="${CLAUDE_AUTO_NAME:-}"
-[ -n "$actor" ] || { echo 'dept-approve: запускается только из сессии воркера (нет CLAUDE_AUTO_NAME)' >&2; exit 1; }
+# DEPT_APPROVE_TEST_ACTOR — тестовый bypass ТОЛЬКО для tests/dept-approve.test.sh (там нет
+# настоящего /proc-предка с --resume). Боевые рамки (supervisor/tmux воркера) её не
+# выставляют — в проде единственный источник identity — resolve_name().
+actor="$(resolve_name)" || actor="${DEPT_APPROVE_TEST_ACTOR:-}"
+[ -n "$actor" ] || { echo 'dept-approve: запускается только из сессии воркера' >&2; exit 1; }
 [ -n "$kind_of" ] && [ -n "$summary" ] || { echo 'usage: dept-approve --kind-of <k> --summary <s> [--detail <d>]' >&2; exit 1; }
 # Пре-валидация ДО открытия аппрува в ledger: claude-auto-request отвергает summary >400
 # уже ПОСЛЕ approval-open, оставляя orphan-open аппрув (оператор увидит открытый, но

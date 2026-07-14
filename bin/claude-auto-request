@@ -13,16 +13,28 @@
 #                                                    permanently whitelisting (TG only)
 #   mcp-add          --server <name>                add an MCP server (from the catalog
 #                                                    ONLY) to MY subscription + restart me
-#   dept-approval    --event-id evt_… --summary '<s>' [--detail '<d>']
+#   dept-approval    --event-id evt_… [--summary '<s>'] [--detail '<d>']
 #                                                    ask the operator to resolve a
 #                                                    department-ledger approval (bot writes
-#                                                    approval-resolve itself, not me)
+#                                                    approval-resolve itself, not me).
+#                                                    --summary/--detail are OPTIONAL and
+#                                                    advisory only — the card is always
+#                                                    built from the CANONICAL summary/detail
+#                                                    read straight from the ledger by
+#                                                    event_id (a mismatching caller value is
+#                                                    ignored with a stderr warning): the bot
+#                                                    resolves BY event_id, so trusting the
+#                                                    caller's text would let it show the
+#                                                    operator one thing and resolve another.
 #
 # Operator-only BY CONSTRUCTION (same guarantees as claude-auto-ask):
 #   * worker identity is the spoof-resistant /proc ancestor (resolve_name), NOT
 #     CLAUDE_AUTO_NAME — so the request is bound to THIS worker's own name/whitelist;
 #   * recipient (operator chat_id) is read from a FIXED absolute .env;
-#   * this helper writes only an 'open' approvals row — it cannot whitelist or send.
+#   * this helper writes only an 'open' approvals row — it cannot whitelist or send;
+#   * dept-approval's card text is read canonically from the ledger (see above), not
+#     trusted from the caller's argv — anti-forge for the one action that resolves
+#     something the caller doesn't own outright (a department-ledger approval).
 #
 # Usage (worker-facing):
 #   claude-auto-request --action whitelist-add  --entry email:a@b.ru --reason '…'
@@ -36,6 +48,8 @@ set -u
 OPERATOR_ENV="/home/rainor/server/.env"
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
 DB="/opt/projects/active/claude-control/bot/rnr_db.py"
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DEPT_LEDGER_BIN="$BINDIR/dept-ledger"                     # canonical source for dept-approval card text
 MCP_CATALOG_FILE="${MCP_CATALOG_FILE:-$HOME/.claude.json}"  # MCP catalog (source of truth)
 BODY_MAX=2000
 REASON_MAX=400
@@ -150,7 +164,44 @@ case "$ACTION" in
     # bot resolves it (approval-resolve) on decision — no reason field for this action.
     [ -n "$EVENT_ID" ] || die "--event-id required for dept-approval"
     printf '%s' "$EVENT_ID" | grep -qE '^evt_[0-9]+_[a-z0-9]{4}$' || die "malformed --event-id: '$EVENT_ID'"
-    [ -n "$SUMMARY" ] || die "--summary required for dept-approval"
+    # Canonical card text comes from the ledger, NEVER from the caller's --summary/--detail:
+    # the bot resolves this approval BY event_id (exec_dept_resolve in rnr_workers_bot.py),
+    # not by matching the card text — so if the caller could freely set what the operator
+    # reads, it could show one thing and have a DIFFERENT (or already-closed/stale) approval
+    # resolved. --status open scopes the lookup to kind=approval AND currently-open in one
+    # shot (die below covers: not found / wrong kind / already resolved — all indistinguishable
+    # from "not currently an open approval under this event_id", which is the actual invariant
+    # we need).
+    [ -x "$DEPT_LEDGER_BIN" ] || die "dept-approval: dept-ledger недоступен ($DEPT_LEDGER_BIN)"
+    canon_list="$("$DEPT_LEDGER_BIN" list --kind approval --status open)" \
+      || die "dept-approval: dept-ledger list не удался"
+    canon_summary="$(CANON_LIST="$canon_list" CANON_EVENT_ID="$EVENT_ID" node -e '
+      const id = process.env.CANON_EVENT_ID;
+      for (const line of (process.env.CANON_LIST || "").split("\n")) {
+        if (!line.trim()) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        if (e.event_id === id && e.kind === "approval") { process.stdout.write(e.data.summary || ""); process.exit(0); }
+      }
+      process.exit(1);
+    ')" || die "dept-approval: аппрув '$EVENT_ID' не найден среди открытых в ledger (не существует, не approval, или уже resolved) — карточка не может быть построена"
+    canon_detail="$(CANON_LIST="$canon_list" CANON_EVENT_ID="$EVENT_ID" node -e '
+      const id = process.env.CANON_EVENT_ID;
+      for (const line of (process.env.CANON_LIST || "").split("\n")) {
+        if (!line.trim()) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        if (e.event_id === id && e.kind === "approval") { process.stdout.write(e.data.detail || ""); process.exit(0); }
+      }
+      process.exit(1);
+    ')"
+    # caller-supplied --summary/--detail are now optional and purely advisory: a mismatch
+    # is warned about (so a divergent caller is visible in logs) but never trusted — the
+    # ledger's own record always wins.
+    [ -n "$SUMMARY" ] && [ "$SUMMARY" != "$canon_summary" ] && \
+      echo "claude-auto-request: warning: dept-approval caller --summary расходится с ledger — использую каноническую версию из ledger" >&2
+    [ -n "$DETAIL" ] && [ "$DETAIL" != "$canon_detail" ] && \
+      echo "claude-auto-request: warning: dept-approval caller --detail расходится с ledger — использую каноническую версию из ledger" >&2
+    SUMMARY="$canon_summary"
+    DETAIL="$canon_detail"
     # strip control bytes first (mirrors --body/--reason below) so invisible padding can't
     # trip the length die, then cap — summary is a headline the operator decides from, so an
     # oversized one is REJECTED (not silently mangled, unlike the more free-form detail).
