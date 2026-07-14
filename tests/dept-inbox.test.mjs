@@ -49,3 +49,10 @@ test('renderApproval без readError (два аргумента) — банне
   assert.ok(!renderApproval(apr, []).includes('Ошибка чтения журнала'));
   assert.ok(!renderApproval(null, []).includes('Ошибка чтения журнала'));
 });
+
+test('кривой/отсутствующий ts рисуется как «?», а не NaN', () => {
+  const bad = { ...apr, ts: undefined };
+  const html = renderApproval(bad, []);
+  assert.ok(!html.includes('NaN'), 'NaN просочился в возраст');
+  assert.ok(html.includes('(? назад)'));
+});

@@ -107,8 +107,29 @@ function validateEvent(kind, data) {
   if (kind === 'message' && data.status === undefined) data.status = 'queued';
 }
 
+// Писатель, упавший посреди append (crash/disk-full), оставляет хвост БЕЗ '\n' —
+// следующий append склеился бы с ним, и ОБЕ строки стали бы нечитаемыми (новое
+// событие подтверждено вызывающему, но навсегда выпадает из readAll). Чиним хвост
+// под уже взятым локом: дописываем '\n', частичная строка остаётся изолированно-битой.
+function repairTailUnlocked() {
+  let fd;
+  try {
+    const size = fs.statSync(LEDGER).size;
+    if (!size) return;
+    const buf = Buffer.alloc(1);
+    fd = fs.openSync(LEDGER, 'r');
+    fs.readSync(fd, buf, 0, 1, size - 1);
+    if (buf[0] !== 0x0a) fs.appendFileSync(LEDGER, '\n');
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e; // журнала ещё нет — чинить нечего
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
 // Сама запись строки в журнал. ПРЕДПОЛАГАЕТ, что лок уже взят вызывающим (withLock).
 function writeEventUnlocked(kind, data, actor) {
+  repairTailUnlocked();
   const events = readAll();
   const seq = events.length ? events[events.length - 1].seq + 1 : 1;
   const e = {
@@ -353,14 +374,24 @@ function cmdIncidentResolve(a) {
   out(brief(appendEvent('incident_status', data, a.actor)));
 }
 function cmdSnapshot() {
-  fs.mkdirSync(HOME, { recursive: true });
   const g = (...gargs) => execFileSync('git', ['-C', HOME, ...gargs], { encoding: 'utf8' });
-  try { g('rev-parse', '--git-dir'); } catch { g('init'); }
-  if (!g('status', '--porcelain').trim()) { out({ committed: false }); return; }
-  g('add', '-A');
-  g('-c', 'user.email=dept@local', '-c', 'user.name=dept-ledger',
-    'commit', '-m', 'snapshot ' + new Date().toISOString());
-  out({ committed: true });
+  // Под ledger-локом: (а) git add не читает журнал посреди append (torn line в
+  // аудит-коммите — detail до 4000 симв. пишется в несколько страниц), (б) два
+  // snapshot'а (таймер + ручной) сериализуются, а не бьются об index.lock.
+  const res = withLock(() => {
+    try { g('rev-parse', '--git-dir'); } catch { g('init'); }
+    // Пока snapshot держит лок, events.jsonl.lock существует — без ignore каждый
+    // прогон коммитил бы лок-файл и никогда не был бы «чистым». Не перетираем
+    // существующий .gitignore (в живом каталоге он свой, шире).
+    const gi = path.join(HOME, '.gitignore');
+    if (!fs.existsSync(gi)) fs.writeFileSync(gi, '*.lock\n*.tmp\n');
+    if (!g('status', '--porcelain').trim()) return { committed: false };
+    g('add', '-A');
+    g('-c', 'user.email=dept@local', '-c', 'user.name=dept-ledger',
+      'commit', '-m', 'snapshot ' + new Date().toISOString());
+    return { committed: true };
+  });
+  out(res);
 }
 
 const HANDLERS = {

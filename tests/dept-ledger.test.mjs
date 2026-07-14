@@ -68,6 +68,23 @@ test('битая строка в журнале пропускается, seq п
   assert.equal(rows.length, 2);
 });
 
+test('оборванный хвост без \\n чинится: следующее событие не склеивается с ним', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  run(home, ['append', '--kind', 'incident',
+    '--data', '{"about_worker":"x","severity":"high","summary":"first"}']);
+  // крэш посреди append: частичная строка БЕЗ перевода строки
+  appendFileSync(join(home, 'events.jsonl'), '{"v":1,"event_id":"evt_partial');
+  const res = spawnSync(CLI, ['append', '--kind', 'incident',
+    '--data', '{"about_worker":"y","severity":"low","summary":"second"}'],
+    { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  // без repairTail новое событие приклеивалось к частичной строке и навсегда
+  // выпадало из readAll (хотя caller получил event_id/seq)
+  const rows = run(home, ['list', '--kind', 'incident']).trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].data.summary, 'second');
+});
+
 test('*_status с несуществующим ref отклоняется', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   assert.throws(() => run(home, ['append', '--kind', 'message_status',
@@ -289,4 +306,9 @@ test('snapshot коммитит журнал и молчит без измене
   assert.equal(s2.committed, false);
   const log = execFileSync('git', ['-C', home, 'log', '--oneline'], { encoding: 'utf8' });
   assert.equal(log.trim().split('\n').length, 1);
+  // snapshot идёт под ledger-локом → лок-файл существует в момент git add и обязан
+  // игнорироваться (иначе каждый прогон коммитит его и никогда не бывает «чистым»)
+  const tracked = execFileSync('git', ['-C', home, 'ls-files'], { encoding: 'utf8' });
+  assert.ok(!tracked.includes('events.jsonl.lock'), `лок закоммичен: ${tracked}`);
+  assert.ok(tracked.includes('.gitignore'));
 });

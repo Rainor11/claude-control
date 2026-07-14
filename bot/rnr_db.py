@@ -118,19 +118,40 @@ def _init(conn):
 
 # ---- writers (bash CLI + poller) -------------------------------------------
 
+def _sane_text(s):
+    """Free-text argv that crossed the process boundary may carry lone surrogates:
+    the bash helpers truncate with byte-oriented tools (`cut -c` cuts BYTES and can
+    split a UTF-8 char in half), and python decodes argv with surrogateescape.
+    sqlite3 refuses to bind such a str (UnicodeEncodeError: surrogates not allowed),
+    which used to crash the whole insert — the request/ask was lost. Replace the
+    undecodable tail with U+FFFD instead of failing the write."""
+    if not isinstance(s, str):
+        return s
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        pass
+    try:  # surrogateescape'd raw bytes → back to bytes → strict-decode with '�'
+        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:  # other lone surrogates (not from fsdecode)
+        return s.encode("utf-8", "replace").decode("utf-8")
+
+
 def insert_ask(qid, kind, worker, tmux_target, chat_id, question, options_json):
     # Validate options_json is a JSON array of strings (defensive — bash already
     # validated, but never trust the input that crosses a process boundary).
     opts = json.loads(options_json) if options_json else []
     if not isinstance(opts, list) or not all(isinstance(x, str) for x in opts):
         raise ValueError("options_json must be a JSON array of strings")
+    opts = [_sane_text(x) for x in opts]
     conn = connect()
     try:
         with conn:
             conn.execute(
                 "INSERT INTO asks (qid,kind,worker,tmux_target,chat_id,question,options_json,status,created_at) "
                 "VALUES (?,?,?,?,?,?,?,'open',?)",
-                (qid, kind, worker, tmux_target, int(chat_id), question,
+                (qid, kind, worker, tmux_target, int(chat_id), _sane_text(question),
                  json.dumps(opts, ensure_ascii=False), now_iso()),
             )
     finally:
@@ -291,7 +312,7 @@ def insert_approval(qid, worker, tmux_target, chat_id, action,
                 "(qid,worker,tmux_target,chat_id,action,arg_kind,arg_value,payload,reason,status,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,'open',?)",
                 (qid, worker, tmux_target, int(chat_id), action, arg_kind,
-                 arg_value, payload, reason, now_iso()),
+                 _sane_text(arg_value), _sane_text(payload), _sane_text(reason), now_iso()),
             )
     finally:
         conn.close()

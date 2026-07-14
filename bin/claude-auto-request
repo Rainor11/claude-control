@@ -44,6 +44,13 @@ DETAIL_MAX=2000
 
 die() { echo "claude-auto-request: $*" >&2; exit 1; }
 
+# UTF-8-safe truncation to N CHARS. `cut -c` cuts BYTES and can split a multibyte
+# char in half — the resulting lone-surrogate argv used to crash the sqlite insert
+# (UnicodeEncodeError) and the whole request with it. python3 is already required.
+utf8_trunc() {
+  python3 -c 'import sys;sys.stdout.buffer.write(sys.stdin.buffer.read().decode("utf-8","replace")[:int(sys.argv[1])].encode("utf-8"))' "$1"
+}
+
 # ---- identity (spoof-resistant) — mirrors claude-auto-send/self-probes resolve_name --
 resolve_name() {
   local pid="$PPID" depth=0 nm exe
@@ -123,7 +130,7 @@ case "$ACTION" in
     [ "$ARG_KIND" = tg ] || die "one-time-send supports only TG in v1 (--to tg:<id>); for email use --action whitelist-add"
     [ -n "$BODY" ] || die "--body '<text>' required for one-time-send"
     # strip control bytes (keep tab/newline), cap (bidi-strip happens in the bot's renderer)
-    PAYLOAD="$(printf '%s' "$BODY" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$BODY_MAX")"
+    PAYLOAD="$(printf '%s' "$BODY" | tr -d '\000-\010\013\014\016-\037' | utf8_trunc "$BODY_MAX")"
     [ -n "${PAYLOAD//[[:space:]]/}" ] || die "--body is empty after sanitization"
     ;;
   mcp-add)
@@ -149,7 +156,7 @@ case "$ACTION" in
     # oversized one is REJECTED (not silently mangled, unlike the more free-form detail).
     SUMMARY="$(printf '%s' "$SUMMARY" | tr -d '\000-\010\013\014\016-\037')"
     [ "${#SUMMARY}" -le "$SUMMARY_MAX" ] || die "--summary too long (>${SUMMARY_MAX} chars)"
-    [ -n "$DETAIL" ] && DETAIL="$(printf '%s' "$DETAIL" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$DETAIL_MAX")"
+    [ -n "$DETAIL" ] && DETAIL="$(printf '%s' "$DETAIL" | tr -d '\000-\010\013\014\016-\037' | utf8_trunc "$DETAIL_MAX")"
     ARG_KIND=event_id; ARG_VALUE="$EVENT_ID"
     PAYLOAD="$SUMMARY"
     [ -n "$DETAIL" ] && PAYLOAD="$SUMMARY
@@ -160,7 +167,7 @@ esac
 
 # ---- reason (sanitize, cap) ----
 if [ -n "$REASON" ]; then
-  REASON="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-"$REASON_MAX")"
+  REASON="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | utf8_trunc "$REASON_MAX")"
 fi
 
 # ---- operator chat_id (fixed; not worker-controlled) ----
