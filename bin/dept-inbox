@@ -50,7 +50,8 @@ body{font:15px/1.5 system-ui,sans-serif;margin:1rem auto;max-width:60rem;padding
 table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}
 td,th{border-bottom:1px solid #2c313a;padding:.35rem .5rem;text-align:left;vertical-align:top}
 th{color:#8b93a1;font-weight:600} a{color:#7ab7ff} h1{font-size:1.4rem} h2{margin:1.2rem 0 .3rem;font-size:1.1rem}
-.meta{color:#7b8290} blockquote{border-left:3px solid #3a4150;margin:.5rem 0;padding:.2rem .8rem;white-space:pre-wrap}
+.meta{color:#7b8290} pre.diff{background:#0d1117;border:1px solid #2c313a;padding:.6rem .8rem;overflow-x:auto;line-height:1.35;font-size:13px}
+.da{color:#7ee787}.dd{color:#ff8f7a}.dh{color:#8b93a1}.dc{color:#c8ccd4} blockquote{border-left:3px solid #3a4150;margin:.5rem 0;padding:.2rem .8rem;white-space:pre-wrap}
 </style></head><body><h1>Цифровой отдел</h1>${body}</body></html>`;
 }
 
@@ -80,6 +81,19 @@ function renderInbox(d) {
 <table><tr><th>когда (UTC)</th><th>кто</th><th>вид</th><th>что</th></tr>${rec}</table>`);
 }
 
+
+// detail с видом unified diff рендерим раскрашенным построчно; прочее — blockquote
+function renderDetail(detail) {
+  if (!detail) return '<p class="meta">детали не приложены</p>';
+  const looksDiff = /^(@@ |--- |\+\+\+ )/m.test(detail);
+  if (!looksDiff) return `<blockquote>${esc(detail)}</blockquote>`;
+  const rows = detail.split('\n').map((l) => {
+    const c = l.startsWith('+') ? 'da' : l.startsWith('-') ? 'dd' : l.startsWith('@@') ? 'dh' : 'dc';
+    return `<span class="${c}">${esc(l)}</span>`;
+  }).join('\n');
+  return `<pre class="diff">${rows}</pre>`;
+}
+
 function renderApproval(e, statuses, readError) {
   if (!e) {
     // при ошибке чтения НЕ выдавать «не найдено» — реальное состояние аппрува неизвестно
@@ -94,7 +108,7 @@ function renderApproval(e, statuses, readError) {
 <p><a href="/">← в инбокс</a></p>
 <h2>${esc(e.data.summary)}</h2>
 <p class="meta">${esc(e.event_id)} · от ${esc(e.data.from)} · тип ${esc(e.data.kind_of)} · открыт ${esc(e.ts)} (${esc(age(e.ts))} назад) · статус: <b>${esc(st)}</b></p>
-${e.data.detail ? `<blockquote>${esc(e.data.detail)}</blockquote>` : '<p class="meta">детали не приложены</p>'}
+${renderDetail(e.data.detail)}
 ${hist ? `<h2>История</h2><ul>${hist}</ul>` : ''}
 <p class="meta">Решение — кнопками в Telegram (@RnR_Workers). Эта страница только показывает.</p>`);
 }

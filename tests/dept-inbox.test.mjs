@@ -56,3 +56,11 @@ test('кривой/отсутствующий ts рисуется как «?», 
   assert.ok(!html.includes('NaN'), 'NaN просочился в возраст');
   assert.ok(html.includes('(? назад)'));
 });
+
+test('renderApproval раскрашивает unified diff построчно', () => {
+  const d = { ...apr, data: { ...apr.data, detail: '--- a\n+++ b\n@@ -1 +1 @@\n-старое\n+новое\n контекст' } };
+  const html = renderApproval(d, []);
+  assert.ok(html.includes('<pre class="diff">'));
+  assert.ok(html.includes('<span class="da">+новое</span>'));
+  assert.ok(html.includes('<span class="dd">-старое</span>'));
+});

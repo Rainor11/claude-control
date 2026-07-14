@@ -249,7 +249,7 @@ function cmdApprovalOpen(a) {
   const data = { kind_of: a['kind-of'],
     from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
     summary: a.summary, status: 'open' };
-  if (a.detail) data.detail = String(a.detail).slice(0, 4000);
+  if (a.detail) data.detail = String(a.detail).slice(0, 20000);
   const pv = policyCurrentSafe();
   if (pv) data.policy_version_seen = pv;
   out(brief(appendEvent('approval', data, a.actor)));

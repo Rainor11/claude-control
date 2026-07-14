@@ -779,9 +779,13 @@ def render_approval(row):
         srv = _clean(str(row.get("arg_value")))
         lines.append(f"MCP-сервер: <code>{esc(srv)}</code>")
     elif action == "dept-approval":
-        lines.append(f"Аппрув отдела: <code>{esc(_clean(str(row.get('arg_value'))))}</code>")
+        eid = _clean(str(row.get("arg_value")))
+        lines.append(f"Аппрув отдела: <code>{esc(eid)}</code>")
         if row.get("payload"):
             lines.append(f"<blockquote>{esc(_clean(row['payload']))}</blockquote>")
+        # TG card is a preview (payload is truncated upstream); the inbox card
+        # carries the full untruncated detail — always link it.
+        lines.append(f'📄 <a href="https://dept.alp-ai.ru/a/{esc(eid)}">Полный текст — в инбоксе отдела</a>')
     if row.get("reason"):
         lines.append(f"\n💬 <i>Причина (со слов воркера): {esc(_clean(row['reason']))}</i>")
     if action == "mcp-add":
