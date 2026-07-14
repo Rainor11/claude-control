@@ -10,6 +10,7 @@
 
 ## deny
 - Bash(sudo:*)
+- AskUserQuestion
 - Edit(//home/rainor/brain/wiki/work/ai-dev/отдел/**)
 - Write(//home/rainor/brain/wiki/work/ai-dev/отдел/**)
 - Edit(//home/rainor/brain/wiki/work/ai-dev/продукты/**)

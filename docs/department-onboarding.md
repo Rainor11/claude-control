@@ -20,7 +20,9 @@
    абсолютный.
    - всем: allow `Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)`,
      `Bash(/opt/projects/active/claude-control/bin/dept-approve:*)`; deny
-     `Bash(sudo:*)`; исходящие людям — НЕ разрешать (гейт через dept-approve).
+     `Bash(sudo:*)`, `AskUserQuestion` (интерактивный вопрос в сессии — оператор
+     его не увидит; вопросы оператору только через claude-auto-ask, кнопки в TG);
+     исходящие людям — НЕ разрешать (гейт через dept-approve).
    - dept-head: deny `Edit(//home/rainor/brain/**)`, `Write(//home/rainor/brain/**)`
      — руководитель ничего не пишет в файлы, только шина.
    - dept-archivist: allow Edit/Write ТОЛЬКО

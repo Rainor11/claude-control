@@ -29,3 +29,8 @@ Asana-сделка: https://app.asana.com/0/0/1216237103615549
 ВАЖНО: dept-ledger и dept-approve вызывай ТОЛЬКО по абсолютному пути
 (/opt/projects/active/claude-control/bin/dept-ledger, …/bin/dept-approve) —
 bare-имя не в PATH и не в allowlist.
+
+Вопросы оператору: интерактивный вопрос в сессии (AskUserQuestion) ЗАПРЕЩЁН и
+заблокирован рамками — оператор в сессии не сидит. Нужен ответ/решение —
+/opt/projects/active/claude-control/bin/claude-auto-ask --question "…"
+--options-json … (кнопки в TG); срочное без вариантов — claude-auto-tg.
