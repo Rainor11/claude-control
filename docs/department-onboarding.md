@@ -40,7 +40,12 @@
      `Edit(//opt/projects/active/claude-control/bin/**)`,
      `Write(//opt/projects/active/claude-control/bin/**)`, то же для
      `//opt/projects/active/claude-control/bot/**` и
-     `//opt/projects/active/claude-control/channels/event-bridge/**`.
+     `//opt/projects/active/claude-control/channels/event-bridge/**`;
+     плюс deny записи секретов и канала алертов: `Edit(**/.env*)`,
+     `Write(**/.env*)`, `Edit(//home/rainor/server/server_monitor/**)`,
+     `Write(//home/rainor/server/server_monitor/**)` — чтение `.env*` уже
+     закрыто baseline-deny adopt; значения секретов воркеру не светим,
+     ротацию токенов делает оператор.
      Автоматический self-protection (adopt) закрывает `~/.claude-control/`,
      собственный workers-каталог И весь репозиторий
      `/opt/projects/active/claude-control/**` целиком — три явных deny выше
