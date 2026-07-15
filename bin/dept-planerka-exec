@@ -17,6 +17,7 @@ DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+RETRY_SLEEP="${PLANERKA_RETRY_SLEEP:-10}"   # пауза между попытками rebase busy-воркера (тест выставляет 0)
 die() { echo "dept-planerka-exec: $*" >&2; exit 1; }
 
 approval="" reason=""
@@ -55,17 +56,27 @@ while IFS= read -r w; do
     echo "$w: state=${wstate:-нет в autonomous.json} — пропуск (не active/sleeping)"
     continue
   fi
+  # КОРОТКИЙ ретрай, НЕ 20-мин блокировка (fixup по ревью Task 8): dept-dispatcher зовёт
+  # исполнителя с timeout 900с (15 мин) и держит dispatcher-lock всё это время. Висеть до
+  # 20 мин на ОДНОМ busy-воркере → SIGTERM посреди цикла → exec_failed → планёрка частично
+  # применена и НЕ авто-ретраится (диспетчер выбирает только status=approved), а пробы спящих
+  # и другие заявки простаивают под локом. Поэтому: до 3 попыток × 10с (≤~30с на воркера),
+  # затем — в ОТЛОЖЕННЫЕ и к следующему. Планёрка не обязана дожать всех в одном проходе:
+  # незаребейзенного busy-воркера добьёт rebase-check по возрасту сессии, ЛИБО следующая
+  # планёрка, ЛИБО policy-турникет заставит перечитать правила перед следующим значимым
+  # действием (механический забор — безопасно). Суммарный бюджет теперь ≤ N × 30с (флот ~8
+  # ≈ 4 мин) с запасом под 15-мин timeout диспетчера.
   ok=false
-  for i in $(seq 1 20); do
+  for i in 1 2 3; do
     rout="$("$CA" rebase "$w" --reason "планёрка: $reason" 2>&1)"; rrc=$?
     echo "$rout"
     if [ "$rrc" -eq 0 ]; then ok=true; break; fi
     if [ "$rrc" -ne 3 ]; then echo "$w: rebase завершился ошибкой (rc=$rrc) — пропуск"; break; fi
-    [ "$i" -lt 20 ] && sleep 60
+    [ "$i" -lt 3 ] && [ "$RETRY_SLEEP" -gt 0 ] && sleep "$RETRY_SLEEP"
   done
-  if [ "$ok" = true ]; then rebased+=("$w"); else deferred+=("$w"); fi
+  if [ "$ok" = true ]; then rebased+=("$w"); elif [ "$rrc" -eq 3 ]; then deferred+=("$w"); fi
 done <<<"$targets"
 
-summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy): ${deferred[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
+summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy, добьёт rebase-check/турникет): ${deferred[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
 echo "$summary"
 "$NOTIFY" "$summary" >/dev/null 2>&1 || echo "dept-planerka-exec: notify FAILED" >&2

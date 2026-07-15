@@ -169,4 +169,45 @@ out7="$(CLAUDE_AUTO_BIN=/bin/false "$DIR/bin/dept-sleep-exec" --worker test-work
   || fail "dept-sleep-exec на уже-спящем воркере должен вернуть exit 0 (no-op)"
 echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об идемпотентном no-op (уже спит)"
 
+# ---- 8) dept-planerka-exec: busy-воркер ОТКЛАДЫВАЕТСЯ (короткий ретрай), а не блокирует --
+# (fixup Task 8: раньше висел до 20 мин на busy-воркере → SIGTERM под dispatcher-timeout.
+# Теперь ≤3 попытки × RETRY_SLEEP, затем в «отложенные»). Изолированный DEPT_HOME/CONTROL_DIR
+# + мок claude-auto (rc=3 для busy) + мок notify. PLANERKA_RETRY_SLEEP=0 — тест не должен ждать.
+PL_DEPT="$(mktemp -d)"
+PL_CTRL="$(mktemp -d)"
+mkdir -p "$PL_CTRL/workers"
+DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-ok-p --role мк --client c1 >/dev/null
+DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-busy-p --role мк --client c2 >/dev/null
+DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-sleep-p --role мк --client c3 >/dev/null
+jq -n '{workers:{"mk-ok-p":{state:"active"},"mk-busy-p":{state:"active"},"mk-sleep-p":{state:"sleeping"}}}' \
+  > "$PL_CTRL/autonomous.json"
+
+PL_CA="$(mktemp -d)/fake-ca-planerka"
+cat > "$PL_CA" <<'EOF'
+#!/bin/bash
+# rebase <worker> --reason <r> : busy-воркер всегда rc=3 (занят), остальные rc=0
+[ "$1" = "rebase" ] && [ "$2" = "mk-busy-p" ] && exit 3
+exit 0
+EOF
+chmod +x "$PL_CA"
+export PL_NOTIFY_LOG="$(mktemp)"
+PL_NOTIFY="$(mktemp -d)/fake-notify"
+cat > "$PL_NOTIFY" <<'EOF'
+#!/bin/bash
+echo "NOTIFY $*" >> "$PL_NOTIFY_LOG"
+EOF
+chmod +x "$PL_NOTIFY"
+
+pl_start=$(date +%s)
+out8="$(DEPT_HOME="$PL_DEPT" CLAUDE_CONTROL_DIR="$PL_CTRL" CLAUDE_AUTO_BIN="$PL_CA" \
+  TELEGRAM_NOTIFY="$PL_NOTIFY" PLANERKA_RETRY_SLEEP=0 \
+  "$DIR/bin/dept-planerka-exec" --reason 'смок планёрки')" \
+  || fail "dept-planerka-exec упал"
+pl_end=$(date +%s)
+[ $((pl_end - pl_start)) -lt 30 ] || fail "dept-planerka-exec висел >30с (должен откладывать busy, а не ждать)"
+echo "$out8" | grep -q 'ребейзнуты:.*mk-ok-p' || fail "mk-ok-p не в ребейзнутых"
+echo "$out8" | grep -qE 'отложены \(busy[^)]*\):.*mk-busy-p' || fail "mk-busy-p не в отложенных (busy)"
+echo "$out8" | grep -q 'спят:.*mk-sleep-p' || fail "mk-sleep-p не в спящих"
+grep -q 'NOTIFY' "$PL_NOTIFY_LOG" || fail "TG-сводка планёрки не отправлена (мок notify не вызван)"
+
 echo PASS
