@@ -1,0 +1,13 @@
+[Unit]
+Description=dept-dispatcher — пробы спящих контуров, wake, исполнение утверждённых заявок, детект неактивности МК
+
+[Service]
+Type=oneshot
+# system node/tmux/claude-auto хватает через хвост PATH — repo bin/ первым
+# (тот же паттерн, что claude-auto-liveness.service / dept-rebase-check.service).
+Environment=PATH=/opt/projects/active/claude-control/bin:/usr/local/bin:/usr/bin:/bin
+# Опциональные пороги/режимы (DEPT_SLEEP_IDLE_DAYS, DEPT_SLEEP_AUTO,
+# CLAUDE_AUTO_STALE_SECONDS, TELEGRAM_NOTIFY) — оператор переопределяет через
+# этот файл, не через юнит. '-' перед путём: отсутствие файла не валит юнит.
+EnvironmentFile=-%h/.config/claude-control/env
+ExecStart=/opt/projects/active/claude-control/bin/dept-dispatcher tick

@@ -1,0 +1,359 @@
+#!/usr/bin/env node
+// dept-dispatcher — контурный диспетчер цифрового отдела (Task 7 фазы 3).
+// systemd-таймер каждые 2 мин: `dept-dispatcher tick [--dry-run]`. Три обязанности:
+//   1. Пробы СПЯЩИХ контуров (autonomous.json state=="sleeping") — на новое событие
+//      будит воркера (`claude-auto start`), НЕ пишет .seen/.dead (доставит штатный
+//      event-bridge-watch проснувшегося воркера — адаптеры детерминированно
+//      перепечатают неподтверждённое).
+//   2. Исполнение утверждённых заявок (dept-ledger approval --status approved),
+//      отфильтрованных pickExecutable (kind_of ∈ EXEC_KINDS И from — руководитель/
+//      operator). Codex-аудит К3: approved-строка сама по себе НЕ мандат — /proc-гард
+//      в dept-ledger (approval-exec) первый забор, этот ролевой фильтр — второй,
+//      сверка detail↔request в исполнителях Task 8 — третий.
+//   3. Детект неактивности МК (решение оператора №6): без DEPT_SLEEP_AUTO=1 —
+//      decision_request Руководителю (дедуп на эпизод); с флагом — авто-`claude-auto
+//      sleep`. Чистая decideSleep() решает 'none'|'ask_head'|'auto_sleep'.
+// Паттерны (lock/timeout/--dry-run) — как в bin/claude-auto-liveness и
+// bin/dept-rebase-check: best-effort lock-файл, execFileSync с честным timeout на
+// каждый подпроцесс, --dry-run строго read-only (ни одной записи на диск/в ledger/TG).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const crypto = require('crypto');
+
+const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
+// Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
+// registry) — approved-строка сама по себе НЕ мандат (ledger-CLI доступен воркерам;
+// /proc-гард в dept-ledger — первый забор, этот фильтр — второй).
+function pickExecutable(rows, roleOf) {
+  return rows.filter((r) => r.data && EXEC_KINDS.has(r.data.kind_of)
+    && (roleOf(r.data.from) === 'руководитель' || r.data.from === 'operator'));
+}
+// Решение оператора №6: авто-сон по неактивности (human-in-the-loop через Руководителя).
+function decideSleep(w, cfg) {
+  if (w.idleDays < cfg.idleDays) return 'none';
+  if (w.hasOpenApproval || w.hasQueued || w.stale) return 'none';
+  if (w.auto) return 'auto_sleep';
+  return w.alreadyAsked ? 'none' : 'ask_head';
+}
+
+// Зеркало дедупа event-bridge-watch, ВКЛЮЧАЯ legacy-миграцию (Codex-аудит В4):
+// marked-строка подавляется и по 'g:<id>', и по legacy sha256 ВИДИМОЙ части
+// (доставленное до появления stable-id не должно ложно будить контур).
+function keysOf(rawline) {
+  const m = /^\x1eebid=([^\x1e]+)\x1e/.exec(rawline);
+  const visible = m ? rawline.slice(m[0].length) : rawline;
+  const legacy = crypto.createHash('sha256').update(visible).digest('hex').slice(0, 32);
+  return m ? ['g:' + m[1], legacy] : [legacy];
+}
+function newProbeLines(lines, seenSet, deadSet) {
+  return lines.filter((l) => l.trim() && !keysOf(l).some((k) => seenSet.has(k) || deadSet.has(k)));
+}
+// Видимая часть строки (без маркера) — для excerpt в TG-уведомлении о пробуждении.
+function visiblePart(rawline) {
+  const m = /^\x1eebid=([^\x1e]+)\x1e/.exec(rawline);
+  return m ? rawline.slice(m[0].length) : rawline;
+}
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS };
+if (require.main !== module) return;
+
+// ---- CLI ---------------------------------------------------------------
+const argv = process.argv.slice(2);
+if (argv[0] !== 'tick') {
+  process.stderr.write('usage: dept-dispatcher tick [--dry-run]\n');
+  process.exit(1);
+}
+const dry = argv.includes('--dry-run');
+
+const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
+const WORKERS_DIR = path.join(CC_HOME, 'workers');
+const BIN = __dirname;
+const CLAUDE_AUTO = path.join(BIN, 'claude-auto');
+const DEPT_LEDGER = path.join(BIN, 'dept-ledger');
+const SLEEP_STATE_FILE = path.join(DEPT, 'sleep-check-state.json');
+const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monitor/telegram_notify.sh';
+
+// Number(garbage) === NaN просачивался бы во все сравнения как false (см. liveness/
+// rebase-check) — guard: невалидное/неположительное значение → дефолт, не NaN.
+function numEnv(name, def) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+const CFG = { idleDays: numEnv('DEPT_SLEEP_IDLE_DAYS', 7) };
+const STALE_AFTER_MS = numEnv('CLAUDE_AUTO_STALE_SECONDS', 1800) * 1000;
+const AUTO = process.env.DEPT_SLEEP_AUTO === '1';
+
+const EXECUTORS = {
+  worker_spawn: 'dept-spawn-exec', mission_change: 'dept-mission-exec',
+  planerka: 'dept-planerka-exec', sleep: 'dept-sleep-exec',
+};
+
+// Best-effort лок (см. liveness/rebase-check): ручной прогон параллельно с таймером
+// иначе гонит read-modify-write sleep-check-state.json/.dispatcher-lastrun-* без
+// синхронизации. 20 мин "протухания" — таймер бьёт раз в 2 мин, но один тик может
+// исполнить НЕСКОЛЬКО заявок по 15 мин таймаут каждая (обязанность 2) — запас на
+// легитимно долгий прогон, не только на секундный.
+const LOCK_FILE = path.join(DEPT, 'dispatcher.lock');
+const LOCK_STALE_MS = 20 * 60_000;
+function acquireLock() {
+  fs.mkdirSync(DEPT, { recursive: true });
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    try {
+      if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK_FILE); return acquireLock(); }
+    } catch {}
+    return false;
+  }
+}
+if (!acquireLock()) {
+  console.log('dispatcher: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на sleep-check-state.json');
+  process.exit(0);
+}
+// 'exit' — не try/finally: снимает лок и при незапойманном исключении в цикле ниже
+// (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
+
+// timeout на КАЖДЫЙ подпроцесс — иначе подвисший claude-auto/probe/tmux вешает
+// execFileSync навсегда, и ни один воркер/заявка ПОСЛЕ зависшего не проверяется.
+// Тихий best-effort (аналог agent_run append в claude-auto bash: `|| true`).
+function sh(cmd, args, timeoutMs = 15_000) {
+  try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs }); } catch { return null; }
+}
+function tail(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(-n) : s; }
+function notify(msg) {
+  if (dry) { console.log('[dry] notify:', msg); return; }
+  if (sh(NOTIFY, [msg]) === null) console.log('dispatcher: notify FAILED:', msg);
+}
+function loadJSON(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+function saveJSON(file, obj) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
+}
+function loadLineSet(file) {
+  try { return new Set(fs.readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean)); }
+  catch { return new Set(); }
+}
+// dept-ledger list — построчный JSON. Диагностика в stderr при сбое (не silent —
+// пустая выборка по ошибке чтения ledger не должна маскироваться под "заявок нет").
+function dlList(args) {
+  let out;
+  try { out = execFileSync(DEPT_LEDGER, ['list', ...args], { encoding: 'utf8', timeout: 15_000 }); }
+  catch (e) { console.error('dispatcher: dept-ledger list ' + args.join(' ') + ' failed: ' + e.message); return []; }
+  return out.split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+function readSpec(name) {
+  try { return JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, name, 'spec.json'), 'utf8')); } catch { return null; }
+}
+// Та же эвристика транскрипта, что claude-auto-liveness/dept-rebase-check.
+function transcriptMtime(name) {
+  const spec = readSpec(name);
+  if (!spec || !spec.session_id) return 0;
+  const projRoot = path.join(process.env.HOME, '.claude', 'projects');
+  try {
+    for (const d of fs.readdirSync(projRoot)) {
+      const f = path.join(projRoot, d, spec.session_id + '.jsonl');
+      if (fs.existsSync(f)) return fs.statSync(f).mtimeMs;
+    }
+  } catch {}
+  return 0;
+}
+// STALE — та же эвристика, что dept-rebase-check.isStale (mtime транскрипта vs
+// max(mtime timeline.md/decisions.md/открытые-вопросы* в brain_path)).
+function isStale(brainPath, txMtime) {
+  if (!brainPath || !txMtime) return false;
+  let entries;
+  try { entries = fs.readdirSync(brainPath); } catch { return false; }
+  let memMtime = 0;
+  const candidates = ['timeline.md', 'decisions.md', ...entries.filter((e) => e.startsWith('open-questions') || e.startsWith('открытые-вопросы'))];
+  for (const c of candidates) {
+    try { const m = fs.statSync(path.join(brainPath, c)).mtimeMs; if (m > memMtime) memMtime = m; } catch {}
+  }
+  if (memMtime === 0) return false; // памяти вообще ещё нет — не STALE
+  return (txMtime - memMtime) > STALE_AFTER_MS;
+}
+// Запуск одной пробы: партиальный stdout возвращаем ДАЖЕ при ненулевом exit/timeout —
+// probe-скрипты (как и в event-bridge-watch) могут упасть, но уже что-то напечатать.
+function runProbe(cmd, timeoutSec) {
+  const argv = Array.isArray(cmd) ? cmd : ['sh', '-c', String(cmd)];
+  if (!argv.length || !argv[0]) return '';
+  try { return execFileSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: (timeoutSec || 30) * 1000 }); }
+  catch (e) { return typeof e.stdout === 'string' ? e.stdout : ''; }
+}
+
+let deptReg, autoReg;
+try { deptReg = JSON.parse(fs.readFileSync(path.join(DEPT, 'registry.json'), 'utf8')); }
+catch (e) { notify(`🚨 dispatcher: не смог прочитать registry.json: ${e.code || e.message} — тик пропущен`); process.exit(0); }
+try { autoReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8')); }
+catch (e) { notify(`🚨 dispatcher: не смог прочитать autonomous.json: ${e.code || e.message} — тик пропущен`); process.exit(0); }
+const autoWorkers = autoReg.workers || autoReg;
+const deptWorkers = deptReg.workers || {};
+const roleOf = (n) => (deptWorkers[n] || {}).role;
+const now = Date.now();
+
+// ---- 1) пробы СПЯЩИХ контуров: на новое событие — wake --------------------
+let sleepingCount = 0, wokenCount = 0;
+for (const [name, meta] of Object.entries(autoWorkers)) {
+  if (!meta || typeof meta !== 'object' || meta.state !== 'sleeping') continue;
+  sleepingCount++;
+  const cfg = loadJSON(path.join(WORKERS_DIR, name, 'event-bridge.config.json'), null);
+  if (!cfg || !Array.isArray(cfg.probes) || !cfg.probes.length) continue;
+  const stateDir = path.join(WORKERS_DIR, name, 'state');
+  let woke = false;
+  for (const probe of cfg.probes) {
+    if (woke) break; // один wake на воркера за тик — после wake его пробы в этом тике не гоняются
+    const pname = probe && probe.name;
+    if (!pname || !probe.cmd) continue;
+    const ident = String(pname).replace(/[^A-Za-z0-9_-]/g, '_');
+    const intervalSec = Number.isFinite(probe.interval_sec) && probe.interval_sec > 0 ? probe.interval_sec : 60;
+    const timeoutSec = Number.isFinite(probe.timeout_sec) && probe.timeout_sec > 0 ? probe.timeout_sec : 30;
+    const lastrunFile = path.join(stateDir, `.dispatcher-lastrun-${ident}`);
+    const lastrun = Number(loadJSON(lastrunFile, 0)) || 0; // содержимое — просто epoch-секунды (не JSON-объект), но валидный JSON-скаляр
+    const nowSec = Math.floor(now / 1000);
+    if (nowSec - lastrun < intervalSec) continue;
+    if (!dry) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(lastrunFile, String(nowSec)); }
+
+    const out = runProbe(probe.cmd, timeoutSec);
+    if (!out) continue;
+    const lines = out.split('\n');
+    const seen = loadLineSet(path.join(stateDir, `${ident}.seen`));
+    const dead = loadLineSet(path.join(stateDir, `${ident}.dead`));
+    const fresh = newProbeLines(lines, seen, dead);
+    if (!fresh.length) continue;
+
+    const excerpt = tail(visiblePart(fresh[0]), 160);
+    woke = true;
+    if (dry) { console.log(`[dry] ${name}: разбудил бы датчиком ${pname}: ${excerpt}`); break; }
+    try {
+      execFileSync(CLAUDE_AUTO, ['start', name], { encoding: 'utf8', timeout: 60_000 });
+      wokenCount++;
+      // agent_run wake — best-effort, зеркало spawn/rebase/mission_update в claude-auto (bash `|| true`).
+      sh(DEPT_LEDGER, ['append', '--kind', 'agent_run', '--data', JSON.stringify({ worker: name, run_kind: 'wake', probe: pname }), '--actor', 'dispatcher']);
+      notify(`🌅 контур «${name}» разбужен датчиком ${pname}: ${excerpt}`);
+    } catch (e) {
+      notify(`🚨 dispatcher: не удалось разбудить «${name}» (датчик ${pname}): ${e.message}`);
+    }
+  }
+}
+
+// ---- 2) исполнение утверждённых заявок -------------------------------------
+const approvalRows = dlList(['--kind', 'approval', '--status', 'approved']);
+const executable = pickExecutable(approvalRows, roleOf);
+let execOkCount = 0, execFailCount = 0;
+for (const row of executable) {
+  const kindOf = row.data.kind_of;
+  const id = row.event_id;
+  const executor = EXECUTORS[kindOf];
+  if (dry) { console.log(`[dry] исполнил бы заявку ${kindOf} ${id} через ${executor || '???'}`); continue; }
+  if (!executor) { console.error(`dispatcher: заявка ${id} kind_of=${kindOf} — нет исполнителя в EXECUTORS (не должно случаться, EXEC_KINDS/EXECUTORS разошлись)`); continue; }
+  const bin = path.join(BIN, executor);
+  try {
+    const stdout = execFileSync(bin, ['--approval', id], { encoding: 'utf8', timeout: 900_000 });
+    execOkCount++;
+    try {
+      execFileSync(DEPT_LEDGER, ['approval-exec', id, '--status', 'executed', '--note', tail(stdout, 500), '--actor', 'dispatcher'], { encoding: 'utf8', timeout: 15_000 });
+      notify(`✅ заявка ${kindOf} ${id} исполнена диспетчером`);
+    } catch (e2) {
+      // Исполнитель УЖЕ сделал дело, но исход не записан — следующий тик снова увидит
+      // approval "approved" и pickExecutable выберет заявку ПОВТОРНО (риск двойного
+      // исполнения). Кричим громко — это не best-effort мелочь.
+      notify(`🚨 dispatcher: заявка ${kindOf} ${id} ИСПОЛНЕНА, но approval-exec НЕ записан (риск повторного исполнения при следующем тике!): ${e2.message}`);
+    }
+  } catch (e) {
+    execFailCount++;
+    const note = tail(e.stderr || e.message || '', 500);
+    try {
+      execFileSync(DEPT_LEDGER, ['approval-exec', id, '--status', 'exec_failed', '--note', note, '--actor', 'dispatcher'], { encoding: 'utf8', timeout: 15_000 });
+      notify(`🔴 заявка ${kindOf} ${id} НЕ исполнена: ${tail(note, 300)}`);
+    } catch (e2) {
+      notify(`🚨 dispatcher: заявка ${kindOf} ${id} ошиблась, и approval-exec тоже НЕ записан: ${e2.message}`);
+    }
+  }
+}
+
+// ---- 3) детект неактивности МК ---------------------------------------------
+function lastActivityTs(allEvents, name) {
+  let max = 0;
+  for (const e of allEvents) {
+    const d = e.data || {};
+    if (e.actor === name || d.to === name || d.from === name || d.worker === name) {
+      const t = Date.parse(e.ts);
+      if (Number.isFinite(t) && t > max) max = t;
+    }
+  }
+  return max;
+}
+function hasOpenApproval(name) {
+  if (dlList(['--kind', 'approval', '--filter', 'from=' + name, '--status', 'open']).length) return true;
+  return dlList(['--kind', 'approval', '--filter', 'from=' + name, '--status', 'approved']).length > 0;
+}
+function hasQueued(name) {
+  return dlList(['--kind', 'message', '--filter', 'to=' + name, '--status', 'queued']).length > 0;
+}
+
+const sleepState = loadJSON(SLEEP_STATE_FILE, {});
+let allLedgerEvents = null; // ленивая загрузка — только если есть хоть один активный МК
+let mkChecked = 0, mkSignalled = 0;
+for (const [name, meta] of Object.entries(deptWorkers)) {
+  if (!meta || meta.role !== 'мк') continue;
+  const autoMeta = autoWorkers[name];
+  if (!autoMeta || autoMeta.state !== 'active') {
+    delete sleepState[name]; // уход из active закрывает эпизод (см. dept-rebase-check.pruneState)
+    continue;
+  }
+  mkChecked++;
+  const txMtime = transcriptMtime(name);
+  if (allLedgerEvents === null) allLedgerEvents = dlList([]);
+  const lastAct = lastActivityTs(allLedgerEvents, name);
+  const anchor = Math.max(txMtime, lastAct);
+  if (!anchor) { console.log(`dispatcher: ${name}: недостаточно данных (нет транскрипта и ledger-активности) — пропуск детекта неактивности`); continue; }
+  const idleDays = (now - anchor) / 86400_000;
+
+  if (idleDays < CFG.idleDays) { delete sleepState[name]; continue; } // активен — сброс дедупа/эпизода
+
+  const stale = isStale(autoMeta.brain_path, txMtime);
+  const openAppr = hasOpenApproval(name);
+  const queued = hasQueued(name);
+  const already = !!(sleepState[name] && sleepState[name].asked);
+  const decision = decideSleep({ idleDays, hasOpenApproval: openAppr, hasQueued: queued, stale, alreadyAsked: already, auto: AUTO }, CFG);
+
+  if (dry) {
+    console.log(`[dry] ${name}: idle_days=${idleDays.toFixed(1)} open_approval=${openAppr} queued=${queued} stale=${stale} → ${decision}`);
+    continue;
+  }
+  if (decision === 'ask_head') {
+    mkSignalled++;
+    const subject = `МК ${name} неактивен ${Math.floor(idleDays)} дн — предложи усыпить или обоснуй`;
+    const sent = sh(DEPT_LEDGER, ['send', '--type', 'decision_request', '--to', 'dept-head', '--subject', subject, '--actor', 'dispatcher']);
+    if (sent !== null) {
+      notify(`💤 dispatcher: МК «${name}» неактивен ${Math.floor(idleDays)} дн — запрос Руководителю отправлен`);
+      sleepState[name] = { asked: true };
+    } else {
+      console.error(`dispatcher: не удалось отправить decision_request по ${name} — попробуем на следующем тике`);
+    }
+  } else if (decision === 'auto_sleep') {
+    mkSignalled++;
+    try {
+      execFileSync(CLAUDE_AUTO, ['sleep', name], { encoding: 'utf8', timeout: 60_000 });
+      sh(DEPT_LEDGER, ['append', '--kind', 'agent_run', '--data', JSON.stringify({ worker: name, run_kind: 'auto_sleep', idle_days: Math.floor(idleDays) }), '--actor', 'dispatcher']);
+      notify(`😴 dispatcher: МК «${name}» усыплён автоматически (неактивен ${Math.floor(idleDays)} дн)`);
+      delete sleepState[name]; // эпизод закрыт сном
+    } catch (e) {
+      notify(`🚨 dispatcher: авто-сон «${name}» НЕ удался: ${e.message}`);
+    }
+  }
+  // decision === 'none' (гард активен или уже спрошено) — sleepState не трогаем
+}
+if (!dry) saveJSON(SLEEP_STATE_FILE, sleepState);
+
+console.log(`dispatcher: tick complete — ${sleepingCount} sleeping (${wokenCount} woken), ${executable.length} заявок (${execOkCount} ok, ${execFailCount} failed), ${mkChecked} МК проверено (${mkSignalled} сигналов)`);
