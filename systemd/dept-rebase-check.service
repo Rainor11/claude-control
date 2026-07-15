@@ -1,0 +1,13 @@
+[Unit]
+Description=dept-rebase-check — автопороги пересборки сессий отдела (alert-only обкатка)
+
+[Service]
+Type=oneshot
+# system node/tmux/claude-auto хватает через хвост PATH — repo bin/ первым
+# (тот же паттерн, что claude-auto-liveness.service / dept-ledger-snapshot.service).
+Environment=PATH=/opt/projects/active/claude-control/bin:/usr/local/bin:/usr/bin:/bin
+# Опциональные пороги/enforce (DEPT_REBASE_MAX_AGE_DAYS, DEPT_REBASE_MAX_COMPACTIONS,
+# DEPT_REBASE_ENFORCE, CLAUDE_AUTO_STALE_SECONDS) — оператор переопределяет через
+# этот файл, не через юнит. '-' перед путём: отсутствие файла не валит юнит.
+EnvironmentFile=-%h/.config/claude-control/env
+ExecStart=/opt/projects/active/claude-control/bin/dept-rebase-check

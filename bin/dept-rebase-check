@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+// dept-rebase-check — автопороги пересборки сессий отдела (alert-only обкатка).
+// Раз в час (systemd-таймер) проходит воркеров отдела (роль ∈ руководитель/мк/
+// архивариус/тп, state==active) и считает триггеры: возраст сессии, число
+// компакций, STALE-память (mtime транскрипта vs файлов памяти в brain_path).
+// Без DEPT_REBASE_ENFORCE=1 — только [would-rebase]-алерт (дедуп на эпизод).
+// С флагом — вызывает `claude-auto rebase <name>`; STALE — ВСЕГДА только алерт,
+// никогда авто (rebase на несвежей памяти теряет контекст без предупреждения).
+// Флаг --dry-run: только печать решений, ноль побочных эффектов (см. liveness).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
+const STATE_FILE = path.join(DEPT, 'rebase-check-state.json');
+const BIN = __dirname;
+// Number(garbage) === NaN просачивался бы во все сравнения decide() как false —
+// отключая пороги разом, а не просто откатываясь на дефолт (см. liveness).
+function numEnv(name, def) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+const CFG = {
+  maxAgeDays: numEnv('DEPT_REBASE_MAX_AGE_DAYS', 14),
+  maxCompactions: numEnv('DEPT_REBASE_MAX_COMPACTIONS', 3),
+};
+const STALE_AFTER_MS = numEnv('CLAUDE_AUTO_STALE_SECONDS', 1800) * 1000;
+const ENFORCE = process.env.DEPT_REBASE_ENFORCE === '1'; // без него — alert-only (обкатка)
+const DEPT_ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп']);
+const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monitor/telegram_notify.sh';
+
+// Чистая решающая функция (тестируется отдельно). w: {ageMs, compactions, stale, alreadyAlerted, enforce}
+function decide(w, cfg) {
+  if (w.stale) return { action: w.alreadyAlerted ? 'none' : 'stale_alert', reason: 'память STALE — rebase запрещён, нужна курация' };
+  const overAge = w.ageMs >= cfg.maxAgeDays * 86400_000;
+  const overCompact = w.compactions >= cfg.maxCompactions;
+  if (!overAge && !overCompact) return { action: 'none' };
+  const reason = overAge ? `возраст сессии ≥ ${cfg.maxAgeDays} дн` : `компакций ≥ ${cfg.maxCompactions}`;
+  if (!w.enforce && w.alreadyAlerted) return { action: 'none' };
+  return { action: 'rebase', reason };
+}
+module.exports = { decide };
+if (require.main !== module) return;
+
+const dry = process.argv.includes('--dry-run');
+
+// Best-effort лок (см. liveness): ручной --dry-run параллельно с таймером иначе
+// делает read-modify-write rebase-check-state.json без синхронизации. Таймер бьёт
+// раз в час — 30 мин "протухания" даёт запас на несколько последовательных ENFORCE
+// rebase (до 300с timeout каждый), не звонит stale за живой, но медленный прогон.
+const LOCK_FILE = path.join(DEPT, 'rebase-check.lock');
+const LOCK_STALE_MS = 30 * 60_000;
+function acquireLock() {
+  fs.mkdirSync(DEPT, { recursive: true });
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    try {
+      if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK_FILE); return acquireLock(); }
+    } catch {}
+    return false;
+  }
+}
+if (!acquireLock()) {
+  console.log('rebase-check: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на rebase-check-state.json');
+  return;
+}
+// 'exit', не try/finally — снимает лок и при незапойманном исключении в цикле ниже
+// (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
+
+// timeout: подвисший claude-auto/tmux иначе вешает execFileSync навсегда — сам
+// rebase-check зависает вместо детекта чужой проблемы, и ни один воркер ПОСЛЕ
+// зависшего в цикле не проверяется, saveState() не вызывается.
+function sh(cmd, args, timeoutMs = 10_000) { try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs }); } catch { return null; } }
+function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
+function saveState(s) {
+  fs.mkdirSync(DEPT, { recursive: true });
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
+}
+function notify(msg) {
+  if (dry) { console.log('[dry] notify:', msg); return; }
+  if (sh(NOTIFY, [msg]) === null) console.log('rebase-check: notify FAILED:', msg);
+}
+
+function readSpec(name) {
+  try { return JSON.parse(fs.readFileSync(path.join(CC_HOME, 'workers', name, 'spec.json'), 'utf8')); } catch { return null; }
+}
+// state/compactions — plain-text счётчик, пишет claude-auto-run при каждом /compact
+// (Task 3-5), claude-auto rebase его удаляет. Мусор/отсутствие файла → 0, не die —
+// иначе один битый файл роняет весь прогон вместо пропуска порога компакций.
+function readCompactions(name) {
+  try {
+    const raw = fs.readFileSync(path.join(CC_HOME, 'workers', name, 'state', 'compactions'), 'utf8').trim();
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+  } catch { return 0; }
+}
+// STALE — та же эвристика, что status_memory/cmd_rebase в claude-auto (bash):
+// mtime транскрипта (по session_id) vs max(mtime timeline.md/decisions.md/
+// open-questions*/открытые-вопросы* в brain_path) > CLAUDE_AUTO_STALE_SECONDS.
+// Не brain-воркер (brain_path пуст/каталог снесён) или транскрипт не найден —
+// не считать STALE (нечего сравнивать, не эпохальный false-positive).
+function isStale(brainPath, sessionId) {
+  if (!brainPath) return false;
+  let entries;
+  try { entries = fs.readdirSync(brainPath); } catch { return false; }
+  let txMtime = 0;
+  if (sessionId) {
+    const projRoot = path.join(process.env.HOME, '.claude', 'projects');
+    try {
+      for (const d of fs.readdirSync(projRoot)) {
+        const f = path.join(projRoot, d, sessionId + '.jsonl');
+        if (fs.existsSync(f)) { txMtime = fs.statSync(f).mtimeMs; break; }
+      }
+    } catch {}
+  }
+  if (txMtime === 0) return false;
+  let memMtime = 0;
+  const candidates = ['timeline.md', 'decisions.md', ...entries.filter(e => e.startsWith('open-questions') || e.startsWith('открытые-вопросы'))];
+  for (const c of candidates) {
+    try {
+      const m = fs.statSync(path.join(brainPath, c)).mtimeMs;
+      if (m > memMtime) memMtime = m;
+    } catch {}
+  }
+  if (memMtime === 0) return false; // ещё нет памяти вообще — не STALE (см. status_memory "NONE YET")
+  return (txMtime - memMtime) > STALE_AFTER_MS;
+}
+
+const deptReg = JSON.parse(fs.readFileSync(path.join(DEPT, 'registry.json'), 'utf8'));
+const autoReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
+const state = loadState();
+const now = Date.now();
+const CLAUDE_AUTO = path.join(BIN, 'claude-auto');
+
+for (const [name, meta] of Object.entries(deptReg.workers || {})) {
+  if (!meta || !DEPT_ROLES.has(meta.role)) continue;
+  const autoMeta = (autoReg.workers || {})[name];
+  if (!autoMeta || autoMeta.state !== 'active') continue;
+
+  const spec = readSpec(name);
+  if (!spec) { console.log(`rebase-check: ${name}: spec.json не найден/битый — пропуск`); continue; }
+  const anchor = spec.rebased_at || spec.created_at;
+  const anchorMs = anchor ? Date.parse(anchor) : NaN;
+  const ageMs = Number.isFinite(anchorMs) ? now - anchorMs : 0;
+  const compactions = readCompactions(name);
+  const stale = isStale(autoMeta.brain_path, spec.session_id);
+  const alreadyAlerted = !!(state[name] && state[name].alerted);
+  const w = { ageMs, compactions, stale, alreadyAlerted, enforce: ENFORCE };
+
+  if (dry) {
+    console.log(`[dry] ${name}: age_days=${Math.round(ageMs / 86400_000)} compactions=${compactions} stale=${stale} action=${decide(w, CFG).action}`);
+  }
+
+  const overAge = ageMs >= CFG.maxAgeDays * 86400_000;
+  const overCompact = compactions >= CFG.maxCompactions;
+  const anyTrigger = stale || overAge || overCompact;
+  const d = decide(w, CFG);
+
+  if (!anyTrigger) {
+    // Эпизод-сброс: триггеров больше нет (успешный rebase обнулил age/compactions,
+    // или память докурировали) — не спамить старым alerted на будущих эпизодах.
+    delete state[name];
+    continue;
+  }
+
+  if (d.action === 'none') continue; // дедуп внутри decide() — эпизод уже сообщён, state не трогаем
+
+  if (d.action === 'stale_alert') {
+    notify(`⚠️ rebase-check: ${name} — сессия старая, но память НЕ курируется (STALE). Авто-rebase запрещён; разберись: tmux -L claude-${name} attach -t claude-${name}`);
+    state[name] = { alerted: true };
+    continue;
+  }
+
+  // d.action === 'rebase'
+  if (!ENFORCE) {
+    notify(`⚠️ [would-rebase] rebase-check: ${name} — ${d.reason}. Включи DEPT_REBASE_ENFORCE=1 или ребейзни вручную: claude-auto rebase ${name}`);
+    state[name] = { alerted: true };
+    continue;
+  }
+
+  // ENFORCE=1: dry-run должен остаться строго read-only — ни рабочего вызова
+  // claude-auto rebase, ни notify через реальный канал (notify() сама глушится в dry).
+  if (dry) {
+    console.log(`[dry] ${name}: ENFORCE включён — реальный прогон вызвал бы 'claude-auto rebase ${name} --reason автопорог: ${d.reason}'`);
+    continue;
+  }
+  try {
+    execFileSync(CLAUDE_AUTO, ['rebase', name, '--reason', `автопорог: ${d.reason}`], { encoding: 'utf8', timeout: 300_000 });
+    notify(`✅ rebase-check: ${name} — автопорог сработал (${d.reason}), rebase выполнен.`);
+    delete state[name];
+  } catch (e) {
+    if (e.status === 3) {
+      console.log(`rebase-check: ${name} занят (exit 3) — rebase отложен, следующий тик повторит`);
+      // эпизод НЕ сброшен: state как был, следующий тик пересчитает триггеры заново
+    } else {
+      notify(`🚨 rebase-check: ENFORCE rebase ${name} FAILED (${d.reason}): ${e.message}`);
+    }
+  }
+}
+
+// Воркеры, пропавшие из registry.json (роль ушла из-под ролей отдела/воркер снесён) —
+// их записи в state иначе никогда не трогаются циклом выше и копятся в файле навечно.
+const known = new Set(Object.entries(deptReg.workers || {}).filter(([, m]) => m && DEPT_ROLES.has(m.role)).map(([n]) => n));
+for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
+
+// dry-run обязан быть чисто read-only (см. docs/department.md паттерн liveness) —
+// боевой state-файл не создаём и не трогаем при превью-прогоне.
+if (!dry) saveState(state);
