@@ -169,24 +169,27 @@ out7="$(CLAUDE_AUTO_BIN=/bin/false "$DIR/bin/dept-sleep-exec" --worker test-work
   || fail "dept-sleep-exec на уже-спящем воркере должен вернуть exit 0 (no-op)"
 echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об идемпотентном no-op (уже спит)"
 
-# ---- 8) dept-planerka-exec: busy-воркер ОТКЛАДЫВАЕТСЯ (короткий ретрай), а не блокирует --
-# (fixup Task 8: раньше висел до 20 мин на busy-воркере → SIGTERM под dispatcher-timeout.
-# Теперь ≤3 попытки × RETRY_SLEEP, затем в «отложенные»). Изолированный DEPT_HOME/CONTROL_DIR
-# + мок claude-auto (rc=3 для busy) + мок notify. PLANERKA_RETRY_SLEEP=0 — тест не должен ждать.
+# ---- 8) dept-planerka-exec: busy → отложен (короткий ретрай), hard-error → сегмент ошибок --
+# (fixup Task 8: (а) раньше висел до 20 мин на busy-воркере → SIGTERM под dispatcher-timeout,
+# теперь ≤3 попытки × RETRY_SLEEP → «отложенные»; (б) hard-error rc∉{0,3} — отдельный 🔴-сегмент,
+# а не тихая пропажа из сводки). Изолированный DEPT_HOME/CONTROL_DIR + мок claude-auto (rc=3 busy,
+# rc=1 hard-error, rc=0 остальные) + мок notify. PLANERKA_RETRY_SLEEP=0 — тест не должен ждать.
 PL_DEPT="$(mktemp -d)"
 PL_CTRL="$(mktemp -d)"
 mkdir -p "$PL_CTRL/workers"
 DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-ok-p --role мк --client c1 >/dev/null
 DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-busy-p --role мк --client c2 >/dev/null
-DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-sleep-p --role мк --client c3 >/dev/null
-jq -n '{workers:{"mk-ok-p":{state:"active"},"mk-busy-p":{state:"active"},"mk-sleep-p":{state:"sleeping"}}}' \
+DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-err-p --role мк --client c3 >/dev/null
+DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-sleep-p --role мк --client c4 >/dev/null
+jq -n '{workers:{"mk-ok-p":{state:"active"},"mk-busy-p":{state:"active"},"mk-err-p":{state:"active"},"mk-sleep-p":{state:"sleeping"}}}' \
   > "$PL_CTRL/autonomous.json"
 
 PL_CA="$(mktemp -d)/fake-ca-planerka"
 cat > "$PL_CA" <<'EOF'
 #!/bin/bash
-# rebase <worker> --reason <r> : busy-воркер всегда rc=3 (занят), остальные rc=0
+# rebase <worker> --reason <r>: busy → rc=3 (занят), hard-error → rc=1 (напр. STALE/exit 1), иначе rc=0
 [ "$1" = "rebase" ] && [ "$2" = "mk-busy-p" ] && exit 3
+[ "$1" = "rebase" ] && [ "$2" = "mk-err-p" ] && exit 1
 exit 0
 EOF
 chmod +x "$PL_CA"
@@ -205,9 +208,17 @@ out8="$(DEPT_HOME="$PL_DEPT" CLAUDE_CONTROL_DIR="$PL_CTRL" CLAUDE_AUTO_BIN="$PL_
   || fail "dept-planerka-exec упал"
 pl_end=$(date +%s)
 [ $((pl_end - pl_start)) -lt 30 ] || fail "dept-planerka-exec висел >30с (должен откладывать busy, а не ждать)"
-echo "$out8" | grep -q 'ребейзнуты:.*mk-ok-p' || fail "mk-ok-p не в ребейзнутых"
-echo "$out8" | grep -qE 'отложены \(busy[^)]*\):.*mk-busy-p' || fail "mk-busy-p не в отложенных (busy)"
-echo "$out8" | grep -q 'спят:.*mk-sleep-p' || fail "mk-sleep-p не в спящих"
+# сегмент = ярлык + всё до следующей `;` (4 сегмента, greedy .* ложно перекрыл бы соседние)
+seg="$(echo "$out8" | grep -o 'Планёрка отдела.*')"
+seg_of() { printf '%s' "$seg" | grep -oE "$1[^;]*"; }
+seg_of 'ребейзнуты: '                 | grep -q 'mk-ok-p'    || fail "mk-ok-p не в ребейзнутых"
+seg_of 'отложены \(busy'              | grep -q 'mk-busy-p'  || fail "mk-busy-p не в отложенных (busy)"
+seg_of 'ошибки \(rc'                  | grep -q 'mk-err-p'   || fail "mk-err-p не в сегменте ошибок"
+seg_of 'спят: '                       | grep -q 'mk-sleep-p' || fail "mk-sleep-p не в спящих"
+# hard-error НЕ должен просочиться в отложенные/ребейзнутые (иначе оператор не заметит ошибку)
+seg_of 'отложены \(busy' | grep -q 'mk-err-p' && fail "mk-err-p ошибочно в отложенных (busy)"
+seg_of 'ребейзнуты: '    | grep -q 'mk-err-p' && fail "mk-err-p ошибочно в ребейзнутых"
 grep -q 'NOTIFY' "$PL_NOTIFY_LOG" || fail "TG-сводка планёрки не отправлена (мок notify не вызван)"
+grep -q '🔴 ошибки' "$PL_NOTIFY_LOG" || fail "🔴-сегмент ошибок не попал в TG-сводку"
 
 echo PASS

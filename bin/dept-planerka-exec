@@ -43,7 +43,7 @@ reason="${reason:-плановая планёрка}"
 deptReg="$("$DL" registry-list)" || die "registry-list не удался"
 targets="$(printf '%s' "$deptReg" | jq -r '.workers | to_entries[] | select(.value.role as $r | ["руководитель","мк","архивариус","тп"] | index($r)) | .key')"
 
-rebased=(); deferred=(); sleeping_list=()
+rebased=(); deferred=(); errored=(); sleeping_list=()
 while IFS= read -r w; do
   [ -n "$w" ] || continue
   wstate="$(jq -r --arg n "$w" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
@@ -71,12 +71,16 @@ while IFS= read -r w; do
     rout="$("$CA" rebase "$w" --reason "планёрка: $reason" 2>&1)"; rrc=$?
     echo "$rout"
     if [ "$rrc" -eq 0 ]; then ok=true; break; fi
-    if [ "$rrc" -ne 3 ]; then echo "$w: rebase завершился ошибкой (rc=$rrc) — пропуск"; break; fi
+    if [ "$rrc" -ne 3 ]; then echo "$w: rebase завершился ошибкой (rc=$rrc) — в сегмент ошибок"; break; fi
     [ "$i" -lt 3 ] && [ "$RETRY_SLEEP" -gt 0 ] && sleep "$RETRY_SLEEP"
   done
-  if [ "$ok" = true ]; then rebased+=("$w"); elif [ "$rrc" -eq 3 ]; then deferred+=("$w"); fi
+  # Три исхода: ok (rc=0) → ребейзнут; busy (rc=3 после 3 попыток) → отложен (безобиден,
+  # добьёт rebase-check/турникет); hard-error (rc∉{0,3}, напр. STALE-память/exit 1) →
+  # в отдельный сегмент ОШИБОК. Невидимость ошибки хуже, чем ложный busy — это ровно та
+  # категория, что требует внимания оператора, поэтому 🔴-сегмент в сводке (fixup по ревью).
+  if [ "$ok" = true ]; then rebased+=("$w"); elif [ "$rrc" -eq 3 ]; then deferred+=("$w"); else errored+=("$w"); fi
 done <<<"$targets"
 
-summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy, добьёт rebase-check/турникет): ${deferred[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
+summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy, добьёт rebase-check/турникет): ${deferred[*]:-нет}; 🔴 ошибки (rc≠0,3 — разберись): ${errored[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
 echo "$summary"
 "$NOTIFY" "$summary" >/dev/null 2>&1 || echo "dept-planerka-exec: notify FAILED" >&2
