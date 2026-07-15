@@ -41,7 +41,20 @@ function decide(w, cfg) {
   if (!w.enforce && w.alreadyAlerted) return { action: 'none' };
   return { action: 'rebase', reason };
 }
-module.exports = { decide };
+// Чистка эпизод-стейта (чистая, тестируется отдельно). Запись выпадает, если воркер
+// ушёл из реестра отдела / роль стала не-отдельной ИЛИ autonomous state !== 'active':
+// уход из active закрывает эпизод — вернувшийся воркер начинает с чистого листа
+// (иначе active(alerted)→sleeping→active вернулся бы со старым alerted и первый
+// легитимный алерт нового эпизода был бы подавлен).
+function pruneState(state, deptWorkers, autoWorkers) {
+  for (const name of Object.keys(state)) {
+    const meta = (deptWorkers || {})[name];
+    const auto = (autoWorkers || {})[name];
+    if (!meta || !DEPT_ROLES.has(meta.role) || !auto || auto.state !== 'active') delete state[name];
+  }
+  return state;
+}
+module.exports = { decide, pruneState };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
@@ -136,8 +149,18 @@ function isStale(brainPath, sessionId) {
   return (txMtime - memMtime) > STALE_AFTER_MS;
 }
 
-const deptReg = JSON.parse(fs.readFileSync(path.join(DEPT, 'registry.json'), 'utf8'));
-const autoReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
+// Битый/отсутствующий реестр НЕ должен валить прогон тихим стектрейсом в journal:
+// работа watchdog-инструмента — замечать то, что никто не смотрит, включая
+// собственную неспособность работать. Алерт → чистый exit (лок снимет 'exit'-хук).
+function readRegistry(file, label) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) {
+    notify(`🚨 rebase-check: не смог прочитать ${label} (${file}): ${e.code || e.message} — проверка флота НЕ выполнена, почини вручную`);
+    process.exit(0);
+  }
+}
+const deptReg = readRegistry(path.join(DEPT, 'registry.json'), 'registry.json');
+const autoReg = readRegistry(path.join(CC_HOME, 'autonomous.json'), 'autonomous.json');
 const state = loadState();
 const now = Date.now();
 const CLAUDE_AUTO = path.join(BIN, 'claude-auto');
@@ -208,10 +231,11 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
   }
 }
 
-// Воркеры, пропавшие из registry.json (роль ушла из-под ролей отдела/воркер снесён) —
-// их записи в state иначе никогда не трогаются циклом выше и копятся в файле навечно.
-const known = new Set(Object.entries(deptReg.workers || {}).filter(([, m]) => m && DEPT_ROLES.has(m.role)).map(([n]) => n));
-for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
+// Воркеры, пропавшие из registry.json (роль ушла из-под ролей отдела/воркер снесён)
+// ИЛИ ушедшие из autonomous active (sleeping/stopped) — их записи в state иначе
+// никогда не трогаются циклом выше (он требует state=='active') и копятся навечно;
+// уход из active закрывает эпизод — вернувшийся воркер начинает с чистого листа.
+pruneState(state, deptReg.workers, autoReg.workers);
 
 // dry-run обязан быть чисто read-only (см. docs/department.md паттерн liveness) —
 // боевой state-файл не создаём и не трогаем при превью-прогоне.

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-const { decide } = createRequire(import.meta.url)('../bin/dept-rebase-check');
+const { decide, pruneState } = createRequire(import.meta.url)('../bin/dept-rebase-check');
 
 const cfg = { maxAgeDays: 14, maxCompactions: 3 };
 const now = Date.now();
@@ -26,4 +26,19 @@ test('STALE побеждает: только stale_alert, даже при воз
 });
 test('уже алертили этот эпизод — none (не спамить)', () => {
   assert.equal(decide({ ...base, ageMs: 20 * 86400_000, alreadyAlerted: true, enforce: false }, cfg).action, 'none');
+});
+
+test('pruneState: уход из active закрывает эпизод — запись выпадает', () => {
+  const state = { w1: { alerted: true } };
+  const dept = { w1: { role: 'мк' } };
+  const auto = { w1: { state: 'sleeping' } };
+  pruneState(state, dept, auto);
+  assert.equal('w1' in state, false);
+});
+test('pruneState: active воркер с ролью отдела остаётся', () => {
+  const state = { w1: { alerted: true }, gone: { alerted: true }, legacy: { alerted: true } };
+  const dept = { w1: { role: 'руководитель' }, legacy: { role: 'legacy' } };
+  const auto = { w1: { state: 'active' }, legacy: { state: 'active' } };
+  pruneState(state, dept, auto);
+  assert.deepEqual(state, { w1: { alerted: true } }); // gone (нет в реестре) и legacy (не-отдельная роль) выпали
 });
