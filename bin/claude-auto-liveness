@@ -22,6 +22,7 @@ function numEnv(name, def) {
 const CFG = {
   hungMin: numEnv('LIVENESS_HUNG_MIN', 30),
   reincidentMin: numEnv('LIVENESS_REINCIDENT_MIN', 60),
+  animMin: numEnv('LIVENESS_ANIM_HUNG_MIN', 90),
 };
 const ENFORCE = process.env.LIVENESS_ENFORCE === '1'; // без него — alert-only (обкатка)
 const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
@@ -30,9 +31,14 @@ const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monito
 // Чистая решающая функция (тестируется отдельно).
 function decide(prev, cur, cfg) {
   if (!cur.busy) return { action: 'none', reset: true };
-  const fresh = cur.ts - cur.transcriptMtime < cfg.hungMin * 60_000;
-  if (fresh) return { action: 'none', reset: true };
-  if (!prev || prev.screenHash !== cur.screenHash) return { action: 'none', reset: true };
+  const staleMs = cur.ts - cur.transcriptMtime;
+  if (staleMs < cfg.hungMin * 60_000) return { action: 'none', reset: true };
+  if (!prev || prev.screenHash !== cur.screenHash) {
+    // экран живёт, транскрипт мёртв: вторичный сигнал (всегда alert-only)
+    if (staleMs >= cfg.animMin * 60_000 && !(prev && prev.animAlerted)) return { action: 'anim_alert', reset: false };
+    if (prev && prev.animAlerted) return { action: 'none', reset: false }; // эпизод продолжается — не спамить
+    return { action: 'none', reset: true };
+  }
   const hungFor = cur.ts - prev.firstSeen;
   if (hungFor < cfg.hungMin * 60_000) return { action: 'none', reset: false };
   if (prev.restartedAt && cur.ts - prev.restartedAt < cfg.reincidentMin * 60_000) return { action: 'incident', reset: false };
@@ -125,6 +131,11 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   const prev = state[name] || null;
   const d = decide(prev, cur, CFG);
   if (d.reset) { state[name] = { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: prev?.restartedAt || 0 }; continue; }
+  if (d.action === 'anim_alert') {
+    notify(`⚠️ liveness [anim]: воркер ${name} — экран активен, но транскрипт не движется ${Math.round((now - tm) / 60000)} мин. Возможно «анимированное зависание» (лимиты подписки/сеть). Проверь: tmux -L claude-${name} attach -t claude-${name}`);
+    state[name] = { ...(prev || { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: 0 }), animAlerted: true };
+    continue;
+  }
   if (d.action === 'alert') {
     notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`);
     state[name] = { ...prev, alerted: true };

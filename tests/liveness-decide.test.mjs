@@ -43,3 +43,37 @@ test('экран изменился — сброс наблюдения', () => 
   assert.equal(a.action, 'none');
   assert.equal(a.reset, true);
 });
+
+test('anim_alert: экран меняется, транскрипт стоит дольше animMin', () => {
+  const cfg = { hungMin: 30, reincidentMin: 60, animMin: 90 };
+  const now = Date.now();
+  const prev = { screenHash: 'aaa', firstSeen: now - 10 * 60_000, alerted: false, restartedAt: 0 };
+  const cur = { ts: now, busy: true, screenHash: 'bbb', transcriptMtime: now - 100 * 60_000 };
+  assert.deepEqual(decide(prev, cur, cfg).action, 'anim_alert');
+});
+
+test('anim_alert: не повторяется в том же эпизоде', () => {
+  const cfg = { hungMin: 30, reincidentMin: 60, animMin: 90 };
+  const now = Date.now();
+  const prev = { screenHash: 'aaa', firstSeen: now, alerted: false, restartedAt: 0, animAlerted: true };
+  const cur = { ts: now, busy: true, screenHash: 'bbb', transcriptMtime: now - 100 * 60_000 };
+  assert.equal(decide(prev, cur, cfg).action, 'none');
+});
+
+test('anim-сигнал не мешает основной лестнице: замерший экран идёт по старому пути', () => {
+  const cfg = { hungMin: 30, reincidentMin: 60, animMin: 90 };
+  const now = Date.now();
+  const prev = { screenHash: 'aaa', firstSeen: now - 31 * 60_000, alerted: false, restartedAt: 0 };
+  const cur = { ts: now, busy: true, screenHash: 'aaa', transcriptMtime: now - 100 * 60_000 };
+  assert.equal(decide(prev, cur, cfg).action, 'alert');
+});
+
+test('anim-эпизод сбрасывается при свежем транскрипте', () => {
+  const cfg = { hungMin: 30, reincidentMin: 60, animMin: 90 };
+  const now = Date.now();
+  const prev = { screenHash: 'aaa', firstSeen: now, alerted: false, restartedAt: 0, animAlerted: true };
+  const cur = { ts: now, busy: true, screenHash: 'bbb', transcriptMtime: now - 60_000 };
+  const d = decide(prev, cur, cfg);
+  assert.equal(d.action, 'none');
+  assert.equal(d.reset, true); // reset очищает animAlerted
+});
