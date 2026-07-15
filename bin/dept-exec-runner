@@ -24,8 +24,21 @@ BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"
 NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
-TIMEOUT_MS="${DEPT_EXEC_RUNNER_TIMEOUT_MS:-900000}"
 die() { echo "dept-exec-runner: $*" >&2; exit 1; }
+
+# Числовая защита (зеркало numEnv в dept-dispatcher/liveness/rebase-check): МУСОРНОЕ значение
+# (напр. '15min') дало бы `awk ms/1000` = 0.000 → `timeout 0s` = ОТКЛЮЧЁННЫЙ таймаут → зависший
+# executor крутится вечно, тик-раннер никогда не пишет финал → заявка вечно в executing. Поэтому
+# невалидное/неположительное/нецелое → дефолт 900000, а НЕ 0.
+# ИНВАРИАНТ: DEPT_EXEC_RUNNER_TIMEOUT_MS должен быть ≤ DEPT_EXEC_MAX_MIN*60000 (порог recovery
+# в dept-dispatcher, дефолт 20 мин = 1200000 мс), иначе ЖИВОЙ долгий runner будет ложно помечен
+# «завис в executing» recovery-детектом ещё до того, как легитимно завершится. Дефолты
+# (900000 ≤ 1200000) инвариант соблюдают; при ручном тюнинге env — держать это соотношение.
+TIMEOUT_MS="${DEPT_EXEC_RUNNER_TIMEOUT_MS:-900000}"
+case "$TIMEOUT_MS" in
+  ''|*[!0-9]*) TIMEOUT_MS=900000 ;;  # не целое неотрицательное → дефолт
+  0) TIMEOUT_MS=900000 ;;             # ноль отключил бы таймаут → дефолт
+esac
 
 approval="" executor=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -72,7 +85,7 @@ timeout --kill-after=10s "${timeout_sec}s" "$executor_resolved" --approval "$app
 rc=$?
 
 {
-  echo "=== dept-exec-runner $(date -Is) approval=$approval executor=$executor_base rc=$rc ==="
+  echo "=== dept-exec-runner $(date -Is) approval=$approval executor=$executor_base timeout=${timeout_sec}s rc=$rc ==="
   echo "--- stdout ---"; cat "$out_file"
   echo "--- stderr ---"; cat "$err_file"
 } >> "$LOG_FILE" 2>&1

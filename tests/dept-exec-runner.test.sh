@@ -116,5 +116,56 @@ alert_count_after="$(grep -c "зависла в executing" "$NOTIFY_LOG")"
 
 echo "OK: recovery-детект зависшей executing-заявки — алерт отправлен один раз (дедуп маркер-файлом)"
 
+# ================================================================================
+# Часть 3 (Minor 1): числовая защита DEPT_EXEC_RUNNER_TIMEOUT_MS — мусор → дефолт, НЕ 0
+# ================================================================================
+# 'timeout 0s' ОТКЛЮЧАЕТ таймаут → зависший executor крутился бы вечно. Проверяем, что
+# мусорное значение падает в дефолт 900000 (900.000s в логе раннера), а не в 0.
+c="$("$DL" approval-open --kind-of sleep --summary "смок timeout-guard" --actor dept-head)"
+eid3="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))' <<<"$c")"
+"$DL" approval-resolve "$eid3" --status approved --actor operator >/dev/null
+"$DL" approval-exec "$eid3" --status executing --actor dispatcher >/dev/null
+# фейковый быстрый executor (whitelist-имя dept-sleep-exec уже есть в SANDBOX, спит 0с при FAKE_EXEC_SLEEP=0)
+FAKE_EXEC_SLEEP=0 DEPT_EXEC_RUNNER_TIMEOUT_MS="15min" \
+  "$SANDBOX/dept-exec-runner" --approval "$eid3" --executor "$SANDBOX/dept-sleep-exec" >/dev/null 2>&1 || true
+grep -q "timeout=900.000s" "$DEPT_HOME/runner-${eid3}.log" \
+  || fail "мусорный TIMEOUT_MS не упал в дефолт: $(grep '=== dept-exec-runner' "$DEPT_HOME/runner-${eid3}.log" 2>/dev/null)"
+grep -q "timeout=0.000s" "$DEPT_HOME/runner-${eid3}.log" \
+  && fail "мусорный TIMEOUT_MS дал timeout=0 (таймаут ОТКЛЮЧЁН — footgun не закрыт)"
+# контроль: валидное значение проходит как есть
+d="$("$DL" approval-open --kind-of sleep --summary "смок timeout-valid" --actor dept-head)"
+eid4="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))' <<<"$d")"
+"$DL" approval-resolve "$eid4" --status approved --actor operator >/dev/null
+"$DL" approval-exec "$eid4" --status executing --actor dispatcher >/dev/null
+FAKE_EXEC_SLEEP=0 DEPT_EXEC_RUNNER_TIMEOUT_MS=5000 \
+  "$SANDBOX/dept-exec-runner" --approval "$eid4" --executor "$SANDBOX/dept-sleep-exec" >/dev/null 2>&1 || true
+grep -q "timeout=5.000s" "$DEPT_HOME/runner-${eid4}.log" \
+  || fail "валидный TIMEOUT_MS=5000 не дал timeout=5.000s: $(grep '=== dept-exec-runner' "$DEPT_HOME/runner-${eid4}.log" 2>/dev/null)"
+echo "OK: числовая защита TIMEOUT_MS — мусор → дефолт 900.000s, валидное значение проходит"
+
+# ================================================================================
+# Часть 4 (Minor 4): диспетчер ПЕРЕЖИВАЕТ краш-старт раннера (unhandled spawn 'error')
+# ================================================================================
+# Регресс на self-review-находку: spawn() шлёт ENOENT асинхронно событием 'error'; без
+# слушателя необработанное событие роняло ВЕСЬ процесс dispatcher. Подменяем dept-exec-runner
+# на НЕсуществующий путь через переименование — диспетчер обязан пометить executing, поймать
+# 'error', заалертить и ЗАВЕРШИТЬ тик штатно (обязанность 3 отрабатывает), не упасть.
+mv "$SANDBOX/dept-exec-runner" "$SANDBOX/dept-exec-runner.bak" # раннера больше нет по ожидаемому пути
+e="$("$DL" approval-open --kind-of sleep --summary "смок spawn-crash" --actor dept-head)"
+eid5="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))' <<<"$e")"
+"$DL" approval-resolve "$eid5" --status approved --actor operator >/dev/null
+: > "$NOTIFY_LOG" # очистим лог нотификаций для чистой проверки
+set +e
+out_crash="$("$DISPATCHER" tick 2>&1)"; crash_rc=$?
+set -e
+[ "$crash_rc" -eq 0 ] || fail "диспетчер УПАЛ (rc=$crash_rc) на краш-старте раннера — unhandled 'error' не пойман: $out_crash"
+echo "$out_crash" | grep -q "tick complete" || fail "тик не завершился штатно (обязанность 3 не отработала?) при краше раннера: $out_crash"
+# заявка помечена executing (шаг 1 прошёл ДО неудачного spawn)
+"$DL" list --kind approval --status executing | grep -q "$eid5" || fail "заявка не помечена executing до попытки spawn"
+# алерт о незапустившемся раннере (событие 'error' обработано, не уронило процесс)
+grep -q "раннер НЕ запустился" "$NOTIFY_LOG" || fail "нет алерта о незапустившемся раннере: $(cat "$NOTIFY_LOG")"
+mv "$SANDBOX/dept-exec-runner.bak" "$SANDBOX/dept-exec-runner" # вернуть на место
+echo "OK: диспетчер переживает краш-старт раннера (spawn 'error' пойман, тик завершён, алерт отправлен)"
+
 rm -rf "$SANDBOX" "$DEPT_HOME" "$CLAUDE_CONTROL_DIR"
 echo "ALL OK: tests/dept-exec-runner.test.sh"
