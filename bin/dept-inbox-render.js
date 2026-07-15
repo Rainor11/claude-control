@@ -373,13 +373,13 @@ function sparkline(days, w, h) {
 
 function renderActivity(rows, readError) {
   const items = (rows || []).map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.events7d ?? 0)}</td>
-<td>${esc(r.compactions ?? 0)}</td><td>${esc(r.wakes ?? 0)}</td><td>${esc(r.rebases ?? 0)}</td>
-<td>${sparkline(r.days)}</td></tr>`).join('') || '<tr><td colspan="6">данных нет</td></tr>';
+<td>${esc(r.compactions ?? 0)}</td><td>${esc(r.wakes ?? 0)}</td><td>${esc(r.rebases ?? 0)}</td><td>${esc(r.spawns ?? 0)}</td>
+<td>${sparkline(r.days)}</td></tr>`).join('') || '<tr><td colspan="7">данных нет</td></tr>';
   const body = `${errBanner(readError)}
 <h1>Активность</h1>
-<p class="proxy-note">⚠️ Расход токенов подписка не отдаёт — это активность-прокси (события/компакции/wake·rebase
+<p class="proxy-note">⚠️ Расход токенов подписка не отдаёт — это активность-прокси (события/компакции/wake·rebase·spawn
 за 7 дней, sparkline — события по дням за 14 дней). Честные бюджеты — фаза 4.</p>
-<div class="tablewrap"><table><tr><th>воркер</th><th>событий/7д</th><th>компакций</th><th>wake</th><th>rebase</th>
+<div class="tablewrap"><table><tr><th>воркер</th><th>событий/7д</th><th>компакций</th><th>wake</th><th>rebase</th><th>спавнов</th>
 <th>14д</th></tr>${items}</table></div>`;
   return page('Отдел — активность', body, 'activity');
 }

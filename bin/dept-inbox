@@ -71,8 +71,18 @@ function systemctlIsActiveMany(names) {
   });
 }
 
-function readJSON(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
-function readContext(name) { return readJSON(path.join(WORKERS_DIR, name, 'state', 'context.json')); }
+// fs-читалки состояния воркера: битый/недоступный файл ОДНОГО воркера не валит страницу
+// (поле остаётся n/a), но ошибку логируем в journald (console.error) — watchdog-философия
+// фазы: не терять сигналы; проблема прав/порчи state должна быть видна в логах, даже если
+// в HTML идёт generic. ENOENT (файла нет — штатно для не-brain/новых воркеров) НЕ логируем.
+function logFsErr(kind, name, e) {
+  if (e && e.code === 'ENOENT') return;
+  console.error(`dept-inbox: ${kind}(${name}) fs error:`, (e && (e.code || e.message)) || e);
+}
+function readContext(name) {
+  try { return JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, name, 'state', 'context.json'), 'utf8')); }
+  catch (e) { logFsErr('readContext', name, e); return null; }
+}
 // state/compactions — plain-text счётчик (claude-auto-run пишет при каждом /compact,
 // claude-auto rebase его удаляет). Мусор/отсутствие файла → 0, не крашить страницу.
 function readCompactions(name) {
@@ -80,9 +90,12 @@ function readCompactions(name) {
     const raw = fs.readFileSync(path.join(WORKERS_DIR, name, 'state', 'compactions'), 'utf8').trim();
     const n = Number(raw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
-  } catch { return 0; }
+  } catch (e) { logFsErr('readCompactions', name, e); return 0; }
 }
-function loadEbCfg(name) { return readJSON(path.join(WORKERS_DIR, name, 'event-bridge.config.json')) || { probes: [] }; }
+function loadEbCfg(name) {
+  try { return JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, name, 'event-bridge.config.json'), 'utf8')); }
+  catch (e) { logFsErr('loadEbCfg', name, e); return { probes: [] }; }
+}
 function minutesSince(ts) {
   const t = Date.parse(ts);
   if (!Number.isFinite(t)) return null;
@@ -194,7 +207,7 @@ async function collectActivity() {
   const since7 = Date.now() - 7 * 86400_000;
   const perWorker = new Map();
   const ensure = (name) => {
-    if (!perWorker.has(name)) perWorker.set(name, { name, events7d: 0, compactions: 0, wakes: 0, rebases: 0, days: new Array(14).fill(0) });
+    if (!perWorker.has(name)) perWorker.set(name, { name, events7d: 0, compactions: 0, wakes: 0, rebases: 0, spawns: 0, days: new Array(14).fill(0) });
     return perWorker.get(name);
   };
   for (const name of s.workersMap.keys()) { ensure(name).compactions = s.workersMap.get(name).compactions; }
@@ -217,6 +230,8 @@ async function collectActivity() {
     if (!w) continue;
     if (e.data.run_kind === 'wake') w.wakes++;
     if (e.data.run_kind === 'rebase') w.rebases++;
+    if (e.data.run_kind === 'spawn') w.spawns++;
+    // mission_update/auto_sleep — бриф §Produces /activity их не требует (только wake/rebase/spawn), YAGNI.
   }
   const rows = [...perWorker.values()].filter((w) => DEPT_ROLES.has((s.workersMap.get(w.name) || {}).role));
   return { rows, readError: s.readError };

@@ -190,14 +190,20 @@ test('renderTimeline: readError показывает баннер', () => {
 // ---------------------------------------------------------------------------
 
 test('renderActivity: подпись про прокси и sparkline-svg', () => {
-  const html = renderActivity([{ name: 'w1', events7d: 5, compactions: 1, wakes: 0, rebases: 1, days: [0,1,0,2,0,0,1,0,0,0,1,0,0,0] }], null);
+  const html = renderActivity([{ name: 'w1', events7d: 5, compactions: 1, wakes: 0, rebases: 1, spawns: 2, days: [0,1,0,2,0,0,1,0,0,0,1,0,0,0] }], null);
   assert.ok(html.includes('активность-прокси'));
   assert.ok(html.includes('<svg'));
 });
 
 test('renderActivity: sparkline имеет aria-label', () => {
-  const html = renderActivity([{ name: 'w1', events7d: 0, compactions: 0, wakes: 0, rebases: 0, days: new Array(14).fill(0) }], null);
+  const html = renderActivity([{ name: 'w1', events7d: 0, compactions: 0, wakes: 0, rebases: 0, spawns: 0, days: new Array(14).fill(0) }], null);
   assert.ok(/aria-label="[^"]+"/.test(html));
+});
+
+test('renderActivity: колонка «спавнов» и её значение (бриф §Produces /activity)', () => {
+  const html = renderActivity([{ name: 'w-spawner', events7d: 3, compactions: 0, wakes: 1, rebases: 0, spawns: 4, days: new Array(14).fill(0) }], null);
+  assert.ok(html.includes('спавнов'));        // заголовок колонки
+  assert.ok(/<td>4<\/td>/.test(html));         // значение spawns=4 в строке
 });
 
 // ---------------------------------------------------------------------------
