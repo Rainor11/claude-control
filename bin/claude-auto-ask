@@ -35,7 +35,11 @@ die() { echo "claude-auto-ask: $*" >&2; exit 1; }
 resolve_name() {
   local pid="$PPID" depth=0 nm exe
   while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
-    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+    # --resume ИЛИ --session-id — fresh-spawn/rebase (claude --session-id <W> без
+    # --resume до первого рестарта). Без этого свежеспавненный воркер не мог вызвать
+    # claude-auto-ask вообще (найдено Codex-ревью Task 10 канона, 2026-07-15) — та же
+    # правка, что уже применена в claude-auto-send/self-probes/dept-*-request.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxE -- '--resume|--session-id'; then
       exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
       case "$exe" in
         "$CLAUDE_INSTALL"/*)
