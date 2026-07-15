@@ -503,8 +503,9 @@ def render_commands():
         "— детали одного: spec, юнит, tmux, свежесть памяти",
         "",
         "<b>🔄 Жизненный цикл</b>",
-        "<code>claude-auto stop &lt;имя&gt;</code>",
-        "— усыпить (файлы целы, потом можно разбудить)",
+        "<code>claude-auto sleep &lt;имя&gt;</code>",
+        "— усыпить (файлы целы; датчики гоняет диспетчер — событие клиента разбудит "
+        "само; глухое выключение: claude-auto stop)",
         "<code>claude-auto start &lt;имя&gt;</code>",
         "— разбудить",
         "<code>claude-auto restart &lt;имя&gt;</code>",
@@ -1617,7 +1618,7 @@ async def cb_wl(cb: CallbackQuery):
 
     if sub == "stopc":
         await cb.answer("усыпляю…")
-        rc, out = await asyncio.to_thread(_run_lifecycle, "stop", worker)
+        rc, out = await asyncio.to_thread(_run_lifecycle, "sleep", worker)
         text, kb = await asyncio.to_thread(wl_worker_view, worker)
         await _safe_edit(cb.message, text, kb)
         if rc != 0:

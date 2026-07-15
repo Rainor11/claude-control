@@ -15,8 +15,13 @@
 #   overview one-screen status of ALL workers: unit state + context budget + probes
 #   status   show one worker (spec + unit + tmux)
 #   stop     stop + disable a worker's unit (keeps files)
+#   sleep    like stop, but state="sleeping" (reconciler/liveness only touch "active";
+#            department sensors keep watching; 'start' wakes it)
 #   start    (re)start a worker's unit
 #   remove   stop, disable, and delete a worker's files + registry entry
+#   mission-update <name> --mission-file <f> [--reason s] [--no-rebase]
+#            rebuild CLAUDE.md from a NEW mission text + immediate rebase (mission
+#            takes effect right away, not at next compaction)
 #   get-probes <name>                 print the worker's current event-bridge probes
 #   set-probes <name> <config.json>   swap the worker's probes live (no re-adopt,
 #                                     no restart; watcher reloads in ~5s). Driven by
@@ -882,6 +887,33 @@ cmd_stop() {
   echo "worker '$name' stopped + disabled (files kept; 'start' to resume, 'remove' to delete)"
 }
 
+# sleep <name> — как stop (юнит disable --now, tmux kill), но state="sleeping" вместо
+# "stopped": reconciler и liveness фильтруют строго state=="active", так что спящего
+# они не трогают и не будят. Файлы/сессия целы; событие клиента (через диспетчер) или
+# ручной `start` будит воркера. Отличие от stop — семантическое: stopped = операторская
+# пауза (реконсилятор её тоже не подхватывает, но нет коннотации "контур жив"),
+# sleeping = воркер в дежурном режиме под наблюдением department-датчиков.
+cmd_sleep() {
+  local name="${1:?usage: sleep <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
+  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  reg_update '.workers[$n].state="sleeping"' --arg n "$name"
+  # Codex-аудит В5: stateful-адаптер (gmail/tg/asana) без прогретого baseline при первом
+  # прогоне создаёт baseline МОЛЧА — событие до прогрева потерялось бы. Предупреждаем.
+  local cfg="$WORKERS_DIR/$name/event-bridge.config.json" p pname
+  if [ -f "$cfg" ]; then
+    while IFS= read -r p; do
+      pname="$(jq -r '.name' <<<"$p")"
+      if jq -e '.cmd[0] | test("(gmail-messages|tg-messages|asana-comments)$")' <<<"$p" >/dev/null 2>&1; then
+        ls "$WORKERS_DIR/$name/state/" 2>/dev/null | grep -q . || \
+          echo "  ВНИМАНИЕ: у пробы '$pname' может не быть baseline (state пуст) — первое событие после сна рискует пропасть; разбуди воркера на один тик watcher'а перед сном" >&2
+      fi
+    done < <(jq -c '.probes[]?' "$cfg" 2>/dev/null)
+  fi
+  echo "worker '$name' спит (контур жив: датчики гоняет dept-dispatcher, событие будит через 'start'; файлы и сессия целы)"
+}
+
 cmd_start() {
   local name="${1:?usage: start <name>}"
   worker_exists "$name" || die "no worker '$name'"
@@ -967,6 +999,52 @@ cmd_rebase() {
     --actor "${CLAUDE_AUTO_NAME:-operator}" >/dev/null 2>&1 || true
 
   echo "worker '$name' rebased: $old_sid -> $new_sid (kickoff delivered=$delivered)"
+}
+
+# mission-update <name> --mission-file <f> [--reason s] [--no-rebase] — пересобирает
+# CLAUDE.md воркера от НОВОГО текста миссии (та же обвязка write_worker_claudemd:
+# identity/awareness + operating rules + deal-memory), кладёт копию новой миссии в
+# $DEPT_HOME/missions/<name>.md (аудит: попадает в git-snapshot department-репо;
+# откат = git revert + повторный mission-update) и — если не --no-rebase — сразу
+# rebase'ит воркера, чтобы миссия вступила в силу немедленно (§7 спеки), не дожидаясь
+# следующей компакции. rebase может отложиться (busy, exit 3) — миссия при этом УЖЕ
+# записана на диск; команда сообщает и пробрасывает тот же exit code.
+cmd_mission_update() {
+  local name="" mission_file="" reason="смена миссии" no_rebase=false
+  name="${1:?usage: mission-update <name> --mission-file <f> [--reason s] [--no-rebase]}"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mission-file) mission_file="${2:-}"; shift 2 ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      --no-rebase) no_rebase=true; shift ;;
+      *) die "mission-update: unknown arg $1" ;;
+    esac
+  done
+  worker_exists "$name" || die "no worker '$name'"
+  [ -n "$mission_file" ] && [ -f "$mission_file" ] || die "mission-update: --mission-file обязателен"
+  local home="$WORKERS_DIR/$name" cwd
+  cwd="$(jq -r '.cwd' "$home/spec.json")"
+  detect_brain_deal "$cwd"
+  local mtext; mtext="$(cat "$mission_file")"
+  write_worker_claudemd "$name" "$home" "$mtext" "$brain_path" "$brain_rel"
+
+  # копия в department-рантайм (git-snapshot закоммитит — аудит смены миссии)
+  local DEPT="${DEPT_HOME:-$CONTROL_DIR/department}"
+  mkdir -p "$DEPT/missions"
+  cp "$mission_file" "$DEPT/missions/$name.md"
+  "$BIN_DIR/dept-ledger" append --kind agent_run \
+    --data "$(jq -nc --arg w "$name" --arg r "$reason" '{worker:$w, run_kind:"mission_update", reason:$r}')" \
+    --actor "${CLAUDE_AUTO_NAME:-operator}" >/dev/null 2>&1 || true
+  echo "mission-update: CLAUDE.md воркера '$name' пересобран (копия: $DEPT/missions/$name.md)"
+
+  if [ "$no_rebase" = true ]; then
+    echo "mission-update: --no-rebase — новая миссия вступит в силу при следующем перезапуске/компакции"
+    return 0
+  fi
+  cmd_rebase "$name" --reason "смена миссии: $reason"
+  local rc=$?
+  [ "$rc" = 3 ] && echo "mission-update: миссия записана, но rebase ОТЛОЖЕН (busy) — повтори: claude-auto rebase $name"
+  return "$rc"
 }
 
 cmd_remove() {
@@ -1568,8 +1646,11 @@ MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
   allow remove <имя> tg:<chat_id>|email:<addr>  убрать контакт
 
 ЖИЗНЕННЫЙ ЦИКЛ
-  start <имя>                  запустить / поднять юнит
+  start <имя>                  запустить / поднять юнит (в т.ч. будит спящего)
   stop <имя>                   остановить + отключить юнит (файлы сохраняются)
+  sleep <имя>                  усыпить: как stop, но state="sleeping" — reconciler
+                               и liveness спящего не трогают (фильтруют "active"),
+                               датчики department продолжают следить; 'start' будит
   restart <имя>                stop+start с resume (для применения MCP-набора; не трогает
                                занятого воркера — откладывает)
   upgrade <имя>                подтянуть воркера к текущему шаблону (auto mode,
@@ -1581,6 +1662,13 @@ MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
                                kickoff-инжект. STALE-гард отказывает при несвежей
                                памяти (--force-stale обходит); занятого воркера
                                откладывает (exit 3, повтори)
+  mission-update <имя> --mission-file <f> [--reason s] [--no-rebase]
+                               пересобрать CLAUDE.md от НОВОЙ миссии + копия в
+                               $DEPT_HOME/missions/<имя>.md (аудит) + немедленный
+                               rebase (миссия вступает в силу сразу, не при
+                               следующей компакции); --no-rebase — только записать,
+                               применится позже; занятого воркера rebase откладывает
+                               (exit 3, миссия уже записана — повтори rebase)
   remove <имя>                 остановить и УДАЛИТЬ файлы воркера + запись в реестре
   adopt …                      создать и запустить воркера (бэкенд /go-autonomous)
   spawn --name <n> --cwd <dir> --mission-file <f> [--mode auto]
@@ -1644,8 +1732,10 @@ case "$sub" in
   overview) cmd_overview ;;
   status) cmd_status "$@" ;;
   stop) cmd_stop "$@" ;;
+  sleep) cmd_sleep "$@" ;;
   start) cmd_start "$@" ;;
   remove) cmd_remove "$@" ;;
+  mission-update) cmd_mission_update "$@" ;;
   get-probes) cmd_get_probes "$@" ;;
   set-probes) cmd_set_probes "$@" ;;
   set-probe-limit) cmd_set_probe_limit "$@" ;;
