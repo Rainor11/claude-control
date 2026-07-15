@@ -1,0 +1,71 @@
+#!/bin/bash
+# dept-planerka-exec — исполнитель заявки planerka: плановый rebase всех активных
+# воркеров отдела (руководитель/мк/архивариус/тп), чтобы каждый перечитал свежие правила
+# при следующем старте сессии. Запускается dept-dispatcher'ом (--approval <event_id>)
+# или оператором (прямой флаг --reason).
+#
+# Идемпотентен: повторный прогон (тот же --approval после hard-kill между исполнением и
+# записью approval-exec диспетчером) просто ещё раз ребейзит весь флот — лишняя
+# пересборка уже свежих сессий безвредна, эффект (все на актуальных правилах) не меняется.
+#
+# Anti-forge (Codex-аудит К4): в режиме --approval detail заявки РЕНДЕРИТСЯ ЗАНОВО из
+# data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
+# ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
+CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+die() { echo "dept-planerka-exec: $*" >&2; exit 1; }
+
+approval="" reason=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  --reason) reason="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+
+if [ -n "$approval" ]; then
+  row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
+  [ -n "$row" ] || die "аппрув не найден: $approval"
+  kind_of_row="$(jq -r '.data.kind_of // empty' <<<"$row")"
+  [ "$kind_of_row" = "planerka" ] || die "аппрув $approval имеет kind_of=$kind_of_row, ожидался planerka"
+  request_json="$(jq -c '.data.request // {}' <<<"$row")"
+  ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
+  rendered_detail="$("$RR" planerka "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
+  [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+  reason="$(jq -r '.reason // empty' <<<"$request_json")"
+fi
+reason="${reason:-плановая планёрка}"
+
+deptReg="$("$DL" registry-list)" || die "registry-list не удался"
+targets="$(printf '%s' "$deptReg" | jq -r '.workers | to_entries[] | select(.value.role as $r | ["руководитель","мк","архивариус","тп"] | index($r)) | .key')"
+
+rebased=(); deferred=(); sleeping_list=()
+while IFS= read -r w; do
+  [ -n "$w" ] || continue
+  wstate="$(jq -r --arg n "$w" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
+  if [ "$wstate" = "sleeping" ]; then
+    sleeping_list+=("$w")
+    echo "$w: спит — пропуск (планёрка спящих не будит, датчики разбудят на новом событии)"
+    continue
+  fi
+  if [ "$wstate" != "active" ]; then
+    echo "$w: state=${wstate:-нет в autonomous.json} — пропуск (не active/sleeping)"
+    continue
+  fi
+  ok=false
+  for i in $(seq 1 20); do
+    rout="$("$CA" rebase "$w" --reason "планёрка: $reason" 2>&1)"; rrc=$?
+    echo "$rout"
+    if [ "$rrc" -eq 0 ]; then ok=true; break; fi
+    if [ "$rrc" -ne 3 ]; then echo "$w: rebase завершился ошибкой (rc=$rrc) — пропуск"; break; fi
+    [ "$i" -lt 20 ] && sleep 60
+  done
+  if [ "$ok" = true ]; then rebased+=("$w"); else deferred+=("$w"); fi
+done <<<"$targets"
+
+summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy): ${deferred[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
+echo "$summary"
+"$NOTIFY" "$summary" >/dev/null 2>&1 || echo "dept-planerka-exec: notify FAILED" >&2

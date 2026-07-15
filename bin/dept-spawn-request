@@ -1,0 +1,79 @@
+#!/bin/bash
+# dept-spawn-request — заявка руководителя на найм нового МК (worker_spawn approval).
+# WORKER-ONLY: идентичность — spoof-resistant /proc-предок (resolve_name, ДОСЛОВНАЯ
+# копия из dept-approve), роль обязана быть «руководитель», турникет policy-check
+# перед открытием аппрува. detail строится ТОЛЬКО через dept-request-render (канонический
+# рендер, общий с dept-spawn-exec — anti-forge, Codex-аудит К4): исполнитель перед работой
+# рендерит detail заново из request и сверяет байт-в-байт с тем, что видел оператор.
+set -euo pipefail
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
+
+die() { echo "dept-spawn-request: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — ДОСЛОВНО из dept-approve resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    # --resume ИЛИ --session-id — fresh-запуск spawn/rebase (claude --session-id <W>
+    # без --resume до первого рестарта). Остальные проверки (exe в CLAUDE_INSTALL,
+    # CLAUDE_AUTO_NAME из environ предка) не меняются — спуф-стойкость сохранена.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxE -- '--resume|--session-id'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+client="" name="" gid="" url="" note=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client) client="${2:-}"; shift 2 ;;
+    --name) name="${2:-}"; shift 2 ;;
+    --asana-gid) gid="${2:-}"; shift 2 ;;
+    --asana-url) url="${2:-}"; shift 2 ;;
+    --note) note="${2:-}"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RR="$BINDIR/dept-request-render"
+
+# роль из реестра, пусто если воркер не найден. НЕ через `registry-get | jq` напрямую:
+# под set -euo pipefail «$DL» exit 1 (не найден) распространяется через pipefail и рвёт
+# скрипт ДО дружественного die() ниже — split на «получить (или пусто) → распарсить».
+role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
+
+# fallback для тестов — ДОСЛОВНО как в dept-approve (Codex-аудит В8):
+actor="$(resolve_name)" || actor="${DEPT_APPROVE_TEST_ACTOR:-}"
+[ -n "$actor" ] || die "запускается только из сессии воркера"
+role="$(role_of "$actor")"
+[ "$role" = "руководитель" ] || die "заявку может подать только Руководитель (твоя роль: ${role:-нет в реестре})"
+"$DL" policy-check --worker "$actor" >/dev/null || exit 1   # турникет с готовой подсказкой в stderr
+
+[ -n "$client" ] && [ -n "$name" ] && [ -n "$gid" ] \
+  || die "usage: dept-spawn-request --client <slug> --name <mk-имя> --asana-gid <GID> [--asana-url <url>] [--note '<s>']"
+[[ "$name" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad --name '$name' (нужен [a-zA-Z0-9_-]{1,40})"
+[[ "$client" =~ ^[a-zа-яё0-9-]{1,60}$ ]] || die "bad --client '$client' (нужен [a-zа-яё0-9-]{1,60})"
+[[ "$gid" =~ ^[0-9]{6,}$ ]] || die "bad --asana-gid '$gid' (нужны цифры, ≥6 знаков)"
+[ -n "$url" ] || url="https://app.asana.com/0/0/$gid"
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+[ -d "$CONTROL_DIR/workers/$name" ] && die "имя занято: воркер '$name' уже существует"
+
+request_json="$(jq -nc --arg client "$client" --arg name "$name" --arg gid "$gid" --arg url "$url" --arg note "$note" \
+  '{client:$client, name:$name, asana_gid:$gid, asana_url:$url} + (if $note=="" then {} else {note:$note} end)')"
+detail="$("$RR" worker_spawn "$request_json")" || die "не удалось построить detail из request"
+
+out="$("$BINDIR/dept-approve" --kind-of worker_spawn --summary "найм: МК «$client» ($name)" \
+  --detail "$detail" --request-json "$request_json")" || exit 1
+echo "$out"

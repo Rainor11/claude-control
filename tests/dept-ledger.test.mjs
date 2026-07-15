@@ -344,6 +344,42 @@ test('approval-open --detail сохраняет detail и policy_version_seen', 
   assert.ok(b.event_id);
 });
 
+test('approval-open --request-json сохраняет data.request; мусор/не-объект/слишком большой — отклоняются', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'worker_spawn', '--summary', 's',
+    '--request-json', '{"name":"x"}']));
+  const row = JSON.parse(run(home, ['list', '--kind', 'approval', '--event-id', a.event_id]).trim());
+  assert.equal(row.data.request.name, 'x');
+  // невалидный JSON
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', '{broken']));
+  // не объект (массив/скаляр)
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', '[1,2]']));
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', '"x"']));
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', 'null']));
+  // слишком большой (>8000 байт сериализованного JSON) для generic kind_of
+  const big = JSON.stringify({ text: 'A'.repeat(8100) });
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', big]));
+});
+
+test('approval-open --request-json: mission_change имеет расширенный кап (22000) для полного текста миссии', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  // ~17000 символов mission_text — за пределами generic-капа 8000, но в пределах mission-капа 22000
+  const missionText = 'миссия '.repeat(2500); // ~17500 символов
+  const req = JSON.stringify({ worker: 'mk-x', reason: 'смена курса', mission_text: missionText });
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'mission_change', '--summary', 's',
+    '--request-json', req, '--detail', 'резюме: смена курса\n\n' + missionText]));
+  const row = JSON.parse(run(home, ['list', '--kind', 'approval', '--event-id', a.event_id]).trim());
+  assert.equal(row.data.request.mission_text, missionText); // не обрезан
+  assert.equal(row.data.detail, 'резюме: смена курса\n\n' + missionText); // detail тоже не обрезан (синхронный кап)
+
+  // >22000 (даже для mission_change) — по-прежнему отклоняется
+  const tooBig = JSON.stringify({ worker: 'mk-x', reason: 'x', mission_text: 'A'.repeat(22500) });
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'mission_change', '--summary', 's', '--request-json', tooBig]));
+
+  // generic kind_of НЕ получает расширенный кап — тот же request (17500 симв.) для НЕ-mission_change падает
+  assert.throws(() => run(home, ['approval-open', '--kind-of', 'other', '--summary', 's', '--request-json', req]));
+});
+
 test('snapshot коммитит журнал и молчит без изменений', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   run(home, ['append', '--kind', 'agent_run', '--data', '{"worker":"x","run_kind":"wake"}']);

@@ -1,0 +1,58 @@
+#!/bin/bash
+# dept-sleep-exec — исполнитель заявки sleep: усыпляет МК (решение оператора №6).
+# Запускается dept-dispatcher'ом (--approval <event_id>) или оператором (прямые флаги
+# --worker/--reason).
+#
+# Идемпотентен: уже спящий воркер → exit 0 no-op ДО вызова claude-auto sleep (повторный
+# --approval после hard-kill между усыплением и записью approval-exec диспетчером просто
+# видит state=sleeping и ничего не делает повторно).
+#
+# Anti-forge (Codex-аудит К4): в режиме --approval detail заявки РЕНДЕРИТСЯ ЗАНОВО из
+# data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
+# ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
+CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+die() { echo "dept-sleep-exec: $*" >&2; exit 1; }
+
+approval="" worker="" reason=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  --worker) worker="${2:-}"; shift 2 ;;
+  --reason) reason="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+
+if [ -n "$approval" ]; then
+  row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
+  [ -n "$row" ] || die "аппрув не найден: $approval"
+  kind_of_row="$(jq -r '.data.kind_of // empty' <<<"$row")"
+  [ "$kind_of_row" = "sleep" ] || die "аппрув $approval имеет kind_of=$kind_of_row, ожидался sleep"
+  request_json="$(jq -c '.data.request // {}' <<<"$row")"
+  ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
+  rendered_detail="$("$RR" sleep "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
+  [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+  worker="$(jq -r '.worker // empty' <<<"$request_json")"
+  reason="$(jq -r '.reason // empty' <<<"$request_json")"
+fi
+[ -n "$worker" ] || die "usage: dept-sleep-exec --approval <event_id> | --worker <w> [--reason <s>]"
+[[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad worker '$worker'"
+
+[ -d "$CONTROL_DIR/workers/$worker" ] || die "воркер '$worker' не найден"
+wstate="$(jq -r --arg n "$worker" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
+if [ "$wstate" = "sleeping" ]; then
+  echo "воркер '$worker' уже спит — no-op (идемпотентно)"
+  exit 0
+fi
+[ "$wstate" = "active" ] || die "воркер '$worker' в неожиданном состоянии state=${wstate:-нет в autonomous.json} — усыплять нечего"
+
+out="$("$CA" sleep "$worker" 2>&1)"; rc=$?
+echo "$out"
+[ "$rc" -eq 0 ] || die "claude-auto sleep завершился ошибкой (rc=$rc)"
+
+# agent_run — best-effort аудит-след (approval_status executed пишет сам диспетчер)
+"$DL" append --kind agent_run --data "$(jq -nc --arg w "$worker" --arg r "${reason:-}" '{worker:$w, run_kind:"sleep", reason:$r}')" --actor dispatcher >/dev/null 2>&1 || true
+
+echo "sleep-exec complete: $worker"

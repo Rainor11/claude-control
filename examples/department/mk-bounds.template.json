@@ -1,0 +1,18 @@
+{
+  "allow": [
+    "Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)",
+    "Bash(/opt/projects/active/claude-control/bin/dept-approve:*)",
+    "Edit(//{{CLIENT_DIR_REL}}/**)",
+    "Write(//{{CLIENT_DIR_REL}}/**)"
+  ],
+  "ask": [],
+  "deny": [
+    "AskUserQuestion",
+    "Edit(//home/rainor/brain/wiki/work/ai-dev/отдел/**)",
+    "Write(//home/rainor/brain/wiki/work/ai-dev/отдел/**)",
+    "Edit(//home/rainor/brain/wiki/work/ai-dev/продукты/**)",
+    "Write(//home/rainor/brain/wiki/work/ai-dev/продукты/**)",
+    "Edit(//home/rainor/brain/wiki/work/ai-dev/партнёры/**)",
+    "Write(//home/rainor/brain/wiki/work/ai-dev/партнёры/**)"
+  ]
+}

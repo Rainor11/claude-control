@@ -78,4 +78,12 @@ if out4="$(DEPT_APPROVE_TEST_ACTOR=mk-prodmash "$SANDBOX/dept-approve" --kind-of
 fi
 echo "$out4" | grep -q 'unknown arg' || { echo 'FAIL: в отказе нет unknown arg'; exit 1; }
 
+# --request-json доезжает до ledger как data.request (и НЕ передаётся claude-auto-request)
+: > "$MOCK_LOG"
+out5="$(DEPT_APPROVE_TEST_ACTOR=mk-prodmash "$SANDBOX/dept-approve" --kind-of worker_spawn --summary 'заявка с request-json' --request-json '{"name":"mk-test","client":"тест"}')"
+eid5="$(echo "$out5" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DIR/bin/dept-ledger" list --kind approval --event-id "$eid5" | jq -e '.data.request.name=="mk-test" and .data.request.client=="тест"' >/dev/null \
+  || { echo 'FAIL: --request-json не записан в data.request'; exit 1; }
+grep -q -- '--request-json' "$MOCK_LOG" && { echo 'FAIL: claude-auto-request получил --request-json (карточка строится из ledger, request не должен утекать)'; exit 1; }
+
 echo PASS

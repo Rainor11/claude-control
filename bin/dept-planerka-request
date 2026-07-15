@@ -1,0 +1,64 @@
+#!/bin/bash
+# dept-planerka-request — заявка руководителя на плановую пересборку сессий отдела
+# (rebase всех активных руководитель/мк/архивариус/тп). WORKER-ONLY (см.
+# dept-spawn-request header — идентичность/роль/policy-турникет идентичны).
+set -euo pipefail
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
+
+die() { echo "dept-planerka-request: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — ДОСЛОВНО из dept-approve resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    # --resume ИЛИ --session-id — fresh-запуск spawn/rebase (claude --session-id <W>
+    # без --resume до первого рестарта). Остальные проверки (exe в CLAUDE_INSTALL,
+    # CLAUDE_AUTO_NAME из environ предка) не меняются — спуф-стойкость сохранена.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxE -- '--resume|--session-id'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+reason=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --reason) reason="${2:-}"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RR="$BINDIR/dept-request-render"
+
+# роль из реестра, пусто если воркер не найден. НЕ через `registry-get | jq` напрямую:
+# под set -euo pipefail «$DL» exit 1 (не найден) распространяется через pipefail и рвёт
+# скрипт ДО дружественного die() ниже — split на «получить (или пусто) → распарсить».
+role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
+
+actor="$(resolve_name)" || actor="${DEPT_APPROVE_TEST_ACTOR:-}"
+[ -n "$actor" ] || die "запускается только из сессии воркера"
+role="$(role_of "$actor")"
+[ "$role" = "руководитель" ] || die "заявку может подать только Руководитель (твоя роль: ${role:-нет в реестре})"
+"$DL" policy-check --worker "$actor" >/dev/null || exit 1   # турникет с готовой подсказкой в stderr
+
+[ -n "$reason" ] || die "usage: dept-planerka-request --reason '<s>'"
+reason="$(printf '%s' "$reason" | tr -d '\000-\010\013\014\016-\037')"
+[ "${#reason}" -le 400 ] || die "--reason длиннее 400 символов"
+
+request_json="$(jq -nc --arg reason "$reason" '{reason:$reason}')"
+detail="$("$RR" planerka "$request_json")" || die "не удалось построить detail из request"
+
+out="$("$BINDIR/dept-approve" --kind-of planerka --summary "планёрка отдела" \
+  --detail "$detail" --request-json "$request_json")" || exit 1
+echo "$out"

@@ -1,0 +1,87 @@
+#!/bin/bash
+# dept-spawn-exec — детерминированный bootstrap МК по утверждённой заявке worker_spawn.
+# Запускается dept-dispatcher'ом (--approval <event_id>) или оператором (прямые флаги).
+# Идемпотентен: каждый шаг «уже сделано → пропустить»; повторный прогон достраивает.
+#
+# Anti-forge (Codex-аудит К4, третий забор после /proc-гарда ledger и ролевого фильтра
+# диспетчера): в режиме --approval detail заявки РЕНДЕРИТСЯ ЗАНОВО из data.request через
+# dept-request-render и сверяется байт-в-байт с data.detail записи ledger — то, что видел
+# оператор на карточке, обязано совпадать с тем, что реально исполнит код. Расхождение
+# (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
+CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"   # env-переопределение для тестов (PATH-заглушка недоступна — вызов по абсолютному пути)
+REPO="$(cd "$BINDIR/.." && pwd)"
+BRAIN_CLIENTS="${BRAIN_CLIENTS:-/home/rainor/brain/wiki/work/ai-dev/клиенты}"
+DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
+die() { echo "dept-spawn-exec: $*" >&2; exit 1; }
+
+approval="" client="" name="" gid="" url="" note=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  --client) client="${2:-}"; shift 2 ;;
+  --name) name="${2:-}"; shift 2 ;;
+  --asana-gid) gid="${2:-}"; shift 2 ;;
+  --asana-url) url="${2:-}"; shift 2 ;;
+  --note) note="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+
+if [ -n "$approval" ]; then
+  row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
+  [ -n "$row" ] || die "аппрув не найден: $approval"
+  kind_of_row="$(jq -r '.data.kind_of // empty' <<<"$row")"
+  [ "$kind_of_row" = "worker_spawn" ] || die "аппрув $approval имеет kind_of=$kind_of_row, ожидался worker_spawn"
+  request_json="$(jq -c '.data.request // {}' <<<"$row")"
+  ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
+  rendered_detail="$("$RR" worker_spawn "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
+  [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+  client="$(jq -r '.client // empty' <<<"$request_json")"
+  name="$(jq -r '.name // empty' <<<"$request_json")"
+  gid="$(jq -r '.asana_gid // empty' <<<"$request_json")"
+  url="$(jq -r '.asana_url // empty' <<<"$request_json")"
+  note="$(jq -r '.note // empty' <<<"$request_json")"
+fi
+[[ "$name" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad name '$name'"
+[[ "$client" =~ ^[a-zA-Zа-яё0-9-]{1,60}$ ]] || die "bad client slug '$client'"
+[[ "$gid" =~ ^[0-9]{6,}$ ]] || die "bad asana gid '$gid'"
+[ -n "$url" ] || url="https://app.asana.com/0/0/$gid"
+
+dir="$BRAIN_CLIENTS/$client"
+# 1. Скелет папки (решение оператора №2: код делает скелет, ingest — первое задание МК)
+if [ ! -d "$dir" ]; then
+  mkdir -p "$dir"
+  sed -e "s/<Название клиента>/$client/g" -e "s/<slug>/$client/g" -e "s/YYYY-MM-DD/$(date +%F)/g" \
+    "$BRAIN_CLIENTS/_template.md" > "$dir/CLAUDE.md"
+  printf -- "---\ntype: timeline\nclient: %s\n---\n# Timeline — %s\n\n" "$client" "$client" > "$dir/timeline.md"
+  printf -- "---\ntype: decisions\nclient: %s\n---\n# Решения — %s\n\n" "$client" "$client" > "$dir/decisions.md"
+  echo "скелет папки создан: $dir"
+else
+  echo "папка клиента существует — скелет пропущен: $dir"
+fi
+
+# 2. Рендер миссии/bounds/probes/kickoff (в DEPT/missions и DEPT/render — попадает в git-snapshot)
+mkdir -p "$DEPT/missions" "$DEPT/render"
+esc() { printf '%s' "$1" | sed 's/[&/\\]/\\&/g'; }
+sed -e "s/{{WORKER_NAME}}/$(esc "$name")/g" -e "s/{{CLIENT_SLUG}}/$(esc "$client")/g" \
+    -e "s|{{ASANA_URL}}|$(esc "$url")|g" \
+  "$REPO/examples/department/mk-mission.template.md" > "$DEPT/missions/$name.md"
+[ -n "$note" ] && printf '\n## Специфика клиента (от Руководителя)\n%s\n' "$note" >> "$DEPT/missions/$name.md"
+sed -e "s|{{CLIENT_DIR_REL}}|$(esc "${dir#/}")|g" \
+  "$REPO/examples/department/mk-bounds.template.json" > "$DEPT/render/$name.bounds.json"
+sed -e "s/{{WORKER_NAME}}/$(esc "$name")/g" -e "s/{{ASANA_GID}}/$(esc "$gid")/g" \
+  "$REPO/examples/department/mk-probes.template.json" > "$DEPT/render/$name.probes.json"
+sed -e "s/{{WORKER_NAME}}/$(esc "$name")/g" -e "s/{{CLIENT_SLUG}}/$(esc "$client")/g" \
+    -e "s|{{ASANA_URL}}|$(esc "$url")|g" \
+  "$REPO/examples/department/mk-spawn-kickoff.template.md" > "$DEPT/render/$name.kickoff.md"
+
+# 3. Spawn (сам идемпотентен: существующий spawned-воркер достраивается)
+"$CA" spawn --name "$name" --cwd "$dir" --mission-file "$DEPT/missions/$name.md" \
+  --bounds-file "$DEPT/render/$name.bounds.json" --probe-config "$DEPT/render/$name.probes.json" \
+  --kickoff-file "$DEPT/render/$name.kickoff.md" || die "spawn failed (повторный прогон достроит)"
+
+# 4. Реестр отдела (идемпотентно)
+"$DL" registry-set "$name" --role мк --client "$client" --mission-version v3 --actor dispatcher
+
+echo "bootstrap complete: $name (клиент $client, папка $dir)"

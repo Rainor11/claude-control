@@ -1,0 +1,78 @@
+#!/bin/bash
+# dept-mission-exec — исполнитель заявки mission_change: пересобирает CLAUDE.md воркера
+# от нового текста миссии и добивает rebase (миссия вступает в силу немедленно).
+# Запускается dept-dispatcher'ом (--approval <event_id>) или оператором (прямые флаги
+# --worker/--mission-file/--reason).
+#
+# Идемпотентен: перезапись CLAUDE.md от того же mission_text — тот же результат;
+# повторный rebase безопасен (лишняя пересборка сессии, не потеря/дублирование эффекта).
+# Повторный вызов с ТЕМ ЖЕ --approval после hard-kill между "миссия применена" и записью
+# approval-exec диспетчером — просто повторяет ту же перезапись + rebase.
+#
+# Anti-forge (Codex-аудит К4): в режиме --approval detail заявки РЕНДЕРИТСЯ ЗАНОВО из
+# data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
+# ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
+CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
+DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
+die() { echo "dept-mission-exec: $*" >&2; exit 1; }
+
+approval="" worker="" mission_file="" reason=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  --worker) worker="${2:-}"; shift 2 ;;
+  --mission-file) mission_file="${2:-}"; shift 2 ;;
+  --reason) reason="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+
+if [ -n "$approval" ]; then
+  row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
+  [ -n "$row" ] || die "аппрув не найден: $approval"
+  kind_of_row="$(jq -r '.data.kind_of // empty' <<<"$row")"
+  [ "$kind_of_row" = "mission_change" ] || die "аппрув $approval имеет kind_of=$kind_of_row, ожидался mission_change"
+  request_json="$(jq -c '.data.request // {}' <<<"$row")"
+  ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
+  rendered_detail="$("$RR" mission_change "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
+  [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+  worker="$(jq -r '.worker // empty' <<<"$request_json")"
+  reason="$(jq -r '.reason // empty' <<<"$request_json")"
+  mission_text="$(jq -r '.mission_text // empty' <<<"$request_json")"
+  [ -n "$worker" ] && [ -n "$mission_text" ] || die "request неполный (нужны worker/mission_text)"
+  mkdir -p "$DEPT/render"
+  printf '%s' "$mission_text" > "$DEPT/render/$worker.mission.new.md"
+  mission_file="$DEPT/render/$worker.mission.new.md"
+fi
+[ -n "$worker" ] || die "usage: dept-mission-exec --approval <event_id> | --worker <w> --mission-file <f> [--reason <s>]"
+[ -n "$mission_file" ] && [ -f "$mission_file" ] || die "--mission-file обязателен и должен существовать"
+reason="${reason:-смена миссии}"
+
+out="$("$CA" mission-update "$worker" --mission-file "$mission_file" --reason "$reason" 2>&1)"; rc=$?
+echo "$out"
+if [ "$rc" -eq 0 ]; then
+  echo "mission-exec complete: $worker"
+  exit 0
+fi
+if [ "$rc" -ne 3 ]; then
+  die "mission-update завершился ошибкой (rc=$rc)"
+fi
+
+# rc=3: миссия УЖЕ записана (CLAUDE.md пересобран), rebase отложен (воркер busy) — ретраим
+# отдельными вызовами claude-auto rebase, до 10 попыток с паузой 30с (§ Task 8 акцептанс).
+ok=false
+for i in $(seq 1 10); do
+  sleep 30
+  rout="$("$CA" rebase "$worker" --reason "миссия: $reason" 2>&1)"; rrc=$?
+  echo "$rout"
+  if [ "$rrc" -eq 0 ]; then ok=true; break; fi
+  if [ "$rrc" -ne 3 ]; then die "rebase после mission-update завершился ошибкой (rc=$rrc)"; fi
+done
+if [ "$ok" = true ]; then
+  echo "mission-exec complete: $worker (rebase применён после отложенной попытки)"
+  exit 0
+fi
+# НЕ провал: миссия применена и переживёт следующую компакцию/rebase-check/оператор.
+echo "миссия применена, rebase отложен — добьёт rebase-check/оператор"
+exit 0

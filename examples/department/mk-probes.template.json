@@ -1,0 +1,6 @@
+{ "probes": [
+  { "name": "dept-bus", "source": "ledger", "interval_sec": 60, "timeout_sec": 30,
+    "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/ledger-messages", "--worker", "{{WORKER_NAME}}"] },
+  { "name": "asana-deal", "source": "asana", "interval_sec": 300, "timeout_sec": 40,
+    "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/asana-comments", "--task", "{{ASANA_GID}}"] }
+] }

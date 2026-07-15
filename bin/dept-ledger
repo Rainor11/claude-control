@@ -326,7 +326,20 @@ function cmdApprovalOpen(a) {
   const data = { kind_of: a['kind-of'],
     from: a.actor || process.env.CLAUDE_AUTO_NAME || 'operator',
     summary: a.summary, status: 'open' };
-  if (a.detail) data.detail = String(a.detail).slice(0, 20000);
+  // mission_change несёт ПОЛНЫЙ текст миссии (≤16000 симв.) в request И в detail — generic-кап
+  // 8000/20000 провалил бы любую реальную миссию. Капы синхронны (request-json и detail), чтобы
+  // dept-request-render, восстанавливающий detail из request в исполнителе (Task 8, anti-forge
+  // К4), совпал байт-в-байт БЕЗ обрезки ни на одной стороне.
+  const isMission = a['kind-of'] === 'mission_change';
+  if (a.detail) data.detail = String(a.detail).slice(0, isMission ? 22000 : 20000);
+  if (a['request-json'] !== undefined) {
+    let req;
+    try { req = JSON.parse(a['request-json']); } catch { die('approval-open: --request-json не валидный JSON'); }
+    if (req === null || typeof req !== 'object' || Array.isArray(req)) die('approval-open: --request-json должен быть JSON-объектом');
+    const reqCap = isMission ? 22000 : 8000;
+    if (JSON.stringify(req).length > reqCap) die(`approval-open: --request-json слишком большой (>${reqCap})`);
+    data.request = req;
+  }
   const pv = policyCurrentSafe();
   if (pv) data.policy_version_seen = pv;
   out(brief(appendEvent('approval', data, a.actor)));

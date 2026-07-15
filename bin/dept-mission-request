@@ -1,0 +1,77 @@
+#!/bin/bash
+# dept-mission-request — заявка руководителя на смену миссии воркера (mission_change).
+# WORKER-ONLY (см. dept-spawn-request header — идентичность/роль/policy-турникет
+# идентичны). Новый текст миссии читается на STDIN (≤16000 симв., utf8_trunc — ДОСЛОВНАЯ
+# копия из claude-auto-request). detail строится ТОЛЬКО через dept-request-render.
+set -euo pipefail
+CLAUDE_INSTALL="/home/rainor/.local/share/claude"        # trusted claude tree
+
+die() { echo "dept-mission-request: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — ДОСЛОВНО из dept-approve resolve_name --
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    # --resume ИЛИ --session-id — fresh-запуск spawn/rebase (claude --session-id <W>
+    # без --resume до первого рестарта). Остальные проверки (exe в CLAUDE_INSTALL,
+    # CLAUDE_AUTO_NAME из environ предка) не меняются — спуф-стойкость сохранена.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxE -- '--resume|--session-id'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+# ---- utf8_trunc — ДОСЛОВНО из claude-auto-request (UTF-8-safe truncation to N chars) --
+utf8_trunc() {
+  python3 -c 'import sys;sys.stdout.buffer.write(sys.stdin.buffer.read().decode("utf-8","replace")[:int(sys.argv[1])].encode("utf-8"))' "$1"
+}
+
+worker="" reason=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --worker) worker="${2:-}"; shift 2 ;;
+    --reason) reason="${2:-}"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RR="$BINDIR/dept-request-render"
+
+# роль из реестра, пусто если воркер не найден. НЕ через `registry-get | jq` напрямую:
+# под set -euo pipefail «$DL» exit 1 (не найден) распространяется через pipefail и рвёт
+# скрипт ДО дружественного die() ниже — split на «получить (или пусто) → распарсить».
+role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
+
+actor="$(resolve_name)" || actor="${DEPT_APPROVE_TEST_ACTOR:-}"
+[ -n "$actor" ] || die "запускается только из сессии воркера"
+role="$(role_of "$actor")"
+[ "$role" = "руководитель" ] || die "заявку может подать только Руководитель (твоя роль: ${role:-нет в реестре})"
+"$DL" policy-check --worker "$actor" >/dev/null || exit 1   # турникет с готовой подсказкой в stderr
+
+[ -n "$worker" ] || die "usage: dept-mission-request --worker <w> --reason '<s>' (новый текст миссии — на stdin)"
+[[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad --worker '$worker'"
+[ -n "$reason" ] || die "--reason обязателен"
+reason="$(printf '%s' "$reason" | tr -d '\000-\010\013\014\016-\037')"
+[ "${#reason}" -le 400 ] || die "--reason длиннее 400 символов"
+
+mission_text="$(cat | tr -d '\000-\010\013\014\016-\037' | utf8_trunc 16000)"
+[ -n "${mission_text//[[:space:]]/}" ] || die "текст миссии (stdin) пуст после чтения"
+
+request_json="$(jq -nc --arg worker "$worker" --arg reason "$reason" --arg mt "$mission_text" \
+  '{worker:$worker, reason:$reason, mission_text:$mt}')"
+detail="$("$RR" mission_change "$request_json")" || die "не удалось построить detail из request"
+
+out="$("$BINDIR/dept-approve" --kind-of mission_change --summary "смена миссии: $worker" \
+  --detail "$detail" --request-json "$request_json")" || exit 1
+echo "$out"

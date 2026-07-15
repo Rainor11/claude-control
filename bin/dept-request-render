@@ -1,0 +1,61 @@
+#!/bin/bash
+# dept-request-render — канонический detail-текст, восстановленный из request-json заявки.
+# ЕДИНСТВЕННЫЙ источник форматирования detail для заявок руководителя (worker_spawn/
+# mission_change/planerka/sleep): обёртки (dept-*-request) строят detail ИСКЛЮЧИТЕЛЬНО
+# этим рендером (руками текст не пишут), исполнители (dept-*-exec) перед работой рендерят
+# detail заново из request и сверяют байт-в-байт с data.detail, записанным в ledger
+# (Codex-аудит К4, anti-forge: третий забор после /proc-гарда ledger и ролевого фильтра
+# диспетчера). Обёртка и исполнитель зовут ОДИН И ТОТ ЖЕ скрипт — расхождение форматов
+# между «что видит оператор» и «что исполняет код» механически исключено.
+#
+# Usage: dept-request-render <kind_of> '<request-json>'
+set -u
+die() { echo "dept-request-render: $*" >&2; exit 1; }
+
+kind_of="${1:-}"
+request_json="${2:-}"
+[ -n "$kind_of" ] || die "usage: dept-request-render <kind_of> '<request-json>'"
+[ -n "$request_json" ] || die "usage: dept-request-render <kind_of> '<request-json>'"
+command -v jq >/dev/null 2>&1 || die "jq required"
+printf '%s' "$request_json" | jq -e 'type=="object"' >/dev/null 2>&1 || die "request-json должен быть JSON-объектом"
+
+jget() { printf '%s' "$request_json" | jq -r --arg k "$1" '.[$k] // empty'; }
+
+case "$kind_of" in
+  worker_spawn)
+    client="$(jget client)"; name="$(jget name)"; gid="$(jget asana_gid)"; url="$(jget asana_url)"; note="$(jget note)"
+    [ -n "$client" ] && [ -n "$name" ] && [ -n "$gid" ] || die "worker_spawn: request требует поля client/name/asana_gid"
+    printf 'Найм МК «%s» (%s)\n\n' "$client" "$name"
+    printf 'Клиент: %s\n' "$client"
+    printf 'Воркер: %s\n' "$name"
+    printf 'Asana-задача: %s (GID %s)\n' "${url:-нет}" "$gid"
+    [ -n "$note" ] && printf 'Заметка Руководителя: %s\n' "$note"
+    printf '\nЧто произойдёт при исполнении:\n'
+    printf '1. Скелет папки клиента в brain (CLAUDE.md/timeline.md/decisions.md по шаблону) — если ещё не создан\n'
+    printf '2. Миссия из шаблона mk-mission (v3), привязанная к клиенту и Asana-задаче\n'
+    printf '3. Датчики: dept-bus (шина отдела) + asana-deal (комменты задачи)\n'
+    printf '4. Регистрация в реестре отдела (роль мк, client=%s, mission_version v3)\n' "$client"
+    printf '5. Первое задание МК: ingest клиентского контекста из Asana %s по правилам brain\n' "${url:-задачи}"
+    ;;
+  mission_change)
+    worker="$(jget worker)"; reason="$(jget reason)"; mission_text="$(jget mission_text)"
+    [ -n "$worker" ] && [ -n "$mission_text" ] || die "mission_change: request требует поля worker/mission_text"
+    printf 'Смена миссии воркера %s\n\n' "$worker"
+    printf 'Причина: %s\n' "${reason:-не указана}"
+    printf '\n--- Новый текст миссии ---\n'
+    printf '%s' "$mission_text"
+    ;;
+  planerka)
+    reason="$(jget reason)"
+    printf 'Плановая пересборка сессий отдела (rebase всех активных воркеров: руководитель/мк/архивариус/тп)\n\n'
+    printf 'Причина: %s\n' "${reason:-не указана}"
+    ;;
+  sleep)
+    worker="$(jget worker)"; reason="$(jget reason)"
+    [ -n "$worker" ] || die "sleep: request требует поле worker"
+    printf 'Усыпить воркера %s\n\n' "$worker"
+    printf 'Причина: %s\n' "${reason:-не указана}"
+    printf '\nКонтур остаётся живым: датчики клиента продолжают опрашиваться диспетчером; новое событие (сообщение/Asana-коммент) автоматически разбудит воркера.\n'
+    ;;
+  *) die "неизвестный kind_of: $kind_of (∈ worker_spawn|mission_change|planerka|sleep)" ;;
+esac
