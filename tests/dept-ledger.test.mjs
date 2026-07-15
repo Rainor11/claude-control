@@ -433,6 +433,74 @@ test('approval-exec: только после approved, идемпотентно;
   assert.throws(() => run(home, ['approval-resolve', a.event_id, '--status', 'denied', '--actor', 'operator']));
 });
 
+// Task 11-fix: промежуточный статус executing (дедуп исполнения долгих заявок диспетчером).
+// Прямой approved→executed (тест выше) — операторский ручной путь, ОБЯЗАН остаться рабочим.
+
+test('approval-exec: approved→executing→executed проходит, executing идемпотентен', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'worker_spawn',
+    '--summary', 'нанять мк-тест', '--actor', 'dept-head']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  const e1 = JSON.parse(run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']));
+  assert.ok(e1.event_id);
+  assert.notEqual(e1.deduped, true);
+  // второй тик/прогон видит уже executing — дедуп, НЕ второе событие
+  const e2 = JSON.parse(run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']));
+  assert.equal(e2.deduped, true);
+  // раннер дописывает финал
+  const e3 = JSON.parse(run(home, ['approval-exec', a.event_id, '--status', 'executed', '--actor', 'dispatcher']));
+  assert.ok(e3.event_id);
+  assert.notEqual(e3.deduped, true);
+  const rows = run(home, ['list', '--kind', 'approval_status']).trim().split('\n');
+  assert.equal(rows.length, 3); // approved + executing + executed, второй executing НЕ дописан (дедуп)
+  assert.equal(run(home, ['list', '--kind', 'approval', '--status', 'executed']).trim().split('\n').length, 1);
+});
+
+test('executing виден в list и НЕ попадает в выборку approved', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'planerka', '--summary', 'план', '--actor', 'dept-head']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']);
+  const executing = run(home, ['list', '--kind', 'approval', '--status', 'executing']).trim().split('\n').map(JSON.parse);
+  assert.equal(executing.length, 1);
+  assert.equal(executing[0].event_id, a.event_id);
+  const approved = run(home, ['list', '--kind', 'approval', '--status', 'approved']).trim();
+  assert.equal(approved, ''); // effectiveStatus теперь executing, НЕ approved — pickExecutable его не увидит
+});
+
+test('approval-exec executing блокирует approval-resolve (заявка уже исполняется)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'sleep', '--summary', 'сон', '--actor', 'dept-head']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']);
+  assert.throws(
+    () => run(home, ['approval-resolve', a.event_id, '--status', 'denied', '--actor', 'operator']),
+    (err) => { assert.match(String(err.stderr), /исполня/i); return true; },
+  );
+});
+
+test('approval-exec: executed→executing отклоняется (финал)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'mission_change', '--summary', 'смена курса', '--actor', 'dept-head']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  run(home, ['approval-exec', a.event_id, '--status', 'executed', '--actor', 'dispatcher']); // прямой путь (back-compat)
+  assert.throws(() => run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']));
+});
+
+test('rotate: заявка в executing НЕ ротируется (даже старая, даже для generic kind_of)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'worker_spawn', '--summary', 'найм', '--actor', 'dept-head']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  run(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']);
+  const led = join(home, 'events.jsonl');
+  const old = new Date(Date.now() - 40 * 86400_000).toISOString();
+  writeFileSync(led, readFileSync(led, 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.stringify({ ...JSON.parse(l), ts: old })).join('\n') + '\n');
+  run(home, ['rotate', '--days', '30']);
+  const left = run(home, ['list', '--kind', 'approval', '--event-id', a.event_id]).trim();
+  assert.ok(left); // жива в активном файле, ротация её не тронула
+});
+
 test('list --event-id находит конверт', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 'x', '--actor', 'w']));

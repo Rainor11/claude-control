@@ -1,0 +1,103 @@
+#!/bin/bash
+# dept-exec-runner — detached-обёртка вокруг исполнителей заявок (dept-*-exec).
+#
+# Task 11-fix (P3-CRITICAL, вскрыт боевой планёркой 2026-07-15): раньше dept-dispatcher
+# запускал исполнителя СИНХРОННО (execFileSync, timeout 15 мин) — тик диспетчера блокировался
+# на всё время исполнения. Долгий exec (планёрка ребейзит весь флот с ретраями) + systemd
+# (дефолтный TimeoutStartSec) убивал зависший dispatcher → осиротевший exec продолжал жить,
+# а следующий тик видел approval всё ещё "approved" и стартовал НОВЫЙ exec на ту же заявку —
+# несколько параллельных исполнителей одной заявки, взаимоблокировка.
+#
+# Фикс: dept-dispatcher помечает заявку executing (дедуп на уровне ledger — approved→executing
+# идемпотентен) и запускает ЭТОТ раннер DETACHED (spawn detached+unref, stdio ignore) — тик НЕ
+# ждёт исполнения. Раннер исполняет синхронно и НЕЗАВИСИМО от диспетчера пишет финальный
+# статус (executed/exec_failed) через approval-exec.
+#
+# Usage: dept-exec-runner --approval <event_id> --executor <path-to-dept-*-exec>
+#
+# Whitelist (anti-forge): --executor обязан быть файлом В ТОМ ЖЕ каталоге, что и этот раннер
+# (BINDIR), и его basename ∈ whitelist ниже — НЕ произвольный путь. Раннер спавнится detached,
+# оператор не видит аргументы вызова в реальном времени — whitelist забор от инъекции
+# произвольного бинаря через --executor.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
+DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
+TIMEOUT_MS="${DEPT_EXEC_RUNNER_TIMEOUT_MS:-900000}"
+die() { echo "dept-exec-runner: $*" >&2; exit 1; }
+
+approval="" executor=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  --executor) executor="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+
+[[ "$approval" =~ ^evt_[0-9]+_[a-z0-9]{4}$ ]] || die "bad --approval event_id: '$approval'"
+[ -n "$executor" ] || die "--executor обязателен"
+
+# whitelist: basename ДОЛЖЕН быть одним из известных исполнителей заявок руководителя, И
+# резолвленный каталог ДОЛЖЕН совпадать с каталогом самого раннера (не произвольный путь).
+WHITELIST="dept-spawn-exec dept-mission-exec dept-planerka-exec dept-sleep-exec"
+executor_base="$(basename -- "$executor")"
+ok=false
+for w in $WHITELIST; do [ "$executor_base" = "$w" ] && ok=true && break; done
+[ "$ok" = true ] || die "executor '$executor_base' не в whitelist ($WHITELIST)"
+executor_dir="$(cd "$(dirname -- "$executor")" 2>/dev/null && pwd)" || die "executor путь не существует: $executor"
+[ "$executor_dir" = "$BINDIR" ] || die "executor обязан лежать в $BINDIR (whitelist по каталогу), получено: $executor_dir"
+executor_resolved="$executor_dir/$executor_base"
+[ -x "$executor_resolved" ] || die "executor не исполняемый файл: $executor_resolved"
+
+# UTF-8-safe хвост последних N СИМВОЛОВ (не байт) — bash `cut -c`/`tail -c` режут по байтам
+# и могут разрубить многобайтовый символ пополам (тот же класс проблемы, что utf8_trunc в
+# claude-auto-request). python3 уже требуется в проекте для той же задачи.
+utf8_tail() { # $1 = n симв., читает stdin
+  python3 -c 'import sys
+s = sys.stdin.buffer.read().decode("utf-8", "replace")
+n = int(sys.argv[1])
+sys.stdout.buffer.write(s[-n:].encode("utf-8"))' "$1"
+}
+
+mkdir -p "$DEPT" 2>/dev/null || true
+LOG_FILE="$DEPT/runner-${approval}.log"
+out_file="$(mktemp)"; err_file="$(mktemp)"
+trap 'rm -f "$out_file" "$err_file"' EXIT
+
+# timeout(1) — GNU coreutils. TIMEOUT_MS — миллисекунды из env (дефолт 900000=15мин), timeout(1)
+# принимает дробные секунды. --kill-after гарантирует, что зависший исполнитель, игнорирующий
+# SIGTERM, реально умрёт (SIGKILL) — иначе процесс мог бы пережить логический таймаут раннера.
+timeout_sec="$(awk -v ms="$TIMEOUT_MS" 'BEGIN{printf "%.3f", ms/1000}')"
+timeout --kill-after=10s "${timeout_sec}s" "$executor_resolved" --approval "$approval" >"$out_file" 2>"$err_file"
+rc=$?
+
+{
+  echo "=== dept-exec-runner $(date -Is) approval=$approval executor=$executor_base rc=$rc ==="
+  echo "--- stdout ---"; cat "$out_file"
+  echo "--- stderr ---"; cat "$err_file"
+} >> "$LOG_FILE" 2>&1
+
+if [ "$rc" -eq 0 ]; then
+  note="$(utf8_tail 500 < "$out_file")"
+  if "$DL" approval-exec "$approval" --status executed --note "$note" --actor dispatcher >>"$LOG_FILE" 2>&1; then
+    "$NOTIFY" "✅ заявка $approval исполнена (раннер, executor=$executor_base)" >/dev/null 2>&1
+    exit 0
+  fi
+  # Исполнитель УЖЕ сделал дело, но исход не записан — заявка останется в executing и
+  # попадёт в recovery-детект диспетчера (DEPT_EXEC_MAX_MIN). Кричим сразу, не ждём таймера.
+  "$NOTIFY" "🚨 dept-exec-runner: заявка $approval ИСПОЛНЕНА, но approval-exec executed НЕ записан (см. $LOG_FILE) — зависнет в executing, разберись" >/dev/null 2>&1
+  exit 1
+fi
+
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  msg="timeout после ${timeout_sec}s (executor не завершился, убит)"
+else
+  msg="$(utf8_tail 500 < "$err_file")"
+  [ -n "$msg" ] || msg="executor завершился с exit code $rc без вывода в stderr (см. $LOG_FILE)"
+fi
+if "$DL" approval-exec "$approval" --status exec_failed --note "$msg" --actor dispatcher >>"$LOG_FILE" 2>&1; then
+  "$NOTIFY" "🔴 заявка $approval НЕ исполнена (executor=$executor_base): $msg" >/dev/null 2>&1
+  exit 1
+fi
+"$NOTIFY" "🚨 dept-exec-runner: заявка $approval провалилась, И approval-exec exec_failed НЕ записан (см. $LOG_FILE) — зависнет в executing, разберись" >/dev/null 2>&1
+exit 1

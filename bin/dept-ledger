@@ -26,7 +26,11 @@ const REQUIRED = {
 const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff',
   'kb_change_request', 'decision_request']); // §5 спеки; worker_spawn/mission_change — approvals, не messages
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
-const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed'];
+// Task 11-fix: 'executing' — промежуточный статус между approved и executed/exec_failed.
+// Диспетчер помечает заявку executing ДО запуска исполнителя detached (dept-exec-runner),
+// чтобы следующий тик/прогон видел её НЕ approved (effectiveStatus) и не запускал второй
+// исполнитель на ту же заявку — см. cmdApprovalExec ниже и wiki-бриф P3-Task-11fix.
+const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed', 'executing'];
 const ROTATE_DAYS_DEFAULT = 30;
 const POLICY_DIR = process.env.DEPT_POLICY_DIR || '/home/rainor/brain/wiki/work/ai-dev/отдел/правила';
 // Number(garbage) → NaN, а `x > NaN` всегда false — старое `Number(env || 24)` при кривом
@@ -363,8 +367,14 @@ function cmdApprovalResolve(a) {
       let apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
       if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
       const eff = apr ? effectiveStatus(events, apr, 'approval_status', 'open') : null;
+      // Task 11-fix: executing тоже блокирует resolve — заявка уже в работе у раннера,
+      // менять решение (denied) под ней небезопасно (раннер продолжит исполнять «отменённую»).
       if (apr && ['executed', 'exec_failed'].includes(eff)) {
         const err = new Error('approval-resolve: аппрув уже исполнен (' + eff + ') — менять решение поздно');
+        err.cliError = true; throw err;
+      }
+      if (apr && eff === 'executing') {
+        const err = new Error('approval-resolve: аппрув уже исполняется (executing) — менять решение поздно');
         err.cliError = true; throw err;
       }
       if (apr && eff === a.status) return { event_id: ref, deduped: true };
@@ -389,10 +399,20 @@ function readChainStatuses(ref) { // статусы цепочки: активн
   rows.sort((x, y) => x.seq - y.seq);
   return rows;
 }
+// Task 11-fix: разрешённые ИСТОЧНИКИ для каждого целевого статуса approval-exec.
+// executing — только из approved (диспетчер помечает ДО запуска раннера).
+// executed/exec_failed — из approved (прямой путь, back-compat: операторский ручной
+// approval-exec и старые тесты Task 1) ИЛИ из executing (раннер дописывает финал).
+// executed/exec_failed сами не встречаются как источник ни для чего — уже финал (die).
+const EXEC_TARGET_FROM = {
+  executing: ['approved'],
+  executed: ['approved', 'executing'],
+  exec_failed: ['approved', 'executing'],
+};
 function cmdApprovalExec(a) {
-  const ref = a._[1] || die('usage: dept-ledger approval-exec <event_id> --status <executed|exec_failed> [--note <s>]');
-  const status = a.status || die('approval-exec: --status обязателен (executed|exec_failed)');
-  if (!['executed', 'exec_failed'].includes(status)) die('approval-exec: --status ∉ executed|exec_failed');
+  const ref = a._[1] || die('usage: dept-ledger approval-exec <event_id> --status <executing|executed|exec_failed> [--note <s>]');
+  const status = a.status || die('approval-exec: --status обязателен (executing|executed|exec_failed)');
+  if (!EXEC_TARGET_FROM[status]) die('approval-exec: --status ∉ executing|executed|exec_failed');
   assertNotWorkerSession('approval-exec'); // /proc-гард, см. 3.8
   let result;
   try {
@@ -403,7 +423,10 @@ function cmdApprovalExec(a) {
       const sts = readChainStatuses(ref);
       const eff = sts.length ? sts[sts.length - 1].data.status : (apr.data.status || 'open');
       if (eff === status) return { event_id: ref, deduped: true };
-      if (eff !== 'approved') { const err = new Error(`approval-exec: эффективный статус «${eff}», исполнять можно только approved`); err.cliError = true; throw err; }
+      if (!EXEC_TARGET_FROM[status].includes(eff)) {
+        const err = new Error(`approval-exec: эффективный статус «${eff}», переход в «${status}» недопустим (нужен один из: ${EXEC_TARGET_FROM[status].join('/')})`);
+        err.cliError = true; throw err;
+      }
       const data = { ref, status };
       if (a.note) data.note = String(a.note).slice(0, 2000);
       return brief(writeEventUnlocked('approval_status', data, a.actor));
@@ -572,6 +595,9 @@ function cmdRotate(a) {
     const EXEC_KINDS_ROT = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
     const CLOSED = {
       message: (s) => ['handled', 'dead'].includes(s),
+      // Task 11-fix: 'executing' НЕ перечислен здесь ни в одной ветке → всегда считается
+      // "не закрыто" (как approved для exec-kind) и НЕ ротируется — заявка ждёт раннера,
+      // dept-dispatcher читает только активный файл, потерять её ротацией нельзя.
       approval: (s, e) => ['denied', 'executed', 'exec_failed'].includes(s)
         || (s === 'approved' && !EXEC_KINDS_ROT.has(e.data.kind_of)),
       incident: (s) => ['resolved', 'wontfix', 'duplicate'].includes(s),

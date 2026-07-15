@@ -9,7 +9,11 @@
 //      отфильтрованных pickExecutable (kind_of ∈ EXEC_KINDS И from — руководитель/
 //      operator). Codex-аудит К3: approved-строка сама по себе НЕ мандат — /proc-гард
 //      в dept-ledger (approval-exec) первый забор, этот ролевой фильтр — второй,
-//      сверка detail↔request в исполнителях Task 8 — третий.
+//      сверка detail↔request в исполнителях Task 8 — третий. Task 11-fix: заявка
+//      ПОМЕЧАЕТСЯ executing (дедуп на уровне ledger) и исполнитель запускается через
+//      dept-exec-runner DETACHED — тик НЕ ждёт исполнения (см. bin/dept-exec-runner).
+//      Recovery: заявки, застрявшие в executing дольше DEPT_EXEC_MAX_MIN (раннер
+//      умер) — алерт оператору, БЕЗ авто-рестарта (дедуп маркер-файлом на event_id).
 //   3. Детект неактивности МК (решение оператора №6): без DEPT_SLEEP_AUTO=1 —
 //      decision_request Руководителю (дедуп на эпизод); с флагом — авто-`claude-auto
 //      sleep`. Чистая decideSleep() решает 'none'|'ask_head'|'auto_sleep'.
@@ -19,7 +23,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const crypto = require('crypto');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
@@ -55,7 +59,17 @@ function visiblePart(rawline) {
   const m = /^\x1eebid=([^\x1e]+)\x1e/.exec(rawline);
   return m ? rawline.slice(m[0].length) : rawline;
 }
-module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS };
+// Task 11-fix: чистая функция recovery-детекта. rows — уже СКЛЕЕННЫЙ список заявок в
+// эффективном статусе executing вместе с моментом входа в этот статус (executing_since —
+// ts approval_status-события executing, НЕ ts самой approval-заявки): caller (executingApprovals()
+// ниже) джойнит list --kind approval --status executing с list --kind approval_status
+// --filter status=executing. Строго БОЛЬШЕ порога (не >=) — "ровно на пороге" ещё не зависла,
+// чтобы не спамить алертом в момент, когда раннер, возможно, вот-вот допишет финал.
+function stuckExecuting(rows, nowMs, maxMin) {
+  const thresholdMs = maxMin * 60_000;
+  return rows.filter((r) => r.executing_since && (nowMs - Date.parse(r.executing_since)) > thresholdMs);
+}
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting };
 if (require.main !== module) return;
 
 // ---- CLI ---------------------------------------------------------------
@@ -84,6 +98,11 @@ function numEnv(name, def) {
 const CFG = { idleDays: numEnv('DEPT_SLEEP_IDLE_DAYS', 7) };
 const STALE_AFTER_MS = numEnv('CLAUDE_AUTO_STALE_SECONDS', 1800) * 1000;
 const AUTO = process.env.DEPT_SLEEP_AUTO === '1';
+// Task 11-fix: сколько минут заявка может провести в executing, прежде чем считаться
+// зависшей (раннер, вероятно, умер — hard-kill/OOM/systemd). НЕ авто-рестарт — только алерт,
+// оператор решает (идемпотентность исполнителей есть, но авто-рестарт застрявшего = риск).
+const EXEC_MAX_MIN = numEnv('DEPT_EXEC_MAX_MIN', 20);
+const EXEC_RUNNER = path.join(BIN, 'dept-exec-runner');
 
 const EXECUTORS = {
   worker_spawn: 'dept-spawn-exec', mission_change: 'dept-mission-exec',
@@ -92,9 +111,11 @@ const EXECUTORS = {
 
 // Best-effort лок (см. liveness/rebase-check): ручной прогон параллельно с таймером
 // иначе гонит read-modify-write sleep-check-state.json/.dispatcher-lastrun-* без
-// синхронизации. 20 мин "протухания" — таймер бьёт раз в 2 мин, но один тик может
-// исполнить НЕСКОЛЬКО заявок по 15 мин таймаут каждая (обязанность 2) — запас на
-// легитимно долгий прогон, не только на секундный.
+// синхронизации. Task 11-fix: обязанность 2 (исполнение заявок) больше НЕ блокирует тик —
+// раннер запускается detached, дольше всего тик может занять на обязанности 1/3 (пробы
+// СПЯЩИХ + claude-auto start/sleep/rebase, execFileSync таймаут 60с на каждый вызов,
+// воркеров может быть несколько). 20 мин "протухания" — таймер бьёт раз в 2 мин, запас
+// на легитимно долгий прогон при большом флоте, не только на секундный.
 const LOCK_FILE = path.join(DEPT, 'dispatcher.lock');
 const LOCK_STALE_MS = 20 * 60_000;
 function acquireLock() {
@@ -246,38 +267,77 @@ for (const [name, meta] of Object.entries(autoWorkers)) {
   }
 }
 
-// ---- 2) исполнение утверждённых заявок -------------------------------------
+// ---- 2) исполнение утверждённых заявок (Task 11-fix: executing + detached раннер) -----
+// Старый баг (боевая планёрка 2026-07-15): execFileSync(executor, timeout 15мин) блокировал
+// тик диспетчера целиком; systemd (дефолтный TimeoutStartSec) убивал зависший на >N сек
+// dispatcher, осиротевший exec продолжал жить, а следующий тик видел approval всё ещё
+// "approved" и стартовал НОВЫЙ exec на ту же заявку → параллельные исполнители одной
+// заявки, взаимоблокировка. Фикс: (1) пометить executing ДО запуска — дедуп на уровне
+// ledger (approval-exec approved→executing идемпотентен: второй прогон получит
+// deduped:true и пропустит заявку); (2) запустить dept-exec-runner DETACHED — тик НЕ ждёт
+// исполнения, продолжает следующую заявку немедленно. Раннер сам пишет финальный статус
+// (executed/exec_failed) независимо от диспетчера — см. bin/dept-exec-runner.
+
+// Recovery: заявки, застрявшие в executing (раннер, вероятно, умер — hard-kill/OOM).
+// ДО обычного цикла исполнения — оператору важно узнать про зависшую заявку даже если в
+// этом тике нет новых approved. Дедуп алерта — маркер-файл на event_id (не спамить каждые
+// 2 мин, пока оператор не разберётся и не тронет заявку/маркер).
+function executingApprovals() {
+  const executingRows = dlList(['--kind', 'approval', '--status', 'executing']); // effectiveStatus
+  const executingMarks = dlList(['--kind', 'approval_status', '--filter', 'status=executing']); // сырые события
+  const since = new Map(); // ref -> ts первого approval_status(executing) (approved→executing пишется РОВНО один раз — дедуп в ledger блокирует повтор)
+  for (const m of executingMarks) if (!since.has(m.data.ref)) since.set(m.data.ref, m.ts);
+  return executingRows.map((r) => ({ event_id: r.event_id, kind_of: r.data.kind_of, executing_since: since.get(r.event_id) }))
+    .filter((r) => r.executing_since);
+}
+const stuck = stuckExecuting(executingApprovals(), now, EXEC_MAX_MIN);
+for (const s of stuck) {
+  const marker = path.join(DEPT, `exec-stuck-${s.event_id}`);
+  if (dry) { console.log(`[dry] алерт зависшей заявки: ${s.kind_of} ${s.event_id} (executing > ${EXEC_MAX_MIN}мин)`); continue; }
+  if (fs.existsSync(marker)) continue; // уже алертили этот эпизод
+  notify(`🚨 dispatcher: заявка ${s.kind_of} ${s.event_id} зависла в executing >${EXEC_MAX_MIN}мин — раннер умер? разберись`);
+  try { fs.writeFileSync(marker, String(now)); } catch (e) { console.error(`dispatcher: не смог записать маркер зависшей заявки ${s.event_id}: ${e.message}`); }
+}
+
 const approvalRows = dlList(['--kind', 'approval', '--status', 'approved']);
 const executable = pickExecutable(approvalRows, roleOf);
-let execOkCount = 0, execFailCount = 0;
+let execStartedCount = 0, execSkippedCount = 0;
 for (const row of executable) {
   const kindOf = row.data.kind_of;
   const id = row.event_id;
   const executor = EXECUTORS[kindOf];
-  if (dry) { console.log(`[dry] исполнил бы заявку ${kindOf} ${id} через ${executor || '???'}`); continue; }
+  if (dry) { console.log(`[dry] пометил бы executing + запустил бы раннер для заявки ${kindOf} ${id} через ${executor || '???'}`); continue; }
   if (!executor) { console.error(`dispatcher: заявка ${id} kind_of=${kindOf} — нет исполнителя в EXECUTORS (не должно случаться, EXEC_KINDS/EXECUTORS разошлись)`); continue; }
-  const bin = path.join(BIN, executor);
+  // Шаг 1: пометить executing. Это САМА защита от повторного запуска (явная — поверх
+  // неявной защиты list --status approved, которая эту заявку уже не выбрала бы на
+  // следующем тике, но между "прочитали approved" и "пометили executing" возможна гонка
+  // двух прогонов диспетчера в один момент — approval-exec-дедуп в ledger её закрывает).
+  let mark;
   try {
-    const stdout = execFileSync(bin, ['--approval', id], { encoding: 'utf8', timeout: 900_000 });
-    execOkCount++;
-    try {
-      execFileSync(DEPT_LEDGER, ['approval-exec', id, '--status', 'executed', '--note', tail(stdout, 500), '--actor', 'dispatcher'], { encoding: 'utf8', timeout: 15_000 });
-      notify(`✅ заявка ${kindOf} ${id} исполнена диспетчером`);
-    } catch (e2) {
-      // Исполнитель УЖЕ сделал дело, но исход не записан — следующий тик снова увидит
-      // approval "approved" и pickExecutable выберет заявку ПОВТОРНО (риск двойного
-      // исполнения). Кричим громко — это не best-effort мелочь.
-      notify(`🚨 dispatcher: заявка ${kindOf} ${id} ИСПОЛНЕНА, но approval-exec НЕ записан (риск повторного исполнения при следующем тике!): ${e2.message}`);
-    }
+    mark = JSON.parse(execFileSync(DEPT_LEDGER, ['approval-exec', id, '--status', 'executing', '--actor', 'dispatcher'], { encoding: 'utf8', timeout: 15_000 }));
   } catch (e) {
-    execFailCount++;
-    const note = tail(e.stderr || e.message || '', 500);
-    try {
-      execFileSync(DEPT_LEDGER, ['approval-exec', id, '--status', 'exec_failed', '--note', note, '--actor', 'dispatcher'], { encoding: 'utf8', timeout: 15_000 });
-      notify(`🔴 заявка ${kindOf} ${id} НЕ исполнена: ${tail(note, 300)}`);
-    } catch (e2) {
-      notify(`🚨 dispatcher: заявка ${kindOf} ${id} ошиблась, и approval-exec тоже НЕ записан: ${e2.message}`);
-    }
+    console.error(`dispatcher: не удалось пометить заявку ${kindOf} ${id} executing: ${e.message} — пропуск, следующий тик повторит попытку`);
+    continue;
+  }
+  if (mark.deduped) { execSkippedCount++; console.log(`dispatcher: заявка ${kindOf} ${id} уже executing (другой тик/прогон взял) — пропуск`); continue; }
+  // Шаг 2: детач-запуск раннера. detached+unref — тик НЕ ждёт исполнения, продолжает
+  // следующую заявку немедленно. stdio:'ignore' — раннер сам пишет свой лог в DEPT/runner-<id>.log.
+  try {
+    const child = spawn(EXEC_RUNNER, ['--approval', id, '--executor', path.join(BIN, executor)], { detached: true, stdio: 'ignore' });
+    // spawn() НЕ бросает синхронно на ENOENT/EACCES (в отличие от execFileSync) — ошибка
+    // приходит АСИНХРОННО событием 'error' на следующем тике event loop. Без слушателя
+    // необработанный 'error' на EventEmitter кидает исключение и падает ВЕСЬ процесс
+    // dispatcher (проверено эмпирически) — заявка уже помечена executing, но раннер не
+    // стартовал, а дальнейшие заявки/обязанность 3 в этом тике вообще не обработались бы.
+    child.on('error', (e) => {
+      notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${e.message}) — зависнет, нужен recovery-разбор`);
+    });
+    child.unref();
+    execStartedCount++;
+    console.log(`dispatcher: заявка ${kindOf} ${id} — раннер запущен detached (pid ${child.pid})`);
+  } catch (e) {
+    // Синхронный throw (маловероятен для spawn, но перекрываем на всякий случай) — та же логика.
+    notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${e.message}) — зависнет, нужен recovery-разбор`);
   }
 }
 
@@ -356,4 +416,4 @@ for (const [name, meta] of Object.entries(deptWorkers)) {
 }
 if (!dry) saveJSON(SLEEP_STATE_FILE, sleepState);
 
-console.log(`dispatcher: tick complete — ${sleepingCount} sleeping (${wokenCount} woken), ${executable.length} заявок (${execOkCount} ok, ${execFailCount} failed), ${mkChecked} МК проверено (${mkSignalled} сигналов)`);
+console.log(`dispatcher: tick complete — ${sleepingCount} sleeping (${wokenCount} woken), ${executable.length} заявок approved (${execStartedCount} раннеров запущено, ${execSkippedCount} пропущено — уже executing), ${stuck.length} зависших в executing, ${mkChecked} МК проверено (${mkSignalled} сигналов)`);
