@@ -887,6 +887,64 @@ cmd_stop() {
   echo "worker '$name' stopped + disabled (files kept; 'start' to resume, 'remove' to delete)"
 }
 
+# probe_argv_val <probe-json> <opt> — значение именованной опции из argv-массива
+# пробы (.cmd), пусто если опции нет / нет значения.
+probe_argv_val() {
+  jq -r --arg o "$2" '.cmd as $c | ($c | index($o)) as $i
+    | if $i != null then ($c[$i+1] // "") else "" end' <<<"$1"
+}
+
+# probe_has_baseline <worker> <probe-json> — прогрет ли baseline у КОНКРЕТНОЙ
+# stateful-пробы (0 = да). ФИКС по ревью Task 5: прежняя проверка `ls state/ |
+# grep -q .` смотрела на весь state/ — он у пожившего воркера всегда непуст
+# (context.json, last_seen.json, локи), warning не срабатывал никогда.
+# Матчим фактические имена state-файлов адаптеров (channels/event-bridge/adapters/):
+#   asana-comments  → .asana-comments-<task>[-<author>].baseline
+#                     (BASE_KEY = TASK_GID или TASK_GID-AUTHOR_GID)
+#   gmail-messages  → .gmail-<acct>-<qhash>.json, где acct = --account (дефолт alp,
+#                     не-[A-Za-z0-9_-] → "_"), qhash = sha256(query)[:12]
+#                     (.gmail-<acct>.token — токен-кэш, НЕ baseline)
+#   tg-messages     → .tg-messages-<chat_id>.json (chat_id из --chat-id или
+#                     числового --contact; %d-формат — leading-zero нормализуем)
+# Не смогли вывести ключ (нет --task; нечисловой --contact — его резолвит
+# contacts.json c NFKC-casefold, в bash не реплицируем) → консервативно 1
+# («baseline не подтверждён» → warning; ложный warning безвреден, потерянное
+# событие — нет).
+probe_has_baseline() {
+  local name="$1" p="$2" sdir="$WORKERS_DIR/$1/state" adapter
+  adapter="$(jq -r '.cmd[0] // "" | split("/") | last' <<<"$p")"
+  case "$adapter" in
+    asana-comments)
+      local task author key
+      task="$(probe_argv_val "$p" --task)"
+      author="$(probe_argv_val "$p" --author)"
+      [ -n "$task" ] || return 1   # позиционный --task не реплицируем — warn
+      key="$task"; [ -n "$author" ] && key="$task-$author"
+      [ -f "$sdir/.asana-comments-$key.baseline" ]
+      ;;
+    gmail-messages)
+      local q acct qhash
+      q="$(probe_argv_val "$p" --query)"
+      acct="$(probe_argv_val "$p" --account)"; [ -n "$acct" ] || acct="alp"
+      [ -n "$q" ] || return 1
+      acct="$(printf '%s' "$acct" | tr -c 'A-Za-z0-9_-' '_')"
+      qhash="$(printf '%s' "$q" | sha256sum | cut -c1-12)"
+      [ -f "$sdir/.gmail-$acct-$qhash.json" ]
+      ;;
+    tg-messages)
+      local cid
+      cid="$(probe_argv_val "$p" --chat-id)"
+      [ -n "$cid" ] || cid="$(probe_argv_val "$p" --contact)"
+      [[ "$cid" =~ ^-?[0-9]+$ ]] || return 1   # имя/username → contacts.json, не реплицируем — warn
+      # адаптер пишет %d — нормализуем leading zeros; 10# — иначе $(( )) счёл бы 010 октальным
+      local sign=""; [[ "$cid" == -* ]] && { sign="-"; cid="${cid#-}"; }
+      cid="$sign$((10#$cid))"
+      [ -f "$sdir/.tg-messages-$cid.json" ]
+      ;;
+    *) return 0 ;;  # не stateful-адаптер — baseline не нужен
+  esac
+}
+
 # sleep <name> — как stop (юнит disable --now, tmux kill), но state="sleeping" вместо
 # "stopped": reconciler и liveness фильтруют строго state=="active", так что спящего
 # они не трогают и не будят. Файлы/сессия целы; событие клиента (через диспетчер) или
@@ -906,8 +964,8 @@ cmd_sleep() {
     while IFS= read -r p; do
       pname="$(jq -r '.name' <<<"$p")"
       if jq -e '.cmd[0] | test("(gmail-messages|tg-messages|asana-comments)$")' <<<"$p" >/dev/null 2>&1; then
-        ls "$WORKERS_DIR/$name/state/" 2>/dev/null | grep -q . || \
-          echo "  ВНИМАНИЕ: у пробы '$pname' может не быть baseline (state пуст) — первое событие после сна рискует пропасть; разбуди воркера на один тик watcher'а перед сном" >&2
+        probe_has_baseline "$name" "$p" || \
+          echo "  ВНИМАНИЕ: у пробы '$pname' нет прогретого baseline — первое событие после сна рискует пропасть; разбуди воркера на один тик watcher'а перед сном" >&2
       fi
     done < <(jq -c '.probes[]?' "$cfg" 2>/dev/null)
   fi
@@ -1039,6 +1097,16 @@ cmd_mission_update() {
 
   if [ "$no_rebase" = true ]; then
     echo "mission-update: --no-rebase — новая миссия вступит в силу при следующем перезапуске/компакции"
+    return 0
+  fi
+  # ФИКС по ревью Task 5: не-active воркер (sleeping/stopped) — НЕ звать cmd_rebase
+  # (его active-гард сделал бы сырой die после уже записанной миссии). Миссия читается
+  # supervisor'ом при каждом запуске (--append-system-prompt-file) — спящий подхватит
+  # её при пробуждении сам, rebase не нужен.
+  ensure_registry
+  local wst; wst="$(jq -r --arg n "$name" '.workers[$n].state // empty' "$REGISTRY")"
+  if [ "$wst" != "active" ]; then
+    echo "mission-update: воркер '$name' state=$wst — rebase не нужен: новая миссия вступит в силу при следующем старте/пробуждении"
     return 0
   fi
   cmd_rebase "$name" --reason "смена миссии: $reason"
