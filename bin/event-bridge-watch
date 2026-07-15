@@ -42,7 +42,13 @@ mkdir -p "$statedir" "$home/logs"
 # NB: no `2>/dev/null` on the exec redirection — that would permanently silence
 # the whole script's stderr (same trap fixed in session-inject).
 exec 8>"$statedir/.watch.lock" || { echo "event-bridge-watch[$name]: cannot open lock" >&2; exit 1; }
-flock -n 8 || { echo "event-bridge-watch[$name]: another watcher holds the lock — exiting" >&2; exit 0; }
+# Wait up to 20s for the lock (an old watcher releases it on its next ~5s tick
+# after its tmux session ends): during a rebase the new supervisor may start us
+# while the old watcher still holds the lock — waiting lets us take over instead
+# of leaving the worker without probes until the next restart. Single-instance is
+# preserved: a genuinely LIVE old watcher (plain supervisor restart, no kill tmux)
+# still causes us to wait 20s then exit, same as before, just slower.
+flock -w 20 8 || { echo "event-bridge-watch[$name]: another watcher holds the lock — exiting" >&2; exit 0; }
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "$(ts) event-bridge-watch[$name]: $*" >> "$log"; }

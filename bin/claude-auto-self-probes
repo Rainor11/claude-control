@@ -60,7 +60,10 @@ resolve_name() {
     # element AND (2) its REAL exe is inside the trusted claude tree (kernel-set,
     # unfakeable via argv[0]/exec -a). This is what makes a bash/python/sqlite
     # wrapper carrying a forged `--resume` + CLAUDE_AUTO_NAME fail to qualify.
-    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- '--resume'; then
+    # --resume ИЛИ --session-id — fresh-запуск spawn/rebase (claude --session-id <W>
+    # без --resume до первого рестарта). Остальные проверки (exe в CLAUDE_INSTALL,
+    # CLAUDE_AUTO_NAME из environ предка) не меняются — спуф-стойкость сохранена.
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qxE -- '--resume|--session-id'; then
       exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
       case "$exe" in
         "$CLAUDE_INSTALL"/*)

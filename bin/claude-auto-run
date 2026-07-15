@@ -139,9 +139,12 @@ else
   # transcript yet.
   if [ "$seeded" = "true" ] || [ -n "$(find_wfile)" ]; then
     args+=( --resume "$session_id" )
-  else
-    [ -n "$origin_id" ] || { say "FATAL: not seeded but no origin_id"; exit 1; }
+  elif [ -n "$origin_id" ]; then
     args+=( --resume "$origin_id" --fork-session --session-id "$session_id" )
+  else
+    # fresh-запуск (spawn/rebase): новая сессия с пиновым id, истории нет by design.
+    # Память воркера — файлы (правило 1.1); kickoff-инжект даёт стартовый контекст.
+    args+=( --session-id "$session_id" )
   fi
   args+=( --permission-mode "$mode" )
   args+=( --settings "$home/settings.json" )
@@ -295,6 +298,8 @@ maybe_compact() {
   if [ -x "$INJECT" ] && "$INJECT" --timeout 120 "$sess" "$COMPACT_MSG" >>"$log" 2>&1; then
     date +%s > "$COMPACT_LAST"
     rm -f "$COMPACT_FLAG"
+    c="$(cat "$home/state/compactions" 2>/dev/null || echo 0)"; [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    echo $(( c + 1 )) > "$home/state/compactions"
     say "/compact injected"
   else
     say "/compact injection deferred (session busy or inject failed) — will retry"

@@ -687,6 +687,85 @@ cmd_start() {
   systemctl --user enable --now "claude-auto@$name.service" && echo "worker '$name' started"
 }
 
+# rebase <name> — пересборка сессии от файлов: новый session_id (seeded=false,
+# origin_id=null), kill tmux, автоперезапуск юнита подхватывает fresh-ветку
+# claude-auto-run (Step 1), kickoff-инжект даёт стартовый контекст. STALE-гард
+# (та же эвристика, что status_memory) отказывает, если транскрипт заметно
+# опередил файлы памяти — rebase стирает сессию, несвежая память = потеря
+# контекста без предупреждения. Exit 0 — успех; exit 3 — отложено (воркер busy,
+# вызывающий ретраит); die — ошибки (не active / STALE / не поднялся юнит).
+cmd_rebase() {
+  local name="" reason="ручной rebase" kickoff_file="" force_stale=false
+  name="${1:?usage: rebase <name> [--reason s] [--kickoff-file f] [--force-stale]}"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) reason="${2:-}"; shift 2 ;;
+      --kickoff-file) kickoff_file="${2:-}"; shift 2 ;;
+      --force-stale) force_stale=true; shift ;;
+      *) die "rebase: unknown arg $1" ;;
+    esac
+  done
+  worker_exists "$name" || die "no worker '$name'"
+  ensure_registry
+  local st; st="$(jq -r --arg n "$name" '.workers[$n].state // empty' "$REGISTRY")"
+  [ "$st" = "active" ] || die "rebase: воркер '$name' не active (state=$st) — спящих/остановленных не ребейзим"
+  if worker_busy "$name"; then
+    echo "rebase: '$name' занят (ход/промпт) — ОТЛОЖЕНО, повтори когда idle"
+    return 3
+  fi
+
+  # STALE-гард: rebase стирает сессию — несвежая память = потеря контекста
+  local home="$WORKERS_DIR/$name" spec="$WORKERS_DIR/$name/spec.json"
+  local bp sid wfile tx_mtime=0 mem_mtime=0 f m
+  bp="$(jq -r --arg n "$name" '.workers[$n].brain_path // empty' "$REGISTRY" 2>/dev/null)"
+  sid="$(jq -r '.session_id' "$spec")"
+  if [ -n "$bp" ] && [ -d "$bp" ] && [ "$force_stale" != true ]; then
+    wfile="$(ls -1 "$HOME/.claude/projects"/*/"$sid.jsonl" 2>/dev/null | head -1)"
+    [ -n "$wfile" ] && tx_mtime="$(stat -c %Y "$wfile" 2>/dev/null || echo 0)"
+    shopt -s nullglob
+    for f in "$bp/timeline.md" "$bp/decisions.md" "$bp"/open-questions* "$bp"/открытые-вопросы*; do
+      [ -f "$f" ] || continue
+      m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$mem_mtime" ] 2>/dev/null && mem_mtime="$m"
+    done
+    shopt -u nullglob
+    if [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "${CLAUDE_AUTO_STALE_SECONDS:-1800}" ]; then
+      die "rebase: память STALE (транскрипт активнее файлов) — потеря контекста. Пусть воркер докурирует память, или --force-stale"
+    fi
+  fi
+
+  local old_sid new_sid; old_sid="$sid"; new_sid="$(cat /proc/sys/kernel/random/uuid)"
+  spec_rmw "$name" '.session_id=$w | .seeded=false | .origin_id=null | .rebased_at=$t | .rebase_of=$o' \
+    --arg w "$new_sid" --arg t "$(ts)" --arg o "$old_sid"
+  rm -f "$home/state/compactions" "$home/state/compact_requested"
+  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  # Restart=always поднимет юнит с новым спеком (fresh-ветка); если юнит был down — поднять явно
+  systemctl --user is-active --quiet "claude-auto@$name.service" || systemctl --user start "claude-auto@$name.service"
+
+  local i up=false
+  for i in $(seq 1 60); do
+    tmux -L "claude-$name" has-session -t "claude-$name" 2>/dev/null && { up=true; break; }
+    sleep 2
+  done
+  [ "$up" = true ] || die "rebase: воркер не поднялся за 120с (journalctl --user -u claude-auto@$name)"
+
+  local kf="${kickoff_file:-$REPO_DIR/examples/department/rebase-kickoff.md}" ktext
+  [ -f "$kf" ] || die "rebase: kickoff-файл не найден: $kf"
+  ktext="$(sed -e "s/{{REASON}}/$(printf '%s' "$reason" | sed 's/[&/\\]/\\&/g')/g" "$kf")"
+  local delivered=false
+  for i in $(seq 1 10); do
+    if "$BIN_DIR/session-inject" --timeout 120 "claude-$name" "$ktext" >/dev/null 2>&1; then delivered=true; break; fi
+    sleep 10
+  done
+  [ "$delivered" = true ] || echo "rebase: ВНИМАНИЕ — kickoff не доставлен (воркер ждёт событий без стартового контекста); повтори инжект вручную" >&2
+
+  "$BIN_DIR/dept-ledger" append --kind agent_run \
+    --data "$(jq -nc --arg w "$name" --arg r "$reason" --arg o "$old_sid" --arg s "$new_sid" \
+      '{worker:$w, run_kind:"rebase", reason:$r, old_session:$o, new_session:$s}')" \
+    --actor "${CLAUDE_AUTO_NAME:-operator}" >/dev/null 2>&1 || true
+
+  echo "worker '$name' rebased: $old_sid -> $new_sid (kickoff delivered=$delivered)"
+}
+
 cmd_remove() {
   local name="${1:?usage: remove <name>}"
   worker_exists "$name" || die "no worker '$name'"
@@ -1293,6 +1372,12 @@ MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
   upgrade <имя>                подтянуть воркера к текущему шаблону (auto mode,
                                awareness, забор) без re-adopt; рестарт с resume —
                                контекст и датчики целы
+  rebase <имя> [--reason s] [--kickoff-file f] [--force-stale]
+                               плановая пересборка памяти от файлов: новая сессия
+                               (история НЕ наследуется), kill tmux, автоперезапуск,
+                               kickoff-инжект. STALE-гард отказывает при несвежей
+                               памяти (--force-stale обходит); занятого воркера
+                               откладывает (exit 3, повтори)
   remove <имя>                 остановить и УДАЛИТЬ файлы воркера + запись в реестре
   adopt …                      создать и запустить воркера (бэкенд /go-autonomous)
   install-units                перегенерировать systemd-шаблоны + reconciler-таймер
@@ -1360,6 +1445,7 @@ case "$sub" in
   mcp-reset) cmd_mcp_reset "$@" ;;
   restart) cmd_restart "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
+  rebase) cmd_rebase "$@" ;;
   allow) cmd_allow "$@" ;;
   install-units) cmd_install_units ;;
   ""|-h|--help) usage ;;
