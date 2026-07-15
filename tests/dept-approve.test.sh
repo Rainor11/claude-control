@@ -72,4 +72,10 @@ if DEPT_APPROVE_TEST_ACTOR=mk-prodmash "$SANDBOX/dept-approve" --kind-of outgoin
 fi
 "$DIR/bin/dept-ledger" list --kind approval --filter "summary=$long_summary" | grep -q . && { echo 'FAIL: аппрув с длинным summary всё же создан в ledger'; exit 1; }
 
+# строгий парсер (p2#5): посторонний флаг завершает работу ненулевым кодом с явной ошибкой
+if out4="$(DEPT_APPROVE_TEST_ACTOR=mk-prodmash "$SANDBOX/dept-approve" --kind-of outgoing --summary 'x' --actor whoever 2>&1)"; then
+  echo 'FAIL: dept-approve принял посторонний флаг --actor'; exit 1
+fi
+echo "$out4" | grep -q 'unknown arg' || { echo 'FAIL: в отказе нет unknown arg'; exit 1; }
+
 echo PASS

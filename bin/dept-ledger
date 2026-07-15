@@ -23,8 +23,11 @@ const REQUIRED = {
   registry_change: ['worker'],
   policy_ack: ['worker', 'policy_version'],
 };
-const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff']); // §5 спеки; НЕ выдумывать новые
+const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff',
+  'kb_change_request', 'decision_request']); // §5 спеки; worker_spawn/mission_change — approvals, не messages
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
+const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed'];
+const ROTATE_DAYS_DEFAULT = 30;
 const POLICY_DIR = process.env.DEPT_POLICY_DIR || '/home/rainor/brain/wiki/work/ai-dev/отдел/правила';
 // Number(garbage) → NaN, а `x > NaN` всегда false — старое `Number(env || 24)` при кривом
 // значении молча ВЫКЛЮЧАЛО TTL (policy-check в cmdPolicyCheck ниже никогда не считал ack
@@ -35,6 +38,45 @@ const ROLES = new Set(['руководитель', 'мк', 'архивариус
 const INCIDENT_RESOLVE_STATUSES = ['resolved', 'wontfix', 'duplicate'];
 
 function die(msg) { process.stderr.write(msg + '\n'); process.exit(1); }
+// Codex-аудит В3: validateEvent/assertRefExists раньше звали die() (=process.exit) — если это
+// случалось ВНУТРИ уже взятого withLock (approval-resolve/approval-exec), finally withLock НЕ
+// выполнялся и лок-файл висел до 60с-протухания. cliDie бросает обычный Error с меткой cliError —
+// withLock корректно снимает лок через finally при любом throw, а хендлер-вызывающий конвертирует
+// cliError в чистый die() уже ПОСЛЕ выхода из withLock (см. глобальный catch внизу файла и
+// локальные try/catch в cmdApprovalResolve/cmdApprovalExec — по образцу cmdRegistrySet).
+function cliDie(msg) { throw Object.assign(new Error(msg), { cliError: true }); }
+
+// Вызов из сессии воркера? Поднимаемся по /proc-предкам: найден процесс с CLAUDE_AUTO_NAME
+// в environ и exe внутри доверенного CLAUDE_INSTALL → это воркер. fail-open при ошибках
+// чтения /proc НЕ допускается только для положительного матча: не смогли прочитать —
+// продолжаем подъём (гард отсекает лёгкую/случайную эскалацию, как self-protection).
+const CLAUDE_INSTALL = process.env.CLAUDE_INSTALL || '/home/rainor/.local/share/claude';
+function callerWorkerName() {
+  let pid = process.ppid, depth = 0;
+  while (pid > 1 && depth++ < 25) {
+    let exe = '', env = '', stat = '';
+    try { exe = fs.readlinkSync(`/proc/${pid}/exe`); } catch {}
+    try { env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8'); } catch {}
+    if (exe.startsWith(CLAUDE_INSTALL + '/')) {
+      const m = /(?:^|\0)CLAUDE_AUTO_NAME=([^\0]+)/.exec(env);
+      if (m) return m[1];
+    }
+    try { stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return null; }
+    const mm = /\)\s+\S\s+(\d+)/.exec(stat);
+    if (!mm) return null;
+    pid = Number(mm[1]);
+  }
+  return null;
+}
+// Codex-аудит К3: у воркеров allow на Bash(dept-ledger:*) — без механического запрета любой
+// воркер мог бы записать approval_status approved --actor operator и диспетчер исполнил бы
+// spawn/mission_change (эскалация привилегий). Гард — обратная /proc-идентичность (зеркало
+// resolve_name из dept-approve, на Node).
+function assertNotWorkerSession(cmd) {
+  if (process.env.DEPT_LEDGER_TEST_ALLOW_WORKER === '1') return; // только для тестов
+  const w = callerWorkerName();
+  if (w) die(`${cmd}: запрещено из сессии воркера («${w}») — решение записывает бот/оператор/диспетчер (policy 2.4)`);
+}
 
 function parseArgs(argv) {
   const args = { _: [] , filter: []};
@@ -80,27 +122,53 @@ function effectiveStatus(events, ev, statusKind, initial) {
   return st;
 }
 
+const ARCHIVE_DIR = () => path.join(HOME, 'archive');
+function archiveFiles() { // новые первыми
+  try { return fs.readdirSync(ARCHIVE_DIR()).filter((f) => /^events-\d{4}-\d{2}\.jsonl$/.test(f)).sort().reverse()
+    .map((f) => path.join(ARCHIVE_DIR(), f)); } catch { return []; }
+}
+function findInArchives(eventId) {
+  for (const f of archiveFiles()) {
+    for (const l of fs.readFileSync(f, 'utf8').split('\n')) {
+      if (!l.trim() || !l.includes(eventId)) continue;
+      try { const e = JSON.parse(l); if (e.event_id === eventId) return e; } catch {}
+    }
+  }
+  return null;
+}
+const ROT_STATE = () => path.join(HOME, 'rotate-state.json');
+function rotateState() { try { return JSON.parse(fs.readFileSync(ROT_STATE(), 'utf8')); } catch { return { last_seq: 0 }; } }
+
 function assertRefExists(ref, expectedKind) {
   const e = readAll().find((e) => e.event_id === ref);
-  if (!e) die('ledger: ref не найден: ' + ref);
-  // без проверки kind approval-resolve/incident-open/ack принимали ref ЛЮБОГО события
-  // (например, event_id сообщения) и "успешно" закрывали несуществующий approval/incident.
-  if (expectedKind && e.kind !== expectedKind) {
-    die(`ledger: ref ${ref} имеет kind ${e.kind}, ожидался ${expectedKind}`);
+  if (e) {
+    // без проверки kind approval-resolve/incident-open/ack принимали ref ЛЮБОГО события
+    // (например, event_id сообщения) и "успешно" закрывали несуществующий approval/incident.
+    if (expectedKind && e.kind !== expectedKind) {
+      cliDie(`ledger: ref ${ref} имеет kind ${e.kind}, ожидался ${expectedKind}`);
+    }
+    return;
+  }
+  // Task 1: не нашли в активном файле — ref мог уехать в архив ротацией (approval-resolve-дедуп
+  // и incident-resolve --ref-main обязаны продолжать работать после rotate).
+  const a = findInArchives(ref);
+  if (!a) cliDie('ledger: ref не найден: ' + ref);
+  if (expectedKind && a.kind !== expectedKind) {
+    cliDie(`ledger: ref ${ref} имеет kind ${a.kind}, ожидался ${expectedKind}`);
   }
 }
 
 // Валидация без побочных эффектов на файл (можно звать до входа в лок).
 function validateEvent(kind, data) {
-  if (!KINDS.has(kind)) die('append: неизвестный kind: ' + kind);
-  for (const f of REQUIRED[kind]) if (data[f] === undefined) die(`append: ${kind} требует поле data.${f}`);
-  if (kind === 'message' && !MSG_TYPES.has(data.type)) die('append: message.type ∉ ' + [...MSG_TYPES]);
+  if (!KINDS.has(kind)) cliDie('append: неизвестный kind: ' + kind);
+  for (const f of REQUIRED[kind]) if (data[f] === undefined) cliDie(`append: ${kind} требует поле data.${f}`);
+  if (kind === 'message' && !MSG_TYPES.has(data.type)) cliDie('append: message.type ∉ ' + [...MSG_TYPES]);
   if (kind === 'message_status') {
-    if (!MSG_STATUSES.has(data.status)) die('append: message_status.status ∉ ' + [...MSG_STATUSES]);
+    if (!MSG_STATUSES.has(data.status)) cliDie('append: message_status.status ∉ ' + [...MSG_STATUSES]);
     assertRefExists(data.ref, 'message');
   }
   if (kind === 'approval_status') {
-    if (!['approved', 'denied'].includes(data.status)) die('append: approval_status.status ∉ approved|denied');
+    if (!APPROVAL_STATUSES.includes(data.status)) cliDie('append: approval_status.status ∉ ' + APPROVAL_STATUSES.join('|'));
     assertRefExists(data.ref, 'approval');
   }
   if (kind === 'incident_status') assertRefExists(data.ref, 'incident');
@@ -131,7 +199,9 @@ function repairTailUnlocked() {
 function writeEventUnlocked(kind, data, actor) {
   repairTailUnlocked();
   const events = readAll();
-  const seq = events.length ? events[events.length - 1].seq + 1 : 1;
+  // Task 1: seq строго монотонный через ротацию — активный файл после rotate может начинаться
+  // "с нуля" (пуст или содержит только новые события), поэтому берём максимум с rotate-state.
+  const seq = Math.max(events.length ? events[events.length - 1].seq : 0, rotateState().last_seq) + 1;
   const e = {
     v: 1,
     event_id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -162,6 +232,7 @@ function cmdList(args) {
   const events = readAll();
   let rows = events;
   if (args.kind) rows = rows.filter((e) => e.kind === args.kind);
+  if (args['event-id']) rows = rows.filter((e) => e.event_id === args['event-id']);
   for (const f of args.filter) {
     // indexOf, не split('=') — split теряет всё после второго '=' (--filter subject=a=b терял "=b"),
     // и --filter без значения (argv кончился) даёт f===undefined → упасть чисто, а не TypeError'ом.
@@ -221,8 +292,14 @@ function cmdSend(a) {
   if (roleOf(from) === 'мк' && roleOf(a.to) === 'мк') {
     die('send: прямое сообщение МК→МК запрещено (policy 3.1) — отправь question руководителю');
   }
-  if (roleOf(a.to) === 'руководитель' && !['question', 'proposal'].includes(a.type)) {
-    die('send: руководителю идут только question/proposal (§5 спеки) — handoff шли профильному штабному, incident открывай через incident-open');
+  if (roleOf(a.to) === 'руководитель' && !['question', 'proposal', 'decision_request'].includes(a.type)) {
+    die('send: руководителю идут только question/proposal/decision_request (§5 спеки) — handoff шли профильному штабному, incident открывай через incident-open');
+  }
+  if (a.type === 'kb_change_request' && roleOf(a.to) && roleOf(a.to) !== 'архивариус') {
+    die('send: kb_change_request адресуется только Архивариусу (policy 3.4)');
+  }
+  if (a.type === 'decision_request' && roleOf(a.to) && roleOf(a.to) !== 'руководитель') {
+    die('send: decision_request адресуется только Руководителю');
   }
   const data = { type: a.type, from,
     to: a.to, subject: a.subject, body: a.body || '', refs: (a.refs || '').split(',').filter(Boolean) };
@@ -256,6 +333,7 @@ function cmdApprovalOpen(a) {
 }
 function cmdApprovalResolve(a) {
   const ref = a._[1];
+  assertNotWorkerSession('approval-resolve'); // /proc-гард, см. 3.8 — решение записывает бот/оператор/диспетчер
   // Дедуп-чтение ДО withLock давало гонку: два параллельных resolve одним статусом оба
   // проходили проверку «ещё не resolved» раньше, чем любой из них дописывал событие, и
   // оба писали approval_status (дубль). Вся операция — читаем, решаем deduped/write —
@@ -263,16 +341,64 @@ function cmdApprovalResolve(a) {
   // дедлок), поэтому пишем через validateEvent+writeEventUnlocked напрямую (как в
   // cmdRegistrySet). validateEvent для approval_status делает assertRefExists→readAll —
   // это чтение, под уже взятым локом безопасно.
-  const result = withLock(() => {
-    const events = readAll();
-    const apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
-    if (apr && effectiveStatus(events, apr, 'approval_status', 'open') === a.status) {
-      return { event_id: ref, deduped: true };
+  let result;
+  try {
+    result = withLock(() => {
+      const events = readAll();
+      // Task 1: активный файл мог не найти apr (уехал в архив ротацией) — искать там,
+      // чтобы дедуп/гард «уже исполнен» работали и после rotate.
+      let apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
+      if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
+      const eff = apr ? effectiveStatus(events, apr, 'approval_status', 'open') : null;
+      if (apr && ['executed', 'exec_failed'].includes(eff)) {
+        const err = new Error('approval-resolve: аппрув уже исполнен (' + eff + ') — менять решение поздно');
+        err.cliError = true; throw err;
+      }
+      if (apr && eff === a.status) return { event_id: ref, deduped: true };
+      const data = { ref, status: a.status };
+      validateEvent('approval_status', data);
+      return brief(writeEventUnlocked('approval_status', data, a.actor));
+    });
+  } catch (e) {
+    if (e && e.cliError) die(e.message);
+    throw e;
+  }
+  out(result);
+}
+function readChainStatuses(ref) { // статусы цепочки: активный файл + архивы (Codex-аудит В2)
+  const rows = readAll().filter((e) => e.kind === 'approval_status' && e.data.ref === ref);
+  for (const f of archiveFiles()) {
+    for (const l of fs.readFileSync(f, 'utf8').split('\n')) {
+      if (!l.trim() || !l.includes(ref)) continue;
+      try { const e = JSON.parse(l); if (e.kind === 'approval_status' && e.data.ref === ref) rows.push(e); } catch {}
     }
-    const data = { ref, status: a.status };
-    validateEvent('approval_status', data);
-    return brief(writeEventUnlocked('approval_status', data, a.actor));
-  });
+  }
+  rows.sort((x, y) => x.seq - y.seq);
+  return rows;
+}
+function cmdApprovalExec(a) {
+  const ref = a._[1] || die('usage: dept-ledger approval-exec <event_id> --status <executed|exec_failed> [--note <s>]');
+  const status = a.status || die('approval-exec: --status обязателен (executed|exec_failed)');
+  if (!['executed', 'exec_failed'].includes(status)) die('approval-exec: --status ∉ executed|exec_failed');
+  assertNotWorkerSession('approval-exec'); // /proc-гард, см. 3.8
+  let result;
+  try {
+    result = withLock(() => {
+      let apr = readAll().find((e) => e.event_id === ref && e.kind === 'approval');
+      if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
+      if (!apr) { const err = new Error('approval-exec: аппрув не найден: ' + ref); err.cliError = true; throw err; }
+      const sts = readChainStatuses(ref);
+      const eff = sts.length ? sts[sts.length - 1].data.status : (apr.data.status || 'open');
+      if (eff === status) return { event_id: ref, deduped: true };
+      if (eff !== 'approved') { const err = new Error(`approval-exec: эффективный статус «${eff}», исполнять можно только approved`); err.cliError = true; throw err; }
+      const data = { ref, status };
+      if (a.note) data.note = String(a.note).slice(0, 2000);
+      return brief(writeEventUnlocked('approval_status', data, a.actor));
+    });
+  } catch (e) {
+    if (e && e.cliError) die(e.message);
+    throw e;
+  }
   out(result);
 }
 function cmdIncidentOpen(a) {
@@ -415,14 +541,99 @@ function cmdSnapshot() {
   out(res);
 }
 
+function cmdRotate(a) {
+  const days = a.days !== undefined ? Number(a.days) : ROTATE_DAYS_DEFAULT_ENV();
+  if (!Number.isFinite(days) || days <= 0) die('rotate: --days должен быть положительным числом');
+  const cutoff = Date.now() - days * 86400_000;
+  const res = withLock(() => {
+    repairTailUnlocked();
+    const events = readAll();
+    const byRef = new Map(); // base event_id -> его *_status события
+    for (const e of events) if (e.kind.endsWith('_status') && e.data && e.data.ref) {
+      if (!byRef.has(e.data.ref)) byRef.set(e.data.ref, []);
+      byRef.get(e.data.ref).push(e);
+    }
+    // Codex-аудит К6: для исполняемых диспетчером kind_of «approved» — НЕ финал
+    // (ждёт executed/exec_failed); ротировать их на approved нельзя — dispatcher
+    // читает только активный файл и потерял бы заявку.
+    const EXEC_KINDS_ROT = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
+    const CLOSED = {
+      message: (s) => ['handled', 'dead'].includes(s),
+      approval: (s, e) => ['denied', 'executed', 'exec_failed'].includes(s)
+        || (s === 'approved' && !EXEC_KINDS_ROT.has(e.data.kind_of)),
+      incident: (s) => ['resolved', 'wontfix', 'duplicate'].includes(s),
+    };
+    const lastAckByWorker = new Map();
+    for (const e of events) if (e.kind === 'policy_ack') lastAckByWorker.set(e.data.worker, e.event_id);
+    const moveIds = new Set();
+    for (const e of events) {
+      if (Date.parse(e.ts) >= cutoff) continue;
+      if (e.kind === 'message' || e.kind === 'approval' || e.kind === 'incident') {
+        const st = effectiveStatus(events, e, e.kind + '_status', e.data.status || 'open');
+        const chain = [e, ...(byRef.get(e.event_id) || [])];
+        // цепочка закрыта И вся старше cutoff (свежий статус держит цепочку в активном файле)
+        if (CLOSED[e.kind](st, e) && chain.every((c) => Date.parse(c.ts) < cutoff)) chain.forEach((c) => moveIds.add(c.event_id));
+      } else if (e.kind === 'policy_ack') {
+        if (lastAckByWorker.get(e.data.worker) !== e.event_id) moveIds.add(e.event_id);
+      } else if (e.kind === 'agent_run' || e.kind === 'registry_change') {
+        moveIds.add(e.event_id);
+      } // *_status без базы в moveIds остаются с базой (обработаны цепочкой выше)
+    }
+    if (!moveIds.size) return { rotated: 0, kept: events.length };
+    fs.mkdirSync(ARCHIVE_DIR(), { recursive: true });
+    const keep = [], byMonth = new Map();
+    for (const e of events) {
+      if (!moveIds.has(e.event_id)) { keep.push(e); continue; }
+      const m = (e.ts || '').slice(0, 7) || 'unknown';
+      if (!byMonth.has(m)) byMonth.set(m, []);
+      byMonth.get(m).push(e);
+    }
+    // Codex-аудит В1 (crash-безопасный порядок): (1) архив с дедупом по event_id —
+    // повторный прогон после crash не плодит дубли; (2) rotate-state (last_seq только
+    // вперёд) ДО переписывания активного файла — crash между шагами не даёт seq-регресса
+    // даже при полной ротации; (3) атомарный rename активного файла.
+    for (const [m, rows] of byMonth) {
+      const af = path.join(ARCHIVE_DIR(), `events-${m}.jsonl`);
+      const already = new Set();
+      try { for (const l of fs.readFileSync(af, 'utf8').split('\n')) { if (l.trim()) try { already.add(JSON.parse(l).event_id); } catch {} } } catch {}
+      const fresh = rows.filter((e) => !already.has(e.event_id));
+      if (fresh.length) fs.appendFileSync(af, fresh.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    }
+    const lastSeq = Math.max(events.length ? events[events.length - 1].seq : 0, rotateState().last_seq);
+    fs.writeFileSync(ROT_STATE(), JSON.stringify({ last_seq: lastSeq }) + '\n');
+    const tmp = LEDGER + '.rotate.tmp';
+    fs.writeFileSync(tmp, keep.map((e) => JSON.stringify(e)).join('\n') + (keep.length ? '\n' : ''));
+    fs.renameSync(tmp, LEDGER);
+    return { rotated: moveIds.size, kept: keep.length };
+  });
+  out(res);
+}
+function ROTATE_DAYS_DEFAULT_ENV() {
+  const n = Number(process.env.DEPT_ROTATE_DAYS);
+  return Number.isFinite(n) && n > 0 ? n : ROTATE_DAYS_DEFAULT;
+}
+// ВАЖНО: *_status-события, чья база НЕ ротируется, остаются в активном файле безусловно
+// (в moveIds попадают только элементы закрытых цепочек и самостоятельные kinds).
+// approval_status, ссылающийся на ранее заархивированную базу (exec после ротации approved —
+// не бывает при days=30, но всё же), при следующей ротации уедет как «*_status без активной
+// базы старше cutoff» — НЕ реализуем в v1, YAGNI: такие строки безвредно живут в активном файле.
+
 const HANDLERS = {
   append: cmdAppend, list: cmdList, send: cmdSend, ack: cmdAck, resolve: cmdResolve,
-  'approval-open': cmdApprovalOpen, 'approval-resolve': cmdApprovalResolve,
+  'approval-open': cmdApprovalOpen, 'approval-resolve': cmdApprovalResolve, 'approval-exec': cmdApprovalExec,
   'incident-open': cmdIncidentOpen,
   'registry-set': cmdRegistrySet, 'registry-get': cmdRegistryGet, 'registry-list': cmdRegistryList,
   'policy-current': cmdPolicyCurrent, 'policy-ack': cmdPolicyAck, 'policy-check': cmdPolicyCheck,
-  'incident-resolve': cmdIncidentResolve, snapshot: cmdSnapshot,
+  'incident-resolve': cmdIncidentResolve, snapshot: cmdSnapshot, rotate: cmdRotate,
 };
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
-(HANDLERS[cmd] || (() => die('usage: dept-ledger <append|list> …')))(args);
+try {
+  (HANDLERS[cmd] || (() => die('usage: dept-ledger <append|list> …')))(args);
+} catch (e) {
+  // Task 1 (Codex-аудит В3): validateEvent/assertRefExists теперь бросают cliError вместо
+  // die() изнутри withLock — единая точка конвертации в чистый die() после того, как withLock
+  // уже снял лок через finally (см. cliDie выше).
+  if (e && e.cliError) die(e.message);
+  throw e;
+}

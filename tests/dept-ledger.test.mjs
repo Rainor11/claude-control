@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync, execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, utimesSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, utimesSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -358,4 +358,135 @@ test('snapshot коммитит журнал и молчит без измене
   const tracked = execFileSync('git', ['-C', home, 'ls-files'], { encoding: 'utf8' });
   assert.ok(!tracked.includes('events.jsonl.lock'), `лок закоммичен: ${tracked}`);
   assert.ok(tracked.includes('.gitignore'));
+});
+
+test('шина: новые типы kb_change_request/decision_request + их топология', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  run(home, ['registry-set', 'dept-archivist', '--role', 'архивариус']);
+  run(home, ['registry-set', 'dept-head', '--role', 'руководитель']);
+  run(home, ['registry-set', 'mk-a', '--role', 'мк', '--client', 'а']);
+  // kb_change_request к архивариусу проходит
+  run(home, ['send', '--type', 'kb_change_request', '--to', 'dept-archivist',
+    '--subject', 'новый факт БЗ', '--actor', 'mk-a']);
+  // kb_change_request к НЕ-архивариусу падает
+  assert.throws(() => run(home, ['send', '--type', 'kb_change_request', '--to', 'dept-head',
+    '--subject', 'x', '--actor', 'mk-a']));
+  // decision_request к руководителю проходит, к архивариусу — нет
+  run(home, ['send', '--type', 'decision_request', '--to', 'dept-head',
+    '--subject', 'нужно решение', '--actor', 'mk-a']);
+  assert.throws(() => run(home, ['send', '--type', 'decision_request', '--to', 'dept-archivist',
+    '--subject', 'x', '--actor', 'mk-a']));
+  // руководителю по-прежнему нельзя handoff
+  assert.throws(() => run(home, ['send', '--type', 'handoff', '--to', 'dept-head',
+    '--subject', 'x', '--actor', 'mk-a']));
+});
+
+test('approval-exec: только после approved, идемпотентно; resolve после exec падает', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'worker_spawn',
+    '--summary', 'нанять мк-тест', '--actor', 'dept-head']));
+  // exec до approved — отказ
+  assert.throws(() => run(home, ['approval-exec', a.event_id, '--status', 'executed', '--actor', 'dispatcher']));
+  run(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  const e1 = JSON.parse(run(home, ['approval-exec', a.event_id, '--status', 'executed', '--actor', 'dispatcher']));
+  assert.ok(e1.event_id);
+  // идемпотентность
+  const e2 = JSON.parse(run(home, ['approval-exec', a.event_id, '--status', 'executed', '--actor', 'dispatcher']));
+  assert.equal(e2.deduped, true);
+  // resolve на исполненный аппрув — отказ
+  assert.throws(() => run(home, ['approval-resolve', a.event_id, '--status', 'denied', '--actor', 'operator']));
+});
+
+test('list --event-id находит конверт', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 'x', '--actor', 'w']));
+  const rows = run(home, ['list', '--kind', 'approval', '--event-id', a.event_id]).trim().split('\n');
+  assert.equal(rows.length, 1);
+  assert.equal(JSON.parse(rows[0]).event_id, a.event_id);
+});
+
+test('rotate: закрытые цепочки уходят в архив, открытые и свежие остаются, seq монотонен', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  // закрытое сообщение (старим ts руками — journал правим до вызова rotate, это тест)
+  const m = JSON.parse(run(home, ['send', '--type', 'question', '--to', 'w2', '--subject', 'старое', '--actor', 'w1']));
+  run(home, ['ack', m.event_id, '--actor', 'w2']);
+  run(home, ['resolve', m.event_id, '--status', 'handled', '--actor', 'w2']);
+  // открытый approval — не ротируется даже старый
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'outgoing', '--summary', 'жду', '--actor', 'w1']));
+  // состарить ВСЕ строки на 40 дней (перезаписью ts в файле)
+  const led = join(home, 'events.jsonl');
+  const old = new Date(Date.now() - 40 * 86400_000).toISOString();
+  writeFileSync(led, readFileSync(led, 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.stringify({ ...JSON.parse(l), ts: old })).join('\n') + '\n');
+  const r = JSON.parse(run(home, ['rotate', '--days', '30']));
+  assert.ok(r.rotated >= 3); // message + 2 статуса
+  const left = run(home, ['list']).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(left.some((e) => e.event_id === a.event_id)); // открытый жив
+  assert.ok(!left.some((e) => e.event_id === m.event_id)); // закрытый уехал
+  // архивный файл существует и содержит закрытую цепочку
+  const arch = readdirSync(join(home, 'archive'));
+  assert.equal(arch.length, 1);
+  // seq после ротации продолжается, не начинается с 1
+  const n = JSON.parse(run(home, ['send', '--type', 'question', '--to', 'w2', '--subject', 'новое', '--actor', 'w1']));
+  const rows = run(home, ['list', '--kind', 'message', '--event-id', n.event_id]).trim();
+  assert.ok(JSON.parse(rows).seq > 1);
+});
+
+test('rotate: policy_ack — последний ack воркера остаётся, старые уходят', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const pol = mkdtempSync(join(tmpdir(), 'pol-'));
+  writeFileSync(join(pol, 'policy-v1.md'), '# v1\n');
+  const env = { DEPT_POLICY_DIR: pol };
+  run(home, ['policy-ack', '--version', 'v1', '--actor', 'w1'], undefined, env);
+  run(home, ['policy-ack', '--version', 'v1', '--actor', 'w1'], undefined, env);
+  const led = join(home, 'events.jsonl');
+  const old = new Date(Date.now() - 40 * 86400_000).toISOString();
+  writeFileSync(led, readFileSync(led, 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.stringify({ ...JSON.parse(l), ts: old })).join('\n') + '\n');
+  JSON.parse(run(home, ['rotate', '--days', '30']));
+  const acks = run(home, ['list', '--kind', 'policy_ack']).trim().split('\n').filter(Boolean);
+  assert.equal(acks.length, 1); // последний остался, старый уехал
+});
+
+test('assertRefExists видит архив: duplicate --ref-main на заархивированный инцидент', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const i1 = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 'основной', '--actor', 'operator']));
+  run(home, ['incident-resolve', i1.event_id, '--status', 'resolved', '--actor', 'operator']);
+  const led = join(home, 'events.jsonl');
+  const old = new Date(Date.now() - 40 * 86400_000).toISOString();
+  writeFileSync(led, readFileSync(led, 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.stringify({ ...JSON.parse(l), ts: old })).join('\n') + '\n');
+  JSON.parse(run(home, ['rotate', '--days', '30']));
+  // новый инцидент-дубль ссылается на архивный основной — должен пройти
+  const i2 = JSON.parse(run(home, ['incident-open', '--about', 'w1', '--severity', 'low', '--summary', 'дубль', '--actor', 'operator']));
+  run(home, ['incident-resolve', i2.event_id, '--status', 'duplicate', '--ref-main', i1.event_id, '--actor', 'operator']);
+});
+
+test('policy-check: mtime правил новее ack и протухший TTL — оба падают (p2#1)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const pol = mkdtempSync(join(tmpdir(), 'pol-'));
+  writeFileSync(join(pol, 'policy-v1.md'), '# v1\n');
+  const env = { DEPT_POLICY_DIR: pol };
+  run(home, ['policy-ack', '--version', 'v1', '--actor', 'w1'], undefined, env);
+  // mtime новее ack: трогаем файл в будущее
+  const f = join(pol, 'policy-v1.md');
+  const future = new Date(Date.now() + 5_000);
+  utimesSync(f, future, future);
+  assert.throws(() => run(home, ['policy-check', '--worker', 'w1'], undefined, env));
+  // TTL: свежий ack, но TTL крошечный → протух
+  utimesSync(f, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  run(home, ['policy-ack', '--version', 'v1', '--actor', 'w1'], undefined, env);
+  assert.throws(() => {
+    // ждём 1.2с, TTL 0.0002ч = 0.72с
+    execFileSync('sleep', ['1.2']);
+    run(home, ['policy-check', '--worker', 'w1'], undefined, { ...env, DEPT_POLICY_ACK_TTL_HOURS: '0.0002' });
+  });
+});
+
+test('die-под-локом: approval-resolve на несуществующий ref не держит лок (Codex-аудит В3)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  // validateEvent/assertRefExists теперь кидают cliError вместо die() изнутри withLock —
+  // если бы лок остался висеть, следующая команда ждала бы withLock'овский 10с-таймаут.
+  assert.throws(() => run(home, ['approval-resolve', 'evt_0_none', '--status', 'approved']));
+  assert.doesNotThrow(() => run(home, ['append', '--kind', 'agent_run', '--data', '{"worker":"x","run_kind":"wake"}']));
 });
