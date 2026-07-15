@@ -1,0 +1,8 @@
+#!/bin/sh
+# Фикстура для теста dl: битые строки stdout (p2#13) — 2 валидные JSON-строки
+# + 1 битая (мусор вместо JSON), как настоящий dept-ledger мог бы отдать при
+# частично повреждённом events.jsonl.
+echo '{"v":1,"event_id":"evt_1","seq":1,"ts":"2026-07-15T00:00:00Z","actor":"tester","kind":"message","data":{"type":"question","from":"a","to":"b","subject":"ok"}}'
+echo 'этой строке не бывать валидным JSON {{{'
+echo '{"v":1,"event_id":"evt_2","seq":2,"ts":"2026-07-15T00:00:01Z","actor":"tester","kind":"message","data":{"type":"question","from":"a","to":"b","subject":"ok2"}}'
+exit 0

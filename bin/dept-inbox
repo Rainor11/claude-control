@@ -1,131 +1,279 @@
 #!/usr/bin/env node
-// dept-inbox — read-only веб-инбокс оператора поверх ledger отдела.
+// dept-inbox — read-only веб-дашборд «Цифровой отдел» поверх ledger отдела (Task 9, фаза 3).
 // Слушает ТОЛЬКО 127.0.0.1; наружу — через Angie-vhost с basic auth.
-// Никаких записей: решения — кнопками в TG-боте (дашборд с действиями — фаза 3+).
+// Никаких записей: решения — кнопками в TG-боте. Только http-сервер + dl() + сборщики
+// данных + маршрутизация; весь HTML — в bin/dept-inbox-render.js.
 'use strict';
+const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { execFile } = require('child_process');
+const render = require('./dept-inbox-render.js');
 
 const PORT = Number(process.env.DEPT_INBOX_PORT || 8377);
-const DL = process.env.DEPT_LEDGER_BIN || path.join(__dirname, 'dept-ledger');
+const DEFAULT_DL_BIN = path.join(__dirname, 'dept-ledger');
+const DEFAULT_TIMEOUT_MS = 15000;
+const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const WORKERS_DIR = path.join(CC_HOME, 'workers');
+const DEPT_ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп']);
 
-// Ошибка чтения ledger не должна маскироваться под «пустой инбокс» / «не найдено».
-// Результат per-call ({rows, error}) — общий mutable lastReadError давал гонку:
-// параллельный запрос затирал ошибку соседнего (или забирал её в свой успешный ответ).
+// p2#12: execFile-timeout читаем ВНУТРИ функции при каждом вызове (не на module-load) —
+// иначе тестовая подмена env после require() дочернего модуля не сработала бы
+// (Codex-аудит В9). Тот же таймаут переиспользует и systemctlIsActiveMany().
+function execTimeoutMs() {
+  const n = Number(process.env.DEPT_INBOX_EXEC_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
+}
+
+// dl() — единственная точка чтения ledger. Ошибка чтения не должна маскироваться под
+// «пустой инбокс» / «не найдено» (per-call {rows, error}: общий mutable lastReadError
+// давал гонку — параллельный запрос затирал ошибку соседнего).
+// p2#11: сырые детали (stderr, ENOENT-пути) НЕ попадают в error, который в итоге рендерится
+// в HTML — только generic-текст; полный текст идёт в console.error (journald подберёт).
+// p2#13: битые JSON-строки stdout считаются, а не молча отбрасываются — попадают в error
+// баннером «N строк пропущено», чтобы оператор видел частичное повреждение журнала.
 function dl(args) {
+  const bin = process.env.DEPT_LEDGER_BIN || DEFAULT_DL_BIN;
+  const timeout = execTimeoutMs();
   return new Promise((resolve) => {
-    execFile(DL, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return resolve({ rows: [], error: String(stderr || err.message).slice(0, 300) });
-      const rows = [];
-      if (stdout && stdout.trim()) {
-        for (const l of stdout.trim().split('\n')) { try { rows.push(JSON.parse(l)); } catch {} }
+    execFile(bin, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`dept-inbox: dl(${JSON.stringify(args)}) failed [bin=${bin}]:`, String(stderr || err.message));
+        return resolve({ rows: [], error: 'журнал недоступен (см. лог сервиса)' });
       }
-      resolve({ rows, error: null });
+      const rows = [];
+      let broken = 0;
+      if (stdout && stdout.trim()) {
+        for (const l of stdout.trim().split('\n')) {
+          try { rows.push(JSON.parse(l)); }
+          catch { broken++; console.error(`dept-inbox: битая строка ledger [bin=${bin}, args=${JSON.stringify(args)}]`); }
+        }
+      }
+      resolve({ rows, error: broken ? `${broken} строк${broken === 1 ? 'а' : ''} пропущено при разборе журнала` : null });
     });
   });
 }
 
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-function age(ts) {
-  const m = Math.max(0, Math.round((Date.now() - Date.parse(ts)) / 60000));
-  if (!Number.isFinite(m)) return '?'; // битый/отсутствующий ts — не рисовать "NaN дн"
-  if (m < 60) return m + ' мин';
-  if (m < 1440) return Math.floor(m / 60) + ' ч ' + (m % 60) + ' мин';
-  return Math.floor(m / 1440) + ' дн';
+// Один execFile на все воркеры разом (не по одному) — systemctl is-active построчно
+// возвращает статус в том же порядке, что и переданные юниты.
+function systemctlIsActiveMany(names) {
+  if (!names.length) return Promise.resolve(new Map());
+  const units = names.map((n) => `claude-auto@${n}.service`);
+  return new Promise((resolve) => {
+    execFile('systemctl', ['--user', 'is-active', ...units], { encoding: 'utf8', timeout: execTimeoutMs() },
+      (err, stdout) => {
+        if (err && !stdout) console.error('dept-inbox: systemctl is-active недоступен:', err.message);
+        const lines = String(stdout || '').trim().split('\n');
+        const map = new Map();
+        names.forEach((n, i) => map.set(n, lines[i] === 'active'));
+        resolve(map);
+      });
+  });
 }
 
-function summaryOf(e) {
-  const d = e.data || {};
-  return d.summary || d.subject || (d.status ? `${d.status} → ${d.ref || ''}` : '') || d.worker || '';
+function readJSON(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+function readContext(name) { return readJSON(path.join(WORKERS_DIR, name, 'state', 'context.json')); }
+// state/compactions — plain-text счётчик (claude-auto-run пишет при каждом /compact,
+// claude-auto rebase его удаляет). Мусор/отсутствие файла → 0, не крашить страницу.
+function readCompactions(name) {
+  try {
+    const raw = fs.readFileSync(path.join(WORKERS_DIR, name, 'state', 'compactions'), 'utf8').trim();
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+  } catch { return 0; }
+}
+function loadEbCfg(name) { return readJSON(path.join(WORKERS_DIR, name, 'event-bridge.config.json')) || { probes: [] }; }
+function minutesSince(ts) {
+  const t = Date.parse(ts);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.round((Date.now() - t) / 60000));
 }
 
-function page(title, body) {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
-<title>${esc(title)}</title><style>
-body{font:15px/1.5 system-ui,sans-serif;margin:1rem auto;max-width:60rem;padding:0 1rem;background:#14161a;color:#d7dae0}
-table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}
-td,th{border-bottom:1px solid #2c313a;padding:.35rem .5rem;text-align:left;vertical-align:top}
-th{color:#8b93a1;font-weight:600} a{color:#7ab7ff} h1{font-size:1.4rem} h2{margin:1.2rem 0 .3rem;font-size:1.1rem}
-.meta{color:#7b8290} pre.diff{background:#0d1117;border:1px solid #2c313a;padding:.6rem .8rem;overflow-x:auto;line-height:1.35;font-size:13px}
-.da{color:#7ee787}.dd{color:#ff8f7a}.dh{color:#8b93a1}.dc{color:#c8ccd4} blockquote{border-left:3px solid #3a4150;margin:.5rem 0;padding:.2rem .8rem;white-space:pre-wrap}
-</style></head><body><h1>Цифровой отдел</h1>${body}</body></html>`;
-}
+// ---------------------------------------------------------------------------
+// Сборщики данных — общее ядро collectDeptState() переиспользуют /, /w/<name>, /activity.
+// fs-ошибка ОДНОГО воркера не валит страницу целиком — поле остаётся «n/a»/null.
+// ---------------------------------------------------------------------------
 
-// Единый стиль баннера ошибки чтения для инбокса и карточки аппрува.
-function errBanner(readError) {
-  return readError
-    ? `<p style="color:#ff8f7a;border:1px solid #7a3a2e;padding:.4rem .8rem">⚠️ Ошибка чтения журнала — данные могут быть неполными: ${esc(readError)}</p>` : '';
-}
+async function collectDeptState() {
+  const [openAprRes, openIncRes, regRes, polRes, ackRes, runRes, allRes] = await Promise.all([
+    dl(['list', '--kind', 'approval', '--status', 'open']),
+    dl(['list', '--kind', 'incident', '--status', 'open']),
+    dl(['registry-list']),
+    dl(['policy-current']),
+    dl(['list', '--kind', 'policy_ack', '--limit', '500']),
+    dl(['list', '--kind', 'agent_run', '--limit', '500']),
+    dl(['list', '--limit', '1000']),
+  ]);
+  const registry = regRes.rows[0] || { workers: {} };
+  const policy = polRes.rows[0] || {};
+  const openApprovalsRows = openAprRes.rows;
+  const openIncidentsRows = openIncRes.rows;
+  const acks = ackRes.rows;
+  const runs = runRes.rows;
+  const recentRows = allRes.rows;
 
-function renderInbox(d) {
-  const apr = d.approvals.map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.from)}</td>
-<td>${esc(e.data.kind_of)}</td><td><a href="/a/${esc(e.event_id)}">${esc(e.data.summary)}</a></td></tr>`).join('')
-    || '<tr><td colspan="4">пусто — решений никто не ждёт</td></tr>';
-  const inc = d.incidents.map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.severity)}</td>
-<td>${esc(e.data.about_worker)}</td><td>${esc(e.data.summary)}</td></tr>`).join('')
-    || '<tr><td colspan="4">пусто</td></tr>';
-  const rec = d.recent.map((e) => `<tr><td>${esc((e.ts || '').slice(0, 16).replace('T', ' '))}</td>
-<td>${esc(e.actor)}</td><td>${esc(e.kind)}</td><td>${esc(summaryOf(e))}</td></tr>`).join('');
-  const workers = Object.keys((d.registry && d.registry.workers) || {}).length;
-  return page('Отдел — инбокс', `${errBanner(d.readError)}
-<p class="meta">правила: ${esc(d.policy.version || '?')} · воркеров в реестре: ${workers} · автообновление 60с</p>
-<h2>⏳ Ждут решения (${d.approvals.length})</h2>
-<table><tr><th>висит</th><th>кто</th><th>тип</th><th>что</th></tr>${apr}</table>
-<h2>🚨 Открытые инциденты (${d.incidents.length})</h2>
-<table><tr><th>возраст</th><th>severity</th><th>о ком</th><th>что</th></tr>${inc}</table>
-<h2>Последние события</h2>
-<table><tr><th>когда (UTC)</th><th>кто</th><th>вид</th><th>что</th></tr>${rec}</table>`);
-}
+  let autoReg = { workers: {} };
+  try { autoReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8')); }
+  catch (e) { console.error('dept-inbox: autonomous.json недоступен:', e.message); }
 
+  const names = Array.from(new Set([
+    ...Object.keys(registry.workers || {}),
+    ...Object.keys(autoReg.workers || {}),
+  ]));
 
-// detail с видом unified diff рендерим раскрашенным построчно; прочее — blockquote
-function renderDetail(detail) {
-  if (!detail) return '<p class="meta">детали не приложены</p>';
-  const looksDiff = /^(@@ |--- |\+\+\+ )/m.test(detail);
-  if (!looksDiff) return `<blockquote>${esc(detail)}</blockquote>`;
-  const rows = detail.split('\n').map((l) => {
-    const c = l.startsWith('+') ? 'da' : l.startsWith('-') ? 'dd' : l.startsWith('@@') ? 'dh' : 'dc';
-    return `<span class="${c}">${esc(l)}</span>`;
-  }).join('\n');
-  return `<pre class="diff">${rows}</pre>`;
-}
-
-function renderApproval(e, statuses, readError) {
-  if (!e) {
-    // при ошибке чтения НЕ выдавать «не найдено» — реальное состояние аппрува неизвестно
-    if (readError) return page('ошибка чтения журнала', `${errBanner(readError)}
-<p>Не удалось прочитать журнал — состояние аппрува неизвестно, обнови страницу.</p>
-<p><a href="/">← в инбокс</a></p>`);
-    return page('не найдено', '<p>Аппрув не найден.</p><p><a href="/">← в инбокс</a></p>');
+  const aprByWorker = new Map();
+  for (const e of openApprovalsRows) { const w = e.data && e.data.from; if (w) aprByWorker.set(w, (aprByWorker.get(w) || 0) + 1); }
+  const incByWorker = new Map();
+  for (const e of openIncidentsRows) { const w = e.data && e.data.about_worker; if (w) incByWorker.set(w, (incByWorker.get(w) || 0) + 1); }
+  const lastAck = new Map();
+  for (const e of acks) if (e.data && e.data.worker) lastAck.set(e.data.worker, e); // append-order → последний перезаписывает
+  const lastEventTs = new Map();
+  const bump = (name, ts) => {
+    if (!name || !ts) return;
+    const cur = lastEventTs.get(name);
+    if (!cur || Date.parse(ts) > Date.parse(cur)) lastEventTs.set(name, ts);
+  };
+  for (const e of recentRows) {
+    const d = e.data || {};
+    for (const n of new Set([e.actor, d.to, d.from, d.worker, d.about_worker].filter(Boolean))) bump(n, e.ts);
   }
-  const st = statuses.length ? statuses[statuses.length - 1].data.status : (e.data.status || 'open');
-  const hist = statuses.map((s) => `<li>${esc(s.ts)} — <b>${esc(s.data.status)}</b> (${esc(s.actor)})</li>`).join('');
-  return page(`Аппрув ${e.event_id}`, `${errBanner(readError)}
-<p><a href="/">← в инбокс</a></p>
-<h2>${esc(e.data.summary)}</h2>
-<p class="meta">${esc(e.event_id)} · от ${esc(e.data.from)} · тип ${esc(e.data.kind_of)} · открыт ${esc(e.ts)} (${esc(age(e.ts))} назад) · статус: <b>${esc(st)}</b></p>
-${renderDetail(e.data.detail)}
-${hist ? `<h2>История</h2><ul>${hist}</ul>` : ''}
-<p class="meta">Решение — кнопками в Telegram (@RnR_Workers). Эта страница только показывает.</p>`);
+  for (const e of runs) bump(e.data && e.data.worker, e.ts);
+
+  const unitStatus = await systemctlIsActiveMany(names);
+
+  const workersMap = new Map();
+  let sleepingCount = 0;
+  for (const name of names) {
+    const reg = (registry.workers && registry.workers[name]) || {};
+    const auto = (autoReg.workers && autoReg.workers[name]) || {};
+    const state = auto.state || 'unknown';
+    const role = reg.role || 'legacy';
+    if (state === 'sleeping') sleepingCount++;
+    const ctxRaw = readContext(name);
+    const ctx = ctxRaw ? { tokens: ctxRaw.ctx_tokens, threshold: ctxRaw.threshold, ts: ctxRaw.ts } : null;
+    const compactions = readCompactions(name);
+    const cfg = loadEbCfg(name);
+    const ackEv = lastAck.get(name);
+    const policyAck = ackEv ? { version: ackEv.data.policy_version, ageMin: minutesSince(ackEv.ts) } : null;
+    let lastTs = lastEventTs.get(name) || null;
+    if (!lastTs && ctx && ctx.ts) lastTs = ctx.ts;
+    workersMap.set(name, {
+      name, role, client: reg.client || null, missionVersion: reg.mission_version || null,
+      state, unitUp: unitStatus.has(name) ? unitStatus.get(name) : null,
+      ctx, compactions, probes: (cfg.probes || []).map((p) => p.name).filter(Boolean),
+      policyAck, lastActivityMin: lastTs ? minutesSince(lastTs) : null,
+      openApprovals: aprByWorker.get(name) || 0, openIncidents: incByWorker.get(name) || 0,
+    });
+  }
+
+  const readError = [openAprRes, openIncRes, regRes, polRes, ackRes, runRes, allRes].map((r) => r.error).find(Boolean) || null;
+  const legacyCount = [...workersMap.values()].filter((w) => !DEPT_ROLES.has(w.role)).length;
+  return { workersMap, recentRows, runs, legacyCount, sleepingCount, policy, registry,
+    openApprovals: openApprovalsRows.length, openIncidents: openIncidentsRows.length, readError };
 }
 
-async function collectInbox() {
+async function collectOffice() {
+  const s = await collectDeptState();
+  const workers = [...s.workersMap.values()].filter((w) => DEPT_ROLES.has(w.role));
+  return { workers, legacyCount: s.legacyCount, sleepingCount: s.sleepingCount, policy: s.policy,
+    openApprovals: s.openApprovals, openIncidents: s.openIncidents, readError: s.readError };
+}
+
+async function collectTimeline(name) {
+  const s = await collectDeptState();
+  const card = s.workersMap.get(name) || null;
+  const events = s.recentRows.filter((e) => {
+    const d = e.data || {};
+    return e.actor === name || d.to === name || d.from === name || d.worker === name || d.about_worker === name;
+  }).slice(-100);
+  return { name, events, card, readError: s.readError };
+}
+
+async function collectActivity() {
+  const s = await collectDeptState();
+  const since7 = Date.now() - 7 * 86400_000;
+  const perWorker = new Map();
+  const ensure = (name) => {
+    if (!perWorker.has(name)) perWorker.set(name, { name, events7d: 0, compactions: 0, wakes: 0, rebases: 0, days: new Array(14).fill(0) });
+    return perWorker.get(name);
+  };
+  for (const name of s.workersMap.keys()) { ensure(name).compactions = s.workersMap.get(name).compactions; }
+
+  for (const e of s.recentRows) {
+    const d = e.data || {};
+    for (const n of new Set([e.actor, d.worker].filter(Boolean))) {
+      if (!perWorker.has(n)) continue; // только известные отделу воркеры (registry ∪ autonomous)
+      const w = ensure(n);
+      const t = Date.parse(e.ts);
+      if (Number.isFinite(t) && t >= since7) w.events7d++;
+      if (Number.isFinite(t)) {
+        const offDays = Math.floor((Date.now() - t) / 86400_000);
+        if (offDays >= 0 && offDays < 14) w.days[13 - offDays]++;
+      }
+    }
+  }
+  for (const e of s.runs) {
+    const w = e.data && e.data.worker && perWorker.get(e.data.worker);
+    if (!w) continue;
+    if (e.data.run_kind === 'wake') w.wakes++;
+    if (e.data.run_kind === 'rebase') w.rebases++;
+  }
+  const rows = [...perWorker.values()].filter((w) => DEPT_ROLES.has((s.workersMap.get(w.name) || {}).role));
+  return { rows, readError: s.readError };
+}
+
+async function collectApprovalsPage() {
   const res = await Promise.all([
     dl(['list', '--kind', 'approval', '--status', 'open']),
     dl(['list', '--kind', 'incident', '--status', 'open']),
     dl(['list', '--limit', '50']),
     dl(['registry-list']),
     dl(['policy-current']),
+    dl(['list', '--kind', 'approval_status', '--limit', '500']),
   ]);
-  const [approvals, incidents, recent, reg, pol] = res;
+  const [approvals, incidents, recent, reg, pol, aprStatuses] = res;
+  const since = Date.now() - 7 * 86400_000;
+  const executed = aprStatuses.rows.filter((e) => e.data
+    && (e.data.status === 'executed' || e.data.status === 'exec_failed')
+    && Date.parse(e.ts) >= since);
   return { approvals: approvals.rows.reverse(), incidents: incidents.rows.reverse(), recent: recent.rows.reverse(),
-    registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
+    executed: executed.reverse(), registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
     readError: res.map((r) => r.error).find(Boolean) || null };
 }
+
+const CLOSED_INCIDENT_STATUSES = new Set(['resolved', 'wontfix', 'duplicate']);
+async function collectIncidents() {
+  const res = await Promise.all([
+    dl(['list', '--kind', 'incident', '--status', 'open']),
+    dl(['list', '--kind', 'incident_status', '--limit', '1000']),
+    dl(['list', '--kind', 'incident', '--limit', '1000']),
+  ]);
+  const [openRes, statusRes, allIncRes] = res;
+  const since = Date.now() - 14 * 86400_000;
+  const closedByRef = new Map();
+  for (const e of statusRes.rows) {
+    if (!(e.data && e.data.ref && CLOSED_INCIDENT_STATUSES.has(e.data.status))) continue;
+    const cur = closedByRef.get(e.data.ref);
+    if (!cur || Date.parse(e.ts) > Date.parse(cur.ts)) closedByRef.set(e.data.ref, e);
+  }
+  const closed = allIncRes.rows
+    .filter((e) => closedByRef.has(e.event_id) && Date.parse(closedByRef.get(e.event_id).ts) >= since)
+    .map((e) => ({ ...e, data: { ...e.data, status: closedByRef.get(e.event_id).data.status } }))
+    .reverse();
+  return { open: openRes.rows.reverse(), closed, readError: res.map((r) => r.error).find(Boolean) || null };
+}
+
+async function collectApproval(eid) {
+  const [aprRes, stRes] = await Promise.all([
+    dl(['list', '--kind', 'approval', '--event-id', eid]), // p2#13: O(1)-фильтр вместо полного списка
+    dl(['list', '--kind', 'approval_status', '--filter', `ref=${eid}`]),
+  ]);
+  return { event: aprRes.rows[0] || null, statuses: stRes.rows, readError: aprRes.error || stRes.error || null };
+}
+
+// ---------------------------------------------------------------------------
+// Сервер
+// ---------------------------------------------------------------------------
 
 if (require.main === module) {
   http.createServer(async (req, res) => {
@@ -133,14 +281,18 @@ if (require.main === module) {
       const u = new URL(req.url, 'http://x');
       if (u.pathname === '/healthz') { res.writeHead(200); res.end('ok'); return; }
       let html = null;
-      if (u.pathname === '/') html = renderInbox(await collectInbox());
+      if (u.pathname === '/') html = render.renderOffice(await collectOffice());
+      else if (u.pathname === '/approvals') html = render.renderApprovalsPage(await collectApprovalsPage());
+      else if (u.pathname === '/incidents') html = render.renderIncidents(await collectIncidents());
+      else if (u.pathname === '/activity') { const a = await collectActivity(); html = render.renderActivity(a.rows, a.readError); }
       else if (u.pathname.startsWith('/a/')) {
-        const eid = u.pathname.slice(3);
-        const [aprs, sts] = await Promise.all([dl(['list', '--kind', 'approval']),
-          dl(['list', '--kind', 'approval_status'])]);
-        html = renderApproval(aprs.rows.find((e) => e.event_id === eid),
-          sts.rows.filter((s) => s.data && s.data.ref === eid),
-          aprs.error || sts.error || null);
+        const eid = decodeURIComponent(u.pathname.slice(3));
+        const { event, statuses, readError } = await collectApproval(eid);
+        html = render.renderApproval(event, statuses, readError);
+      } else if (u.pathname.startsWith('/w/')) {
+        const name = decodeURIComponent(u.pathname.slice(3));
+        const t = await collectTimeline(name);
+        html = render.renderTimeline(name, t.events, t.readError, t.card);
       }
       if (html === null) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); return; }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8',
@@ -148,9 +300,15 @@ if (require.main === module) {
         'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
       res.end(html);
     } catch (e) {
+      // p2#11: без деталей (стек/пути) наружу — только в лог сервиса.
+      console.error('dept-inbox: unhandled error on', req.url, '-', e.stack || e.message);
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('inbox error: ' + e.message);
+      res.end('internal error — см. лог сервиса');
     }
   }).listen(PORT, '127.0.0.1', () => console.log('dept-inbox on 127.0.0.1:' + PORT));
 }
-module.exports = { renderInbox, renderApproval, summaryOf };
+
+module.exports = {
+  dl, collectDeptState, collectOffice, collectTimeline, collectActivity, collectApprovalsPage,
+  collectIncidents, collectApproval, systemctlIsActiveMany, execTimeoutMs,
+};
