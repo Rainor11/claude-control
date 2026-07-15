@@ -136,6 +136,16 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     state[name] = { ...(prev || { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: 0 }), animAlerted: true };
     continue;
   }
+  if (d.action === 'none') {
+    // none && !reset (reset обработан выше). Для основной лестницы это no-op — hash в этой
+    // ветке равен prev.screenHash. Для продолжающегося anim-эпизода продвигает hash каждый
+    // тик: реально замерший после анимации экран на следующем тике совпадёт с prev.screenHash
+    // и уйдёт в основную лестницу (иначе старый докадровый hash глушил бы её навсегда).
+    // firstSeen сохраняется как якорь начала эпизода — переход anim→freeze эскалирует сразу
+    // (воркер уже давно болен), это намеренно.
+    state[name] = { ...prev, screenHash: cur.screenHash };
+    continue;
+  }
   if (d.action === 'alert') {
     notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`);
     state[name] = { ...prev, alerted: true };
