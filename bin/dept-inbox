@@ -237,6 +237,14 @@ async function collectActivity() {
   return { rows, readError: s.readError };
 }
 
+// M-2 (ревью фазы 3): /approvals не видел заявки МЕЖДУ решением человека и финалом раннера
+// (approved-исполняемые и executing) — «дыра видимости» до 20+ минут на долгих заявках.
+// Секция «⚙️ Исполняются» = executing (любой kind_of: статус пишет только диспетчер перед
+// раннером) + approved с kind_of ∈ EXEC_KINDS (ждут диспетчера). approved НЕ-исполняемых
+// kind_of (outgoing/kb_change/…) сюда намеренно НЕ попадают: их «исполняет» сам воркер без
+// финального статуса в ledger — они висели бы в секции вечно (rotate считает их закрытыми).
+// Синхронно с EXEC_KINDS в bin/dept-dispatcher (пин — dept-dispatcher.test.mjs).
+const EXEC_KINDS_INBOX = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
 async function collectApprovalsPage() {
   const res = await Promise.all([
     dl(['list', '--kind', 'approval', '--status', 'open']),
@@ -245,14 +253,22 @@ async function collectApprovalsPage() {
     dl(['registry-list']),
     dl(['policy-current']),
     dl(['list', '--kind', 'approval_status', '--limit', '500']),
+    dl(['list', '--kind', 'approval', '--status', 'executing']),
+    dl(['list', '--kind', 'approval', '--status', 'approved']),
   ]);
-  const [approvals, incidents, recent, reg, pol, aprStatuses] = res;
+  const [approvals, incidents, recent, reg, pol, aprStatuses, executingRes, approvedRes] = res;
   const since = Date.now() - 7 * 86400_000;
   const executed = aprStatuses.rows.filter((e) => e.data
     && (e.data.status === 'executed' || e.data.status === 'exec_failed')
     && Date.parse(e.ts) >= since);
+  const executingNow = [
+    ...executingRes.rows.map((e) => ({ ...e, phase: 'executing' })),
+    ...approvedRes.rows.filter((e) => e.data && EXEC_KINDS_INBOX.has(e.data.kind_of))
+      .map((e) => ({ ...e, phase: 'approved' })),
+  ];
   return { approvals: approvals.rows.reverse(), incidents: incidents.rows.reverse(), recent: recent.rows.reverse(),
-    executed: executed.reverse(), registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
+    executed: executed.reverse(), executingNow: executingNow.reverse(),
+    registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
     readError: res.map((r) => r.error).find(Boolean) || null };
 }
 

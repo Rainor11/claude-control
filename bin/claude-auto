@@ -1065,8 +1065,14 @@ cmd_rebase() {
 # $DEPT_HOME/missions/<name>.md (аудит: попадает в git-snapshot department-репо;
 # откат = git revert + повторный mission-update) и — если не --no-rebase — сразу
 # rebase'ит воркера, чтобы миссия вступила в силу немедленно (§7 спеки), не дожидаясь
-# следующей компакции. rebase может отложиться (busy, exit 3) — миссия при этом УЖЕ
-# записана на диск; команда сообщает и пробрасывает тот же exit code.
+# следующей компакции.
+# Exit codes (I-1, ревью фазы 3): 0 — миссия записана и rebase прошёл; 3 — миссия
+# записана, rebase ОТЛОЖЕН (воркер busy — повтори rebase); 4 — миссия записана, но
+# rebase упал HARD (STALE-память / воркер не поднялся): НЕ полный провал (миссия уже
+# на диске и вступит при следующем старте/компакции), но и не полный успех — rebase
+# добить вручную / rebase-check. Раньше hard-die внутри cmd_rebase ронял весь скрипт
+# rc=1, и вызывающий (dept-mission-exec) писал exec_failed по фактически применённой
+# миссии — рассинхрон ledger ↔ диск; теперь rebase ловится субшеллом.
 cmd_mission_update() {
   local name="" mission_file="" reason="смена миссии" no_rebase=false
   name="${1:?usage: mission-update <name> --mission-file <f> [--reason s] [--no-rebase]}"; shift
@@ -1109,9 +1115,20 @@ cmd_mission_update() {
     echo "mission-update: воркер '$name' state=$wst — rebase не нужен: новая миссия вступит в силу при следующем старте/пробуждении"
     return 0
   fi
-  cmd_rebase "$name" --reason "смена миссии: $reason"
+  # Субшелл ловит hard-die cmd_rebase (STALE-гард ~1025 / «не поднялся за 120с»):
+  # die = exit 1 умирает ВНУТРИ субшелла, а не роняет весь mission-update — иначе
+  # вызывающий видел бы rc=1 «полный провал», хотя миссия уже записана выше.
+  ( cmd_rebase "$name" --reason "смена миссии: $reason" )
   local rc=$?
-  [ "$rc" = 3 ] && echo "mission-update: миссия записана, но rebase ОТЛОЖЕН (busy) — повтори: claude-auto rebase $name"
+  case "$rc" in
+    0) ;;
+    3) echo "mission-update: миссия записана, но rebase ОТЛОЖЕН (busy) — повтори: claude-auto rebase $name" ;;
+    *) # hard-fail rebase → спецкод 4: ненулевой (скрипты не примут за полный успех),
+       # отличим от 3 (busy-defer). Миссия УЖЕ на диске — вступит при следующем
+       # старте/компакции; rebase добить вручную или дождаться rebase-check.
+       echo "mission-update: миссия ЗАПИСАНА (вступит при следующем старте/компакции), но rebase УПАЛ (rc=$rc) — добей вручную: claude-auto rebase $name, или оставь rebase-check'у"
+       rc=4 ;;
+  esac
   return "$rc"
 }
 
@@ -1736,7 +1753,10 @@ MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
                                rebase (миссия вступает в силу сразу, не при
                                следующей компакции); --no-rebase — только записать,
                                применится позже; занятого воркера rebase откладывает
-                               (exit 3, миссия уже записана — повтори rebase)
+                               (exit 3, миссия уже записана — повтори rebase);
+                               hard-провал rebase (STALE/не поднялся) → exit 4:
+                               миссия записана и вступит при следующем старте,
+                               rebase добить вручную / rebase-check
   remove <имя>                 остановить и УДАЛИТЬ файлы воркера + запись в реестре
   adopt …                      создать и запустить воркера (бэкенд /go-autonomous)
   spawn --name <n> --cwd <dir> --mission-file <f> [--mode auto]

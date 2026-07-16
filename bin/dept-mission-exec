@@ -55,6 +55,15 @@ if [ "$rc" -eq 0 ]; then
   echo "mission-exec complete: $worker"
   exit 0
 fi
+# rc=4 (I-1, ревью фазы 3): миссия ЗАПИСАНА (CLAUDE.md пересобран, копия в missions/),
+# но rebase упал hard (STALE-память / воркер не поднялся). Это НЕ провал заявки —
+# миссия вступит при следующем старте/компакции; писать exec_failed было бы ложью
+# (эффект уже на диске и молча применится). Успех с явной note — raннер положит
+# хвост stdout в approval-exec executed --note.
+if [ "$rc" -eq 4 ]; then
+  echo "mission-exec complete: $worker (partial: миссия записана, rebase не прошёл — вступит при следующем старте; rebase добить: claude-auto rebase $worker / rebase-check)"
+  exit 0
+fi
 if [ "$rc" -ne 3 ]; then
   die "mission-update завершился ошибкой (rc=$rc)"
 fi

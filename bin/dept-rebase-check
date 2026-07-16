@@ -80,13 +80,17 @@ function acquireLock() {
     return false;
   }
 }
-if (!acquireLock()) {
-  console.log('rebase-check: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на rebase-check-state.json');
-  return;
+// p3#22: dry-run строго read-only — лок НЕ берём и НЕ пишем (превью не должен транзиентно
+// блокировать реальный тик; dry-путь без лока безопасен — state он не пишет, гонки RMW нет).
+if (!dry) {
+  if (!acquireLock()) {
+    console.log('rebase-check: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на rebase-check-state.json');
+    return;
+  }
+  // 'exit', не try/finally — снимает лок и при незапойманном исключении в цикле ниже
+  // (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
+  process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 }
-// 'exit', не try/finally — снимает лок и при незапойманном исключении в цикле ниже
-// (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
-process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 
 // timeout: подвисший claude-auto/tmux иначе вешает execFileSync навсегда — сам
 // rebase-check зависает вместо детекта чужой проблемы, и ни один воркер ПОСЛЕ
@@ -99,9 +103,13 @@ function saveState(s) {
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
+// p3#33: у notify СОБСТВЕННЫЙ таймаут 30с (не общий 10с sh()) — telegram_notify.sh при
+// сетевом флапе не успевал добежать до fallback, алерт молча терялся. Возвращает
+// успех/провал: дедуп-стейт эпизода (alerted) пишется только при доставленном алерте.
 function notify(msg) {
-  if (dry) { console.log('[dry] notify:', msg); return; }
-  if (sh(NOTIFY, [msg]) === null) console.log('rebase-check: notify FAILED:', msg);
+  if (dry) { console.log('[dry] notify:', msg); return true; }
+  if (sh(NOTIFY, [msg], 30_000) === null) { console.log('rebase-check: notify FAILED:', msg); return false; }
+  return true;
 }
 
 function readSpec(name) {
@@ -199,15 +207,20 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
   if (d.action === 'none') continue; // дедуп внутри decide() — эпизод уже сообщён, state не трогаем
 
   if (d.action === 'stale_alert') {
-    notify(`⚠️ rebase-check: ${name} — сессия старая, но память НЕ курируется (STALE). Авто-rebase запрещён; разберись: tmux -L claude-${name} attach -t claude-${name}`);
-    state[name] = { alerted: true };
+    // p3#33: alerted (дедуп эпизода) — только при ДОСТАВЛЕННОМ алерте; провал notify
+    // оставляет эпизод несообщённым, следующий тик повторит попытку.
+    if (notify(`⚠️ rebase-check: ${name} — сессия старая, но память НЕ курируется (STALE). Авто-rebase запрещён; разберись: tmux -L claude-${name} attach -t claude-${name}`)) {
+      state[name] = { alerted: true };
+    }
     continue;
   }
 
   // d.action === 'rebase'
   if (!ENFORCE) {
-    notify(`⚠️ [would-rebase] rebase-check: ${name} — ${d.reason}. Включи DEPT_REBASE_ENFORCE=1 или ребейзни вручную: claude-auto rebase ${name}`);
-    state[name] = { alerted: true };
+    // p3#33: тот же принцип — alerted только при доставленном [would-rebase]-алерте.
+    if (notify(`⚠️ [would-rebase] rebase-check: ${name} — ${d.reason}. Включи DEPT_REBASE_ENFORCE=1 или ребейзни вручную: claude-auto rebase ${name}`)) {
+      state[name] = { alerted: true };
+    }
     continue;
   }
 
@@ -219,6 +232,9 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
   }
   try {
     execFileSync(CLAUDE_AUTO, ['rebase', name, '--reason', `автопорог: ${d.reason}`], { encoding: 'utf8', timeout: 300_000 });
+    // p3#33-решение: state чистим НЕЗАВИСИМО от исхода notify — эпизод закрыт ФАКТОМ
+    // rebase (триггеры обнулены), уведомление информационное; следующий тик и так
+    // удалил бы запись по anyTrigger=false.
     notify(`✅ rebase-check: ${name} — автопорог сработал (${d.reason}), rebase выполнен.`);
     delete state[name];
   } catch (e) {

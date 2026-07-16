@@ -30,8 +30,9 @@ executed, exec_failed`. `executing` — промежуточный статус 
 - `dept-ledger list [--kind <k>] [--event-id <id>] [--filter k=v ...]
   [--status <s>] [--limit N]` — `--event-id` даёт точечное чтение одной
   записи (так карточки читает dept-inbox — не полный список).
-- `dept-ledger send --type <question|proposal|incident|handoff> --to <worker>
-  --subject <s> [--body <b>] [--refs a,b]` — сахар над `append --kind message`
+- `dept-ledger send --type <question|proposal|incident|handoff|
+  kb_change_request|decision_request> --to <worker> --subject <s>
+  [--body <b>] [--refs a,b]` — сахар над `append --kind message`
   (статус сразу `queued`); валидирует топологию отправителя/адресата (см.
   «Топология шины»).
 - `dept-ledger ack <event_id>` / `resolve <event_id> --status <handled|dead>`.
@@ -80,10 +81,14 @@ executed, exec_failed`. `executing` — промежуточный статус 
 - **МК → МК запрещено** — падает с «прямое сообщение МК→МК запрещено
   (policy 3.1) — отправь question руководителю»; вопрос вне своей зоны МК
   шлёт `dept-head`.
-- **Руководителю — только `question`/`proposal`** — остальные типы
-  (`incident`, `handoff`) `send` отклоняет с подсказкой: `incident` —
-  через `incident-open` (сам маршрутизирует на роль `тп`), `handoff` —
-  адресату напрямую.
+- **Руководителю — только `question`/`proposal`/`decision_request`** —
+  остальные типы (`incident`, `handoff`) `send` отклоняет с подсказкой:
+  `incident` — через `incident-open` (сам маршрутизирует на роль `тп`),
+  `handoff` — адресату напрямую.
+- **`kb_change_request` — только роли `архивариус`** (dept-archivist;
+  policy 3.4) — иным адресатам `send` отклоняет.
+- **`decision_request` — только роли `руководитель`** (dept-head) — иным
+  адресатам `send` отклоняет.
 
 Если хотя бы одна роль не резолвится (воркер не в реестре) — проверка не
 срабатывает, `send` пропускает сообщение.
@@ -91,10 +96,12 @@ executed, exec_failed`. `executing` — промежуточный статус 
 ## Policy-refresh (турникет правил)
 
 Канон правил — `wiki/work/ai-dev/отдел/правила/policy-vN.md` в brain
-(override `DEPT_POLICY_DIR`); действующая версия — файл с наибольшим `N`.
-На 2026-07-16 действующая — **v6** (v5 — role_change как 4-я база
-Архивариуса + граница «внутреннего коллеги» + уточнение §3.1; v6 — формат
-сообщений оператору, п. 3.7).
+(override `DEPT_POLICY_DIR`); **действующая версия = файл с наибольшим
+`vN` в каталоге** (на 16.07 — v7), фиксированный номер здесь не
+поддерживается — смотри каталог. История версий — в changelog-frontmatter
+самого файла правил (v5 — role_change как 4-я база Архивариуса + граница
+«внутреннего коллеги» + уточнение §3.1; v6 — формат сообщений оператору,
+п. 3.7; v7 — п. 4.7 «кастом-проект нормальным роадмапом»).
 
 - `dept-ledger policy-current` — `{version, file}` действующей версии.
 - `dept-ledger policy-ack --version vN [--actor <w>]` — подтверждение

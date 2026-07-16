@@ -72,14 +72,19 @@ function acquireLock() {
     return false;
   }
 }
-if (!acquireLock()) {
-  console.log('liveness: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на watchdog-state.json');
-  return;
+// p3#22: dry-run строго read-only — лок НЕ берём и НЕ пишем (превью-прогон не должен
+// транзиентно блокировать реальный тик и вообще что-либо создавать на диске; dry-путь
+// без лока безопасен — он не пишет state, гонки RMW нет).
+if (!dry) {
+  if (!acquireLock()) {
+    console.log('liveness: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на watchdog-state.json');
+    return;
+  }
+  // 'exit' — не try/finally: тоже снимает лок при незапойманном исключении в цикле ниже,
+  // не только при штатном завершении (иначе один сбой навсегда блокирует следующие прогоны
+  // на 15 мин, а не только на текущий тик).
+  process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 }
-// 'exit' — не try/finally: тоже снимает лок при незапойманном исключении в цикле ниже,
-// не только при штатном завершении (иначе один сбой навсегда блокирует следующие прогоны
-// на 15 мин, а не только на текущий тик).
-process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 
 // timeout: подвисший tmux/systemctl/dept-ledger (напр. мёртвый tmux-сервер) иначе вешает
 // execFileSync навсегда — сам watchdog зависает вместо детекта чужого зависания, и ни один
@@ -104,9 +109,14 @@ function saveState(s) {
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
+// p3#33: у notify СОБСТВЕННЫЙ таймаут 30с (не общий 10с sh()) — telegram_notify.sh при
+// сетевом флапе не успевал добежать до своего fallback, алерт молча терялся. Возвращает
+// успех/провал: там, где после алерта пишется дедуп-стейт эпизода (alerted/animAlerted/
+// wouldNotified), провал notify НЕ помечает эпизод — следующий тик повторит.
 function notify(msg) {
-  if (dry) { console.log('[dry] notify:', msg); return; }
-  if (sh(NOTIFY, [msg]) === null) console.log('liveness: notify FAILED:', msg);
+  if (dry) { console.log('[dry] notify:', msg); return true; }
+  try { execFileSync(NOTIFY, [msg], { encoding: 'utf8', timeout: 30_000 }); return true; }
+  catch { console.log('liveness: notify FAILED:', msg); return false; }
 }
 
 const reg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
@@ -132,8 +142,10 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   const d = decide(prev, cur, CFG);
   if (d.reset) { state[name] = { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: prev?.restartedAt || 0 }; continue; }
   if (d.action === 'anim_alert') {
-    notify(`⚠️ liveness [anim]: воркер ${name} — экран активен, но транскрипт не движется ${Math.round((now - tm) / 60000)} мин. Возможно «анимированное зависание» (лимиты подписки/сеть). Проверь: tmux -L claude-${name} attach -t claude-${name}`);
-    state[name] = { ...(prev || { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: 0 }), animAlerted: true };
+    // p3#33: animAlerted (дедуп anim-эпизода) — только при ДОСТАВЛЕННОМ алерте,
+    // иначе следующий тик повторит попытку (алерт не теряется на сетевом флапе).
+    const animOk = notify(`⚠️ liveness [anim]: воркер ${name} — экран активен, но транскрипт не движется ${Math.round((now - tm) / 60000)} мин. Возможно «анимированное зависание» (лимиты подписки/сеть). Проверь: tmux -L claude-${name} attach -t claude-${name}`);
+    state[name] = { ...(prev || { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: 0 }), animAlerted: animOk };
     continue;
   }
   if (d.action === 'none') {
@@ -147,8 +159,11 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     continue;
   }
   if (d.action === 'alert') {
-    notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`);
-    state[name] = { ...prev, alerted: true };
+    // p3#33: alerted (первая ступень лестницы) — только при доставленном алерте; провал
+    // notify оставляет prev как есть, следующий тик снова даст action=alert и повторит.
+    if (notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`)) {
+      state[name] = { ...prev, alerted: true };
+    }
   } else if (d.action === 'restart') {
     if (ENFORCE) {
       // dry всегда "успех" (симуляция, systemctl не вызывается); в боевом прогоне —
@@ -156,6 +171,9 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
       // «перезапущен» и чистил alerted/firstSeen, из-за чего лестница молча теряла воркера.
       const restarted = dry || sh('systemctl', ['--user', 'restart', `claude-auto@${name}.service`]) !== null;
       if (restarted) {
+        // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — рестарт УЖЕ случился,
+        // restartedAt обязан отразить реальность (иначе reincident-детект сломан и лестница
+        // зациклит рестарты); уведомление здесь информационное, не «эпизодный» алерт.
         notify(`🔄 liveness: воркер ${name} перезапущен (resume той же сессии).`);
         state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: now };
       } else {
@@ -163,8 +181,12 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
         // state НЕ обновляем — prev остаётся alerted, лестница продолжит на следующем тике
       }
     } else {
-      if (!prev.wouldNotified) notify(`⚠️ liveness [would-restart]: ${name} всё ещё висит. Включи LIVENESS_ENFORCE=1 или перезапусти вручную: systemctl --user restart claude-auto@${name}`);
-      state[name] = { ...prev, wouldNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
+      // p3#33: wouldNotified — только при доставленном алерте (иначе повтор на следующем тике)
+      if (!prev.wouldNotified) {
+        if (notify(`⚠️ liveness [would-restart]: ${name} всё ещё висит. Включи LIVENESS_ENFORCE=1 или перезапусти вручную: systemctl --user restart claude-auto@${name}`)) {
+          state[name] = { ...prev, wouldNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
+        }
+      }
     }
   } else if (d.action === 'incident') {
     if (ENFORCE) {
@@ -173,6 +195,9 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
       const opened = dry || sh(path.join(BIN, 'dept-ledger'), ['incident-open', '--about', name, '--severity', 'high',
         '--summary', 'воркер виснет повторно после рестарта', '--actor', 'watchdog']) !== null;
       if (opened) {
+        // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — инцидент УЖЕ открыт в
+        // ledger (ТП получил message), повтор на следующем тике открыл бы ВТОРОЙ инцидент;
+        // уведомление информационное, факт эпизода зафиксирован инцидентом.
         notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
         state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
       } else {
@@ -180,8 +205,12 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
         // state НЕ обновляем
       }
     } else {
-      if (!prev.wouldIncidentNotified) notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`);
-      state[name] = { ...prev, wouldIncidentNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
+      // p3#33: wouldIncidentNotified — только при доставленном алерте (иначе повтор)
+      if (!prev.wouldIncidentNotified) {
+        if (notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`)) {
+          state[name] = { ...prev, wouldIncidentNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
+        }
+      }
     }
   }
 }

@@ -587,6 +587,19 @@ test('policy-check: mtime правил новее ack и протухший TTL 
   });
 });
 
+// M-1 (ревью фазы 3): список exec-kinds живёт в 4 копиях (EXEC_KINDS в dept-dispatcher —
+// его пинит dept-dispatcher.test.mjs; EXECUTORS там же; WHITELIST в dept-exec-runner;
+// EXEC_KINDS_ROT здесь, в rotate). Разъезд копий = тихая потеря заявки: rotate унесёт
+// approved-заявку нового kind_of в архив, а dispatcher читает только активный файл.
+// Пин текстом (модуль bash-стиля не экспортируешь): регекс по строке объявления.
+test('EXEC_KINDS_ROT (rotate) синхронен с EXEC_KINDS dispatcher и WHITELIST dept-exec-runner', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const m = /EXEC_KINDS_ROT\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(src);
+  assert.ok(m, 'EXEC_KINDS_ROT не найден в bin/dept-ledger — переименовали? обнови тест и сверь 4 копии');
+  const kinds = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
+  assert.deepEqual(kinds, ['mission_change', 'planerka', 'sleep', 'worker_spawn']);
+});
+
 test('die-под-локом: approval-resolve на несуществующий ref не держит лок (Codex-аудит В3)', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   // validateEvent/assertRefExists теперь кидают cliError вместо die() изнутри withLock —

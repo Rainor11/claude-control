@@ -135,12 +135,14 @@ test('newProbeLines: legacy back-compat — маркированная стро�
 test('runnerArgv: transient-юнит + прокидка whitelist-env + argv раннера', () => {
   const argv = runnerArgv('evt_1_abcd', '/repo/bin/dept-exec-runner', '/repo/bin/dept-spawn-exec',
     { PATH: '/x:/y', CLAUDE_CONTROL_DIR: '/cc', BRAIN_CLIENTS: '/bc', TELEGRAM_NOTIFY: '/tg',
+      CLAUDE_AUTO_STALE_SECONDS: '3600',
       CLAUDE_AUTO_HOME: '/dead', HOME: '/home/u', SECRET: 'no' });
   assert.deepEqual(argv.slice(0, 4), ['--user', '--collect', '--quiet', '--unit=dept-runner-evt_1_abcd']);
   const forwarded = argv.filter((_, i) => argv[i - 1] === '--setenv');
-  // ревью P3-CRITICAL-2: прокидывается ровно то, что читает bash-цепочка раннера;
-  // CLAUDE_AUTO_HOME (node-only), HOME, SECRET — НЕ прокидываются.
-  assert.deepEqual(forwarded, ['PATH=/x:/y', 'CLAUDE_CONTROL_DIR=/cc', 'BRAIN_CLIENTS=/bc', 'TELEGRAM_NOTIFY=/tg']);
+  // ревью P3-CRITICAL-2: прокидывается ровно то, что читает bash-цепочка раннера
+  // (M-4: + CLAUDE_AUTO_STALE_SECONDS — STALE-гард cmd_rebase в цепочке planerka/
+  // mission-exec); CLAUDE_AUTO_HOME (node-only), HOME, SECRET — НЕ прокидываются.
+  assert.deepEqual(forwarded, ['PATH=/x:/y', 'CLAUDE_CONTROL_DIR=/cc', 'BRAIN_CLIENTS=/bc', 'TELEGRAM_NOTIFY=/tg', 'CLAUDE_AUTO_STALE_SECONDS=3600']);
   assert.deepEqual(argv.slice(-5), ['/repo/bin/dept-exec-runner', '--approval', 'evt_1_abcd', '--executor', '/repo/bin/dept-spawn-exec']);
 });
 

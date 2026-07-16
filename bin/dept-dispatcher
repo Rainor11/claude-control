@@ -94,13 +94,16 @@ function humanApproval(row) {
 // systemd-run НЕ наследует env клиента — значимые переменные прокидываются явно (--setenv).
 // Whitelist = ровно то, что ЧИТАЕТ цепочка раннера (ревью P3-CRITICAL-2, сверено grep'ом):
 // PATH; DEPT_HOME + DEPT_POLICY_DIR (dept-ledger); CLAUDE_CONTROL_DIR (claude-auto,
-// planerka/sleep-exec); BRAIN_CLIENTS (spawn-exec); TELEGRAM_NOTIFY + таймаут (сам раннер).
+// planerka/sleep-exec); BRAIN_CLIENTS (spawn-exec); TELEGRAM_NOTIFY + таймаут (сам раннер);
+// CLAUDE_AUTO_STALE_SECONDS (STALE-гард cmd_rebase в claude-auto — его читает цепочка
+// planerka/mission-exec → rebase; без прокидки тюнинг порога в env диспетчера молча
+// терялся бы, раннер ребейзил бы по дефолту 1800с — M-4 ревью фазы 3).
 // CLAUDE_AUTO_HOME сюда НЕ входит — её читают только node-компоненты (dispatcher/liveness/
 // inbox), в bash-цепочке раннера она мертва.
 // Чистая функция: собирает argv systemd-run (тестируется без запуска).
 function runnerArgv(eventId, runnerBin, executorBin, env) {
   const out = ['--user', '--collect', '--quiet', `--unit=dept-runner-${eventId}`];
-  for (const k of ['PATH', 'DEPT_HOME', 'DEPT_POLICY_DIR', 'CLAUDE_CONTROL_DIR', 'BRAIN_CLIENTS', 'TELEGRAM_NOTIFY', 'DEPT_EXEC_RUNNER_TIMEOUT_MS'])
+  for (const k of ['PATH', 'DEPT_HOME', 'DEPT_POLICY_DIR', 'CLAUDE_CONTROL_DIR', 'BRAIN_CLIENTS', 'TELEGRAM_NOTIFY', 'DEPT_EXEC_RUNNER_TIMEOUT_MS', 'CLAUDE_AUTO_STALE_SECONDS'])
     if (env[k] !== undefined && env[k] !== '') out.push('--setenv', `${k}=${env[k]}`);
   out.push(runnerBin, '--approval', eventId, '--executor', executorBin);
   return out;
@@ -174,13 +177,17 @@ function acquireLock() {
     return false;
   }
 }
-if (!acquireLock()) {
-  console.log('dispatcher: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на sleep-check-state.json');
-  process.exit(0);
+// p3#22: dry-run строго read-only — лок НЕ берём и НЕ пишем (превью не должен транзиентно
+// блокировать реальный тик; dry-путь без лока безопасен — он не пишет state/lastrun/маркеры).
+if (!dry) {
+  if (!acquireLock()) {
+    console.log('dispatcher: другой прогон уже идёт (свежий lock) — пропуск во избежание гонки на sleep-check-state.json');
+    process.exit(0);
+  }
+  // 'exit' — не try/finally: снимает лок и при незапойманном исключении в цикле ниже
+  // (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
+  process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 }
-// 'exit' — не try/finally: снимает лок и при незапойманном исключении в цикле ниже
-// (иначе один сбой блокирует все прогоны на LOCK_STALE_MS, а не только текущий тик).
-process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 
 // timeout на КАЖДЫЙ подпроцесс — иначе подвисший claude-auto/probe/tmux вешает
 // execFileSync навсегда, и ни один воркер/заявка ПОСЛЕ зависшего не проверяется.
@@ -189,9 +196,13 @@ function sh(cmd, args, timeoutMs = 15_000) {
   try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs }); } catch { return null; }
 }
 function tail(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(-n) : s; }
+// p3#33: у notify СОБСТВЕННЫЙ таймаут 30с (не общий 15с sh()) — telegram_notify.sh при
+// сетевом флапе не успевал добежать до fallback, алерт молча терялся. Возвращает
+// успех/провал: дедуп-стейт эпизода (exec-stuck маркер) пишется только при доставке.
 function notify(msg) {
-  if (dry) { console.log('[dry] notify:', msg); return; }
-  if (sh(NOTIFY, [msg]) === null) console.log('dispatcher: notify FAILED:', msg);
+  if (dry) { console.log('[dry] notify:', msg); return true; }
+  if (sh(NOTIFY, [msg], 30_000) === null) { console.log('dispatcher: notify FAILED:', msg); return false; }
+  return true;
 }
 function loadJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -341,7 +352,9 @@ for (const s of stuck) {
   if (dry) { console.log(`[dry] алерт зависшей заявки: ${s.kind_of} ${s.event_id} (executing > ${EXEC_MAX_MIN}мин)`); continue; }
   if (fs.existsSync(marker)) continue; // уже алертили этот эпизод
   // humanApproval вместо голого event_id — фидбэк оператора 16.07: алерт читается без ledger.
-  notify(`🚨 dispatcher: заявка ${s.kind_of} зависла в executing >${EXEC_MAX_MIN}мин: ${humanApproval(s)} — раннер умер? разберись`);
+  // p3#33: маркер (дедуп алерта) — только при ДОСТАВЛЕННОМ алерте; провал notify оставляет
+  // эпизод несообщённым, следующий тик (2 мин) повторит попытку.
+  if (!notify(`🚨 dispatcher: заявка ${s.kind_of} зависла в executing >${EXEC_MAX_MIN}мин: ${humanApproval(s)} — раннер умер? разберись`)) continue;
   try { fs.writeFileSync(marker, String(now)); } catch (e) { console.error(`dispatcher: не смог записать маркер зависшей заявки ${s.event_id}: ${e.message}`); }
 }
 
@@ -439,6 +452,9 @@ for (const [name, meta] of Object.entries(deptWorkers)) {
     const subject = `МК ${name} неактивен ${Math.floor(idleDays)} дн — предложи усыпить или обоснуй`;
     const sent = sh(DEPT_LEDGER, ['send', '--type', 'decision_request', '--to', 'dept-head', '--subject', subject, '--actor', 'dispatcher']);
     if (sent !== null) {
+      // p3#33-решение: asked (дедуп эпизода) привязан к УСПЕХУ ledger-send, НЕ к notify —
+      // содержательное действие (decision_request Руководителю) уже в журнале, повтор на
+      // следующем тике создал бы ДУБЛЬ заявки; TG-уведомление здесь информационное.
       notify(`💤 dispatcher: МК «${name}» неактивен ${Math.floor(idleDays)} дн — запрос Руководителю отправлен`);
       sleepState[name] = { asked: true };
     } else {

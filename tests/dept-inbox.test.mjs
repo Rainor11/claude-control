@@ -39,6 +39,33 @@ test('renderApprovalsPage: блок «исполнение» — executed/exec_f
   assert.ok(html.includes('systemctl упал'));
 });
 
+// M-2 (ревью фазы 3): секция «⚙️ Исполняются» — заявки между решением человека и финалом
+// раннера (executing — раннер в работе; approved exec-kind — ждёт диспетчера). Раньше они
+// выпадали из /approvals совсем (ни open, ни финал) — дыра видимости на долгих заявках.
+test('renderApprovalsPage: секция «Исполняются» — executing и approved-исполняемые с фазой', () => {
+  const html = renderApprovalsPage({ approvals: [], incidents: [], recent: [], executed: [],
+    executingNow: [
+      { event_id: 'evt_5_exec', ts: new Date().toISOString(), phase: 'executing',
+        data: { kind_of: 'planerka', from: 'dept-head', summary: 'планёрка отдела' } },
+      { event_id: 'evt_6_appr', ts: new Date().toISOString(), phase: 'approved',
+        data: { kind_of: 'worker_spawn', from: 'dept-head', summary: 'найм: МК <b>срочно</b>' } },
+    ],
+    registry: { workers: {} }, policy: {} });
+  assert.ok(html.includes('Исполняются'));
+  assert.ok(html.includes('планёрка отдела'));
+  assert.ok(html.includes('executing'));
+  assert.ok(html.includes('approved — ждёт диспетчера'));
+  assert.ok(html.includes('/a/evt_5_exec'));      // ссылка на карточку
+  assert.ok(html.includes('&lt;b&gt;срочно&lt;/b&gt;')); // экранирование summary
+  assert.ok(!html.includes('<b>срочно</b>'));
+});
+
+test('renderApprovalsPage: без executingNow (старые вызовы) секция пуста и не падает', () => {
+  const html = renderApprovalsPage({ approvals: [], incidents: [], recent: [], executed: [],
+    registry: { workers: {} }, policy: {} });
+  assert.ok(html.includes('ничего не исполняется'));
+});
+
 test('renderApproval показывает detail и историю статусов', () => {
   const html = renderApproval(apr, [{ ts: '2026-07-13T10:00:00Z', actor: 'operator',
     data: { status: 'approved', ref: 'evt_1_aaaa' } }]);

@@ -242,12 +242,20 @@ function renderApprovalsPage(d) {
   const exec = (d.executed || []).map((e) => `<tr><td>${esc(age(e.ts))}</td>
 <td><a href="/a/${esc(e.data.ref)}">${esc(e.data.ref)}</a></td><td>${esc(e.data.status)}</td><td>${esc(e.data.note || '')}</td></tr>`).join('')
     || '<tr><td colspan="4">за 7 дней исполнений не было</td></tr>';
+  // M-2: заявки между решением человека и финалом раннера (approved-исполняемые ждут
+  // диспетчера, executing — раннер в работе) — сборка в collectApprovalsPage (dept-inbox).
+  const execNow = (d.executingNow || []).map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.from)}</td>
+<td>${esc(e.data.kind_of)}</td><td>${esc(e.phase === 'approved' ? 'approved — ждёт диспетчера' : 'executing')}</td>
+<td><a href="/a/${esc(e.event_id)}">${esc(e.data.summary)}</a></td></tr>`).join('')
+    || '<tr><td colspan="5">ничего не исполняется</td></tr>';
   const workers = Object.keys((d.registry && d.registry.workers) || {}).length;
   const body = `${errBanner(d.readError)}
 <h1>Аппрувы</h1>
 <p class="meta">правила: ${esc((d.policy && d.policy.version) || '?')} · воркеров в реестре: ${workers} · автообновление 60с</p>
 <h2>⏳ Ждут решения (${(d.approvals || []).length})</h2>
 <div class="tablewrap"><table><tr><th>висит</th><th>кто</th><th>тип</th><th>что</th></tr>${apr}</table></div>
+<h2>⚙️ Исполняются (${(d.executingNow || []).length})</h2>
+<div class="tablewrap"><table><tr><th>возраст</th><th>кто</th><th>тип</th><th>фаза</th><th>что</th></tr>${execNow}</table></div>
 <h2>🚨 Открытые инциденты (${(d.incidents || []).length})</h2>
 <div class="tablewrap"><table><tr><th>возраст</th><th>severity</th><th>о ком</th><th>что</th></tr>${inc}</table></div>
 <h2>Исполнение заявок (7 дней)</h2>
