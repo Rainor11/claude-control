@@ -19,6 +19,11 @@ fail() { echo "FAIL: $1"; exit 1; }
 export CLAUDE_CONTROL_DIR="$TMP/cc"
 export DEPT_HOME="$TMP/dept"
 export HOME="$TMP/home"   # изолирует ~/.claude/projects (поиск транскрипта STALE-гардом)
+# Герметичность от ambient env: чужой CLAUDE_AUTO_STALE_SECONDS (>7200 или мусор) сломал бы
+# STALE-имитацию — тест ушёл бы ДАЛЬШЕ гарда, в spec_rmw + systemctl start РЕАЛЬНОГО юнита
+# claude-auto@w1 на хосте; чужой CLAUDE_AUTO_BIN подменил бы claude-auto в dept-mission-exec.
+export CLAUDE_AUTO_STALE_SECONDS=1800
+unset CLAUDE_AUTO_BIN
 
 # ---- фикстура воркера + STALE-имитация -------------------------------------------------
 # STALE по cmd_rebase (~1025): транскрипт $HOME/.claude/projects/*/<sid>.jsonl СВЕЖИЙ,
@@ -62,5 +67,24 @@ out4="$(CLAUDE_AUTO_BIN="$FAKE_CA" "$ME" --worker w1 --mission-file "$TMP/missio
 [ "$rc4" -ne 0 ] || fail "dept-mission-exec на rc=1 обязан падать (exec_failed), а вернул 0: $out4"
 echo "$out4" | grep -q 'rc=1' || fail "нет rc в сообщении об ошибке: $out4"
 echo "OK: dept-mission-exec — rc=1 остаётся полным провалом"
+
+# ---- 4) rc=3 (busy) → отложенный rebase падает hard → partial-успех, НЕ exec_failed -----
+# Багхант 16.07: миссия применена ДО ретраев — hard-провал ретрая раньше делал die →
+# exec_failed (та же ложь аудита, что чинил I-1 на прямом пути). MISSION_RETRY_SLEEP=0 —
+# тест-шов (зеркало PLANERKA_RETRY_SLEEP).
+FAKE_CA_BUSY="$TMP/fake-ca-busy"
+cat > "$FAKE_CA_BUSY" <<'EOF'
+#!/bin/bash
+case "$1" in
+  mission-update) echo "мок: миссия записана, rebase ОТЛОЖЕН (busy)"; exit 3 ;;
+  rebase)         echo "мок: rebase hard-fail (STALE)"; exit 1 ;;
+  *)              echo "мок: неожиданный вызов $1"; exit 9 ;;
+esac
+EOF
+chmod +x "$FAKE_CA_BUSY"
+out5="$(CLAUDE_AUTO_BIN="$FAKE_CA_BUSY" MISSION_RETRY_SLEEP=0 "$ME" --worker w1 --mission-file "$TMP/mission.md" --reason 'смок busy→hard' 2>&1)"; rc5=$?
+[ "$rc5" -eq 0 ] || fail "dept-mission-exec на busy→hard-rebase должен вернуть 0 (partial), получен rc=$rc5: $out5"
+echo "$out5" | grep -q 'partial: миссия записана' || fail "нет partial-note в busy→hard пути: $out5"
+echo "OK: dept-mission-exec — busy→hard-rebase = partial-успех, не exec_failed"
 
 echo "PASS claude-auto-mission-update (I-1: rc=4 шов mission_change)"

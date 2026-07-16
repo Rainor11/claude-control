@@ -13,6 +13,7 @@
 # data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
 # ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
 set -u
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"   # для partial_ok-гарда (Codex M-3)
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
@@ -60,7 +61,14 @@ fi
 # миссия вступит при следующем старте/компакции; писать exec_failed было бы ложью
 # (эффект уже на диске и молча применится). Успех с явной note — raннер положит
 # хвост stdout в approval-exec executed --note.
+# Codex M-3 (/bug финала ф3): partial-успех объявляем только если эффект реально на диске —
+# воркер мог быть удалён (claude-auto remove) между записью миссии и этим моментом;
+# тогда «миссия записана, вступит при старте» — ложь, честный исход = exec_failed.
+partial_ok() {
+  [ -f "$CONTROL_DIR/workers/$worker/spec.json" ] && [ -f "$CONTROL_DIR/workers/$worker/CLAUDE.md" ]
+}
 if [ "$rc" -eq 4 ]; then
+  partial_ok || die "mission-update rc=4, но воркер '$worker' исчез с диска (удалён во время операции?) — partial невозможен"
   echo "mission-exec complete: $worker (partial: миссия записана, rebase не прошёл — вступит при следующем старте; rebase добить: claude-auto rebase $worker / rebase-check)"
   exit 0
 fi
@@ -70,13 +78,25 @@ fi
 
 # rc=3: миссия УЖЕ записана (CLAUDE.md пересобран), rebase отложен (воркер busy) — ретраим
 # отдельными вызовами claude-auto rebase, до 10 попыток с паузой 30с (§ Task 8 акцептанс).
+# Пауза параметризована для тестов (зеркало PLANERKA_RETRY_SLEEP в dept-planerka-exec);
+# мусор в env → дефолт, не сюрприз (зеркало TIMEOUT_MS-гарда в dept-exec-runner).
+RETRY_SLEEP="${MISSION_RETRY_SLEEP:-30}"
+case "$RETRY_SLEEP" in ''|*[!0-9]*) RETRY_SLEEP=30 ;; esac
 ok=false
 for i in $(seq 1 10); do
-  sleep 30
+  [ "$RETRY_SLEEP" -gt 0 ] && sleep "$RETRY_SLEEP"
   rout="$("$CA" rebase "$worker" --reason "миссия: $reason" 2>&1)"; rrc=$?
   echo "$rout"
   if [ "$rrc" -eq 0 ]; then ok=true; break; fi
-  if [ "$rrc" -ne 3 ]; then die "rebase после mission-update завершился ошибкой (rc=$rrc)"; fi
+  if [ "$rrc" -ne 3 ]; then
+    # Зеркало rc=4 (I-1): миссия УЖЕ применена (CLAUDE.md пересобран до ретраев) —
+    # hard-провал ОТЛОЖЕННОГО rebase тоже не делает заявку exec_failed (аудит-след
+    # противоречил бы реальности: эффект на диске и вступит при следующем старте).
+    # Успех с явной partial-note, как и в ветке rc=4 выше.
+    partial_ok || die "отложенный rebase упал (rc=$rrc) И воркер '$worker' исчез с диска — partial невозможен"
+    echo "mission-exec complete: $worker (partial: миссия записана, отложенный rebase упал hard (rc=$rrc) — вступит при следующем старте; rebase добить: claude-auto rebase $worker / rebase-check)"
+    exit 0
+  fi
 done
 if [ "$ok" = true ]; then
   echo "mission-exec complete: $worker (rebase применён после отложенной попытки)"

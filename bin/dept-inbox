@@ -261,14 +261,22 @@ async function collectApprovalsPage() {
   const executed = aprStatuses.rows.filter((e) => e.data
     && (e.data.status === 'executed' || e.data.status === 'exec_failed')
     && Date.parse(e.ts) >= since);
+  // pickExecutable-семантика (bin/dept-dispatcher): диспетчер исполняет только заявки
+  // руководителя/operator. approved-исполняемую заявку НЕ от них он не возьмёт НИКОГДА —
+  // показывать её «ждёт диспетчера» вводило бы в заблуждение; честная фаза —
+  // 'approved_foreign' (багхант 16.07). При ошибке чтения реестра роли неизвестны —
+  // не мислейблим (остаёмся на оптимистичном 'approved', баннер readError и так виден).
+  const registry = reg.rows[0] || { workers: {} };
+  const dispatcherWill = (from) => reg.error
+    || ((registry.workers || {})[from] || {}).role === 'руководитель' || from === 'operator';
   const executingNow = [
     ...executingRes.rows.map((e) => ({ ...e, phase: 'executing' })),
     ...approvedRes.rows.filter((e) => e.data && EXEC_KINDS_INBOX.has(e.data.kind_of))
-      .map((e) => ({ ...e, phase: 'approved' })),
+      .map((e) => ({ ...e, phase: dispatcherWill(e.data.from) ? 'approved' : 'approved_foreign' })),
   ];
   return { approvals: approvals.rows.reverse(), incidents: incidents.rows.reverse(), recent: recent.rows.reverse(),
     executed: executed.reverse(), executingNow: executingNow.reverse(),
-    registry: reg.rows[0] || { workers: {} }, policy: pol.rows[0] || {},
+    registry, policy: pol.rows[0] || {},
     readError: res.map((r) => r.error).find(Boolean) || null };
 }
 

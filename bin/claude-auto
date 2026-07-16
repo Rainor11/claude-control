@@ -56,6 +56,15 @@ die() { echo "claude-auto: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 have jq || die "jq required"
 ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+# CLAUDE_AUTO_STALE_SECONDS с мусором/нулём → дефолт 1800 (зеркало numEnv в node-юнитах и
+# TIMEOUT_MS-гарда dept-exec-runner): иначе `[ $((…)) -gt "15min" ]` падает с ошибкой test
+# и ТИХО отключает STALE-гард rebase (rebase на несвежей памяти = потеря контекста), а
+# status_memory врал бы "fresh". Env прокидывается через цепочку dispatcher→runner (M-4).
+stale_after_secs() {
+  local v="${CLAUDE_AUTO_STALE_SECONDS:-1800}"
+  case "$v" in ''|*[!0-9]*|0) v=1800 ;; esac
+  echo "$v"
+}
 
 # ---- MCP catalog (per-worker MCP subscriptions) ----------------------------
 # The live catalog (source of truth) is ~/.claude.json key `.mcpServers`. A worker
@@ -859,7 +868,7 @@ status_memory() {
     [ "$m" -gt "$mem_mtime" ] 2>/dev/null && mem_mtime="$m"
   done
   shopt -u nullglob
-  local stale_after="${CLAUDE_AUTO_STALE_SECONDS:-1800}"
+  local stale_after; stale_after="$(stale_after_secs)"
   if [ "$mem_mtime" -eq 0 ]; then
     echo "  deal memory: NONE YET ($bp has no timeline/decisions/open-questions)"
   elif [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "$stale_after" ]; then
@@ -1021,7 +1030,7 @@ cmd_rebase() {
       m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$mem_mtime" ] 2>/dev/null && mem_mtime="$m"
     done
     shopt -u nullglob
-    if [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "${CLAUDE_AUTO_STALE_SECONDS:-1800}" ]; then
+    if [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "$(stale_after_secs)" ]; then
       die "rebase: память STALE (транскрипт активнее файлов) — потеря контекста. Пусть воркер докурирует память, или --force-stale"
     fi
   fi

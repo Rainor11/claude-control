@@ -115,7 +115,7 @@ function saveState(s) {
 // wouldNotified), провал notify НЕ помечает эпизод — следующий тик повторит.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  try { execFileSync(NOTIFY, [msg], { encoding: 'utf8', timeout: 30_000 }); return true; }
+  try { execFileSync(NOTIFY, [msg], { encoding: 'utf8', timeout: 45_000 }); return true; }
   catch { console.log('liveness: notify FAILED:', msg); return false; }
 }
 

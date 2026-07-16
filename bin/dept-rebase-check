@@ -108,7 +108,7 @@ function saveState(s) {
 // успех/провал: дедуп-стейт эпизода (alerted) пишется только при доставленном алерте.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  if (sh(NOTIFY, [msg], 30_000) === null) { console.log('rebase-check: notify FAILED:', msg); return false; }
+  if (sh(NOTIFY, [msg], 45_000) === null) { console.log('rebase-check: notify FAILED:', msg); return false; }
   return true;
 }
 

@@ -244,8 +244,12 @@ function renderApprovalsPage(d) {
     || '<tr><td colspan="4">за 7 дней исполнений не было</td></tr>';
   // M-2: заявки между решением человека и финалом раннера (approved-исполняемые ждут
   // диспетчера, executing — раннер в работе) — сборка в collectApprovalsPage (dept-inbox).
+  // approved_foreign — approved-исполняемая НЕ от руководителя/operator: pickExecutable
+  // диспетчера её не возьмёт никогда, честно говорим об этом вместо «ждёт диспетчера».
+  const EXEC_PHASE_LABEL = { executing: 'executing', approved: 'approved — ждёт диспетчера',
+    approved_foreign: 'approved — диспетчер НЕ возьмёт (подал не руководитель)' };
   const execNow = (d.executingNow || []).map((e) => `<tr><td>${esc(age(e.ts))}</td><td>${esc(e.data.from)}</td>
-<td>${esc(e.data.kind_of)}</td><td>${esc(e.phase === 'approved' ? 'approved — ждёт диспетчера' : 'executing')}</td>
+<td>${esc(e.data.kind_of)}</td><td>${esc(EXEC_PHASE_LABEL[e.phase] || e.phase)}</td>
 <td><a href="/a/${esc(e.event_id)}">${esc(e.data.summary)}</a></td></tr>`).join('')
     || '<tr><td colspan="5">ничего не исполняется</td></tr>';
   const workers = Object.keys((d.registry && d.registry.workers) || {}).length;

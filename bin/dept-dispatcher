@@ -201,7 +201,7 @@ function tail(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.sl
 // успех/провал: дедуп-стейт эпизода (exec-stuck маркер) пишется только при доставке.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  if (sh(NOTIFY, [msg], 30_000) === null) { console.log('dispatcher: notify FAILED:', msg); return false; }
+  if (sh(NOTIFY, [msg], 45_000) === null) { console.log('dispatcher: notify FAILED:', msg); return false; }
   return true;
 }
 function loadJSON(file, fallback) {
@@ -294,7 +294,15 @@ for (const [name, meta] of Object.entries(autoWorkers)) {
     const lastrun = Number(loadJSON(lastrunFile, 0)) || 0; // содержимое — просто epoch-секунды (не JSON-объект), но валидный JSON-скаляр
     const nowSec = Math.floor(now / 1000);
     if (nowSec - lastrun < intervalSec) continue;
-    if (!dry) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(lastrunFile, String(nowSec)); }
+    if (dry) {
+      // Codex H-1 (/bug финала ф3): probe.cmd НЕ исполняется в dry — stateful-адаптеры
+      // (asana-comments/gmail-messages/tg-messages) на ХОЛОДНОМ датчике пишут baseline
+      // первым прогоном → реальный тик подавил бы события до baseline (missed wake).
+      // dry строго read-only: только перечисляем, что проверили бы.
+      console.log(`[dry] проверил бы датчик ${pname} контура ${name} (probe в dry не исполняется: stateful)`);
+      continue;
+    }
+    fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(lastrunFile, String(nowSec));
 
     const out = runProbe(probe.cmd, timeoutSec);
     if (!out) continue;
@@ -360,6 +368,14 @@ for (const s of stuck) {
 
 const approvalRows = dlList(['--kind', 'approval', '--status', 'approved']);
 const executable = pickExecutable(approvalRows, roleOf);
+// Codex H-2 (/bug финала ф3): заявки на ОДНОГО воркера сериализуются — вторая approved
+// mission_change (или mission+sleep/spawn) на тот же target не запускается, пока первая
+// executing/запущена в этом тике; иначе два раннера пишут CLAUDE.md/spec наперегонки,
+// оба финализируются executed, а выживает last-writer. Отложенная возьмётся следующим
+// тиком (approved никуда не денется). Цель: request.worker|request.name; planerka — null.
+const targetOfRequest = (r) => { const q = (r.data && r.data.request) || {}; return q.worker || q.name || null; };
+const busyTargets = new Set(
+  dlList(['--kind', 'approval', '--status', 'executing']).map(targetOfRequest).filter(Boolean));
 let execStartedCount = 0, execSkippedCount = 0;
 for (const row of executable) {
   const kindOf = row.data.kind_of;
@@ -367,6 +383,12 @@ for (const row of executable) {
   const executor = EXECUTORS[kindOf];
   if (dry) { console.log(`[dry] пометил бы executing + запустил бы раннер для заявки ${kindOf} ${id} через ${executor || '???'}`); continue; }
   if (!executor) { console.error(`dispatcher: заявка ${id} kind_of=${kindOf} — нет исполнителя в EXECUTORS (не должно случаться, EXEC_KINDS/EXECUTORS разошлись)`); continue; }
+  const target = targetOfRequest(row);
+  if (target && busyTargets.has(target)) {
+    execSkippedCount++;
+    console.log(`dispatcher: заявка ${kindOf} ${id} отложена — по воркеру «${target}» уже исполняется другая заявка (следующий тик возьмёт)`);
+    continue;
+  }
   // Шаг 1: пометить executing. Это САМА защита от повторного запуска (явная — поверх
   // неявной защиты list --status approved, которая эту заявку уже не выбрала бы на
   // следующем тике, но между "прочитали approved" и "пометили executing" возможна гонка
@@ -389,6 +411,7 @@ for (const row of executable) {
     execFileSync(SYSTEMD_RUN, runnerArgv(id, EXEC_RUNNER, path.join(BIN, executor), process.env),
       { encoding: 'utf8', timeout: 15_000 });
     execStartedCount++;
+    if (target) busyTargets.add(target); // сериализация в рамках тика (Codex H-2)
     console.log(`dispatcher: заявка ${kindOf} ${id} — раннер запущен transient-юнитом dept-runner-${id}`);
   } catch (e) {
     const detail = ((e.stderr && String(e.stderr).trim()) || e.message || String(e)).slice(0, 300);
