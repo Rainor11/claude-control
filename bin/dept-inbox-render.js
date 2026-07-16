@@ -303,7 +303,7 @@ function workerCardHtml(w) {
 <span class="badge badge-${st.cls}" title="${esc(st.label)}"><span aria-hidden="true">${st.icon}</span> ${esc(st.label)}</span>
 </div>
 <dl class="card-meta">
-<div><dt>Правила</dt><dd>${esc(w.missionVersion || 'n/a')}</dd></div>
+<div><dt>Миссия</dt><dd>${esc(w.missionVersion || 'n/a')}</dd></div>
 <div><dt>Policy-ack</dt><dd>${ack}</dd></div>
 <div><dt>Компакций</dt><dd>${compactions}</dd></div>
 <div><dt>Активность</dt><dd>${lastAct}</dd></div>
