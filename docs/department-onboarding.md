@@ -1,8 +1,18 @@
-# Онбординг воркеров отдела (фаза 2, до появления spawn)
+# Онбординг воркеров отдела
 
-Создание воркера — ОПЕРАТОРСКАЯ операция: `/go-autonomous` умеет превращать
-в воркера только текущую сессию (adopt наследует её cwd). Автоматический
-`claude-auto spawn` — фаза 3.
+**Штатный путь найма МК (с фазы 3, 2026-07-16)** — заявка Руководителя:
+`dept-spawn-request --client <slug> --name <имя> --asana-gid <GID>` →
+карточка → ✅ оператора → диспетчер → `dept-spawn-exec` (детерминированный
+bootstrap: скелет папки клиента в brain, миссия из
+`examples/department/mk-mission.template.md`, bounds/probes из шаблонов
+`mk-*.template.*`, `claude-auto spawn` + kickoff, `registry-set --role мк
+--mission-version v3`; идемпотентен — повторный прогон достраивает).
+Контракт заявок — `docs/department.md`, механика spawn —
+`docs/autonomous.md`.
+
+**Ручной онбординг ниже** остаётся для ШТАБНЫХ воркеров и нестандартных
+случаев: `/go-autonomous` превращает в воркера текущую сессию (adopt
+наследует её cwd).
 
 ## Штабной воркер (dept-head / dept-archivist / dept-tp)
 
@@ -26,18 +36,21 @@
      исходящие людям — НЕ разрешать (гейт через dept-approve).
    - dept-head: deny `Edit(//home/rainor/brain/**)`, `Write(//home/rainor/brain/**)`
      — руководитель ничего не пишет в файлы, только шина.
-   - dept-archivist: allow Edit/Write ТОЛЬКО
+   - dept-archivist: allow Edit/Write ТОЛЬКО 4 базы —
      `//home/rainor/brain/wiki/work/ai-dev/продукты/alp-gpt/база-знаний/sales-assistant/**`,
      `//home/rainor/brain/wiki/work/ai-dev/отдел/правила/**`,
-     `//home/rainor/brain/wiki/work/ai-dev/отдел/тп-знания.md`; deny Edit/Write
+     `//home/rainor/brain/wiki/work/ai-dev/отдел/тп-знания.md`,
+     `//home/rainor/brain/wiki/work/ai-dev/отдел/роли/**` (карточки ролей —
+     4-я база с 16.07/policy-v5: правки ТОЛЬКО через `dept-approve --kind-of
+     role_change`, применяет сам Архивариус после ✅ — диспетчер role_change
+     не исполняет); deny Edit/Write
      `//home/rainor/brain/wiki/work/ai-dev/продукты/alp-gpt/база-знаний/consultant-alp-gpt/**`
      (БЗ Ивана, «НЕ ТВОЁ» по миссии — пояс и подтяжки к зауженному allow),
-     `//home/rainor/brain/wiki/work/ai-dev/отдел/роли/**`,
      `//home/rainor/brain/wiki/work/ai-dev/отдел/CLAUDE.md`,
-     `//home/rainor/brain/wiki/work/ai-dev/клиенты/**` (роли и манифест отдела
-     меняет только Оракул-сессия; клиентские папки пишут МК). Неизменяемость
-     старых policy-vN — правило канона (механически не выражается): новая
-     версия = только новый файл policy-vN+1.md.
+     `//home/rainor/brain/wiki/work/ai-dev/клиенты/**` (манифест отдела,
+     состав ролей и спека — только Оракул-сессия; клиентские папки пишут
+     МК). Неизменяемость старых policy-vN — правило канона (механически не
+     выражается): новая версия = только новый файл policy-vN+1.md.
    - dept-tp: + allow `Edit(//opt/projects/active/**)`,
      `Write(//opt/projects/active/**)`; ask на `Bash(systemctl:*)`; явные deny
      `Edit(//opt/projects/active/claude-control/bin/**)`,
@@ -55,15 +68,29 @@
      дублируют его как документация рамок, не единственный забор.
 3. Закрой origin-окно (правило adopt).
 4. Пробы: `claude-auto set-probes <имя> /opt/projects/active/claude-control/examples/department/<имя>/probes.json`
-5. Реестр: `/opt/projects/active/claude-control/bin/dept-ledger registry-set <имя> --role <руководитель|архивариус|тп> --mission-version v2`
+5. Реестр: `/opt/projects/active/claude-control/bin/dept-ledger registry-set <имя> --role <руководитель|архивариус|тп> --mission-version v3`
+   (актуальное поколение миссий — v3, шаблоны в `examples/department/`)
 6. Смок: `/opt/projects/active/claude-control/bin/dept-ledger send --type question
    --to <имя> --subject 'смок' --body 'ответь ack и resolve' --actor operator` →
    в течение ~минуты воркер ack'ает (проверь
    `/opt/projects/active/claude-control/bin/dept-ledger list --kind message
    --filter to=<имя> --status queued` — пусто).
 
-## МК (миграция существующего deal-воркера)
+## МК
 
-См. план фазы 2, Task 8: курация памяти → stop+remove старого → adopt из
-папки клиента с миссией из mk-mission.template.md → set-probes (старые пробы
-+ dept-bus) → registry-set --mission-version v2 → смоки.
+**Новый МК** — только через заявку `dept-spawn-request` (см. шапку),
+руками не создаётся.
+
+**Миграция существующего v1/v2-воркера на v3** — тоже через spawn-заявку
+(боевой прецедент: `diaverum-russ`, 16.07):
+
+1. Убедись, что память сделки докурирована (`claude-auto status <имя>` —
+   не STALE): spawn рождает fresh-сессию, вся память — из файлов папки
+   клиента.
+2. `claude-auto stop <имя>` → `claude-auto remove <имя>` (старый воркер;
+   имя должно освободиться — `dept-spawn-request` отказывает на занятом).
+3. Руководитель подаёт `dept-spawn-request` → ✅ → bootstrap: папка клиента
+   уже существует — скелет пропускается (идемпотентность), воркер получает
+   миссию v3, пробы `dept-bus` + `asana-deal`, реестр `--mission-version v3`.
+4. Kickoff-инжект даёт стартовый контекст (правила → CLAUDE.md клиента →
+   timeline → decisions → открытые вопросы → policy-ack).

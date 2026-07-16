@@ -11,7 +11,7 @@ This builds on claude-control (tmux sessions under `systemd --user` + linger).
 
 | Piece | What it is |
 |-------|-----------|
-| `bin/claude-auto` | Manage workers: `adopt`, `list`, `status`, `stop`, `start`, `remove`, `install-units`, `get-probes`, `set-probes` (see "Worker identity" + "Changing probes"). |
+| `bin/claude-auto` | Manage workers: `adopt`, `spawn`, `list`, `status`, `stop`, `start`, `sleep`, `restart`, `rebase`, `mission-update`, `upgrade`, `remove`, `install-units`, `get-probes`, `set-probes`, `get-mcp`/`set-mcp`/… (see "Worker identity", "Changing probes", "Headless lifecycle"). |
 | `bin/claude-auto-run` | Foreground supervisor (one per worker, the `ExecStart` of `claude-auto@<name>.service`). Launches the worker in tmux, blocks for its lifetime, restarts it, runs controlled compaction, starts the event watcher. |
 | `bin/claude-auto-identity` | `SessionStart` hook: re-asserts the worker's identity + runtime awareness (and a live probe list + session title) on every start, including `/compact` and resume. See "Worker identity & runtime awareness". |
 | `bin/event-bridge-watch` | Per-worker event loop: runs the worker's probes and injects new events as user turns. **Re-reads `event-bridge.config.json` every tick (~5s)** so a probe change is picked up live, no restart. |
@@ -24,8 +24,8 @@ This builds on claude-control (tmux sessions under `systemd --user` + linger).
 | `/worker-probes` slash command | Operator helper to view/add/remove/replace a worker's probes (drives `set-probes`). See "Changing probes". |
 
 State lives in `~/.claude-control/`:
-- `autonomous.json` — registry (`workers.<name> = {state, cwd, created_at, brain_path, brain_rel}`). `brain_path`/`brain_rel` link a worker to its brain deal folder (null when not adopted from one).
-- `workers/<name>/` — `spec.json`, `settings.json` (bounds), `CLAUDE.md` (mission), `event-bridge.config.json` (probes), `logs/`, and `state/` (`last_seen.json`, `last_step.json`, `context.json`, `compact_requested`).
+- `autonomous.json` — registry (`workers.<name> = {state, cwd, created_at, brain_path, brain_rel}`). `state` ∈ `active` / `stopped` (operator pause) / `sleeping` (dormant circuit, see "Headless lifecycle"). `brain_path`/`brain_rel` link a worker to its brain deal folder (null when not adopted from one).
+- `workers/<name>/` — `spec.json`, `settings.json` (bounds), `CLAUDE.md` (mission), `event-bridge.config.json` (probes), `logs/`, and `state/` (`last_seen.json`, `last_step.json`, `context.json`, `compact_requested`, `compactions` — running count of controlled compactions, consumed by `dept-rebase-check` and the dept-inbox dashboard, reset on `rebase`).
 
 ## Worker identity & runtime awareness
 
@@ -127,7 +127,57 @@ Under the hood (`claude-auto adopt`):
   holds the memory it curated up to its last completed step (seconds/minutes
   behind the transcript — accepted trade-off).
 
-## Changing probes (what a worker watches)
+## Headless lifecycle: spawn / rebase / mission-update / sleep (2026-07)
+
+Four operations added for the digital department (`docs/department.md`) but
+generic to any worker. They rest on a third launch branch in
+`claude-auto-run` (**fresh-launch**): seeded or transcript exists →
+`--resume <W>`; origin known → fork; **neither → `claude --session-id <W>`**
+— a genuinely fresh session with a pinned id and no inherited history. All
+memory comes from files (mission CLAUDE.md + the brain deal folder) plus a
+kickoff inject.
+
+- **`spawn --name <n> --cwd <dir> --mission-file <f> [--bounds-file <f>]
+  [--probe-config <f>] [--kickoff-file <f>] [--model <m>]
+  [--remote-control] [--dry-run]`** — headless hire, no origin session:
+  spec `{origin_id:null, spawned:true, seeded:false}`, same generators as
+  adopt for CLAUDE.md/settings (identity, awareness, self-protection).
+  **Idempotent:** re-running for the same spawned worker + cwd finishes the
+  build (unit/start); a directory with a broken spec is recreated ONLY if
+  it carries the `.spawn-marker` recovery file (written first — a crash
+  before a valid spec.json leaves a safely-removable skeleton); a worker
+  not created by spawn, or with another cwd, is refused. The kickoff file
+  is injected as the first user turn (bounded retries) — workers never get
+  a proactive first turn otherwise.
+- **`rebase <name> [--reason s] [--kickoff-file f] [--force-stale]`** —
+  planned session rebuild from files: new pinned session id
+  (`seeded=false`, `origin_id=null`, history intentionally dropped — files
+  are the memory), tmux killed, unit auto-restart takes the fresh-launch
+  branch, kickoff injected (default `examples/department/rebase-kickoff.md`),
+  `state/compactions`/`compact_requested` reset, `agent_run rebase` written
+  to the department ledger. **STALE guard:** compares the transcript mtime
+  against the deal memory files (`timeline.md`, `decisions.md`,
+  `open-questions*`/`открытые-вопросы*`); transcript ahead by more than
+  `CLAUDE_AUTO_STALE_SECONDS` (1800) → refuse (a rebase on stale memory
+  silently loses context) — `--force-stale` overrides. Busy worker →
+  deferred, **exit 3** (caller retries). Only `active` workers are rebased.
+- **`mission-update <name> --mission-file <f> [--reason s] [--no-rebase]`**
+  — rebuilds the worker's CLAUDE.md from a NEW mission text (same
+  identity/awareness wrapper), copies the mission to
+  `$DEPT_HOME/missions/<name>.md` (audited by the department git snapshot),
+  then immediately `rebase`s so the mission takes effect now, not at the
+  next compaction. `--no-rebase` — write only. A non-active worker
+  (sleeping/stopped) is not rebased — the mission file is re-read on every
+  launch, so it applies at the next start/wake. Busy → exit 3, mission
+  already written (re-run just the rebase).
+- **`sleep <name>`** — like `stop` (unit disabled, tmux killed, files and
+  session intact) but `state="sleeping"`: the reconciler and the liveness
+  watchdog filter strictly on `active` and leave it alone, while the
+  department dispatcher keeps running the worker's probes and wakes it
+  (`claude-auto start`) on the first unhandled event — the circuit stays
+  live at zero session cost. Warns if a stateful probe has no warmed
+  baseline (an event before warm-up would be lost silently). `start` also
+  wakes manually.
 
 An **adapter** is just a probe command. A probe is cheap and non-AI: it prints
 **new** events one per line and **nothing when idle** (so the AI session spends
@@ -288,7 +338,10 @@ mission/state/questions/bounds>` via `session-inject` — but only when the TUI 
 idle (no approval prompt, settled) and a cooldown
 (`CLAUDE_AUTO_COMPACT_COOLDOWN`, default 900s) has elapsed. Native auto-compact
 remains the backstop. A slash command must be **typed** (a channel body would be
-treated as data), which is why this uses send-keys, not the channel.
+treated as data), which is why this uses send-keys, not the channel. Each
+injected `/compact` increments `state/compactions` — the counter behind the
+`dept-rebase-check` "too many compactions" threshold and the dashboard; a
+`rebase` resets it.
 
 ## Channel mode (opt-in, currently gated)
 
@@ -321,7 +374,7 @@ claude --dangerously-load-development-channels server:event-bridge --mcp-config 
 Surfaced by review; acceptable for v1 but know them before relying on it unattended:
 - **Self-protection covers Edit/Write tools + recognized Bash file commands (cat/sed/tee…), NOT arbitrary subprocesses.** A worker allowed to run `python`/`node`/`perl` could write its own config via a script. For a worker that handles **untrusted events**, keep the Bash allow-list narrow (no broad `Bash`, no interpreters) and/or enable the OS [sandbox](https://code.claude.com/docs/en/sandboxing).
 - **Injection targets the active pane.** If you `tmux attach` and split/switch panes or leave a half-typed draft in the worker's input, an injected event can merge with your draft or land oddly. Don't leave a draft in the worker when events may arrive; the injector refuses while busy/at an approval prompt but a static draft can still merge.
-- **Shared subscription health.** All workers use one Claude subscription (OAuth). Usage-limit/auth-expiry can leave a worker looking healthy (tmux up) but not progressing. No deep liveness probe yet — watch `claude-auto status` / worker logs.
+- **Shared subscription health.** All workers use one Claude subscription (OAuth). Usage-limit/auth-expiry can leave a worker looking healthy (tmux up) but not progressing. The `claude-auto-liveness` watchdog (5-min timer) detects "busy on screen + frozen transcript" and a secondary "animated hang" signal — currently **alert-only** (`LIVENESS_ENFORCE` off); see `docs/department.md`.
 - **Worker logs** are size-capped by the reconciler (copytruncate, ~2 MB → last 2000 lines), not by the control-session logrotate.
 - **Not yet exercised:** real server reboot (only kill-respawn), the ask-flow blocking + Telegram notify end-to-end, many concurrent workers under contention, corrupt durable-state recovery.
 
