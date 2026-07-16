@@ -72,6 +72,6 @@ request_json="$(jq -nc --arg worker "$worker" --arg reason "$reason" --arg mt "$
   '{worker:$worker, reason:$reason, mission_text:$mt}')"
 detail="$("$RR" mission_change "$request_json")" || die "не удалось построить detail из request"
 
-out="$("$BINDIR/dept-approve" --kind-of mission_change --summary "смена миссии: $worker" \
+out="$("$BINDIR/dept-approve" --kind-of mission_change --summary "смена миссии воркера $worker" \
   --detail "$detail" --request-json "$request_json")" || exit 1
 echo "$out"

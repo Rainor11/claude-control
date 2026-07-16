@@ -74,6 +74,6 @@ request_json="$(jq -nc --arg client "$client" --arg name "$name" --arg gid "$gid
   '{client:$client, name:$name, asana_gid:$gid, asana_url:$url} + (if $note=="" then {} else {note:$note} end)')"
 detail="$("$RR" worker_spawn "$request_json")" || die "не удалось построить detail из request"
 
-out="$("$BINDIR/dept-approve" --kind-of worker_spawn --summary "найм: МК «$client» ($name)" \
+out="$("$BINDIR/dept-approve" --kind-of worker_spawn --summary "найм МК «$client» ($name)" \
   --detail "$detail" --request-json "$request_json")" || exit 1
 echo "$out"

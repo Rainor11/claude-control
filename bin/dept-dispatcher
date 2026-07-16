@@ -70,6 +70,19 @@ function stuckExecuting(rows, nowMs, maxMin) {
   const thresholdMs = maxMin * 60_000;
   return rows.filter((r) => r.executing_since && (nowMs - Date.parse(r.executing_since)) > thresholdMs);
 }
+// Фидбэк оператора 16.07: алерт «заявка evt_…» нечитаем — не видно, ЧТО за заявка и от кого;
+// алерт должен читаться без похода в ledger. Чистая функция: человеческая метка заявки из
+// {event_id, summary, from} → «<summary> — заявка <from> (<id>)»; summary схлопывается в одну
+// строку и режется до ~120 codepoints (не UTF-16 units — кириллица/эмодзи не рвутся, зеркало
+// utf8_head в dept-exec-runner); при пустом summary — честный fallback на голый id (как раньше).
+function humanApproval(row) {
+  const id = (row && row.event_id) || '';
+  let summary = row && row.summary ? String(row.summary).replace(/\s+/g, ' ').trim() : '';
+  const cp = [...summary];
+  if (cp.length > 120) summary = cp.slice(0, 120).join('') + '…';
+  if (!summary) return `заявка ${id}`;
+  return `${summary} — заявка ${(row && row.from) || '?'} (${id})`;
+}
 // P3-CRITICAL-2 (2026-07-16, первый боевой найм): раннер, запущенный detached+unref из
 // oneshot-тика, умирал через миллисекунды — detached выводит из process group, но НЕ из
 // cgroup юнита; systemd (KillMode=control-group, дефолт) при завершении тика зачищает
@@ -92,7 +105,7 @@ function runnerArgv(eventId, runnerBin, executorBin, env) {
   out.push(runnerBin, '--approval', eventId, '--executor', executorBin);
   return out;
 }
-module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv };
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval };
 if (require.main !== module) return;
 
 // ---- CLI ---------------------------------------------------------------
@@ -316,7 +329,10 @@ function executingApprovals() {
   const executingMarks = dlList(['--kind', 'approval_status', '--filter', 'status=executing']); // сырые события
   const since = new Map(); // ref -> ts первого approval_status(executing) (approved→executing пишется РОВНО один раз — дедуп в ledger блокирует повтор)
   for (const m of executingMarks) if (!since.has(m.data.ref)) since.set(m.data.ref, m.ts);
-  return executingRows.map((r) => ({ event_id: r.event_id, kind_of: r.data.kind_of, executing_since: since.get(r.event_id) }))
+  // summary/from — для человеческого алерта (фидбэк оператора 16.07, см. humanApproval);
+  // stuckExecuting фильтрует rows как есть — лишние поля проезжают насквозь.
+  return executingRows.map((r) => ({ event_id: r.event_id, kind_of: r.data.kind_of,
+    summary: r.data.summary, from: r.data.from, executing_since: since.get(r.event_id) }))
     .filter((r) => r.executing_since);
 }
 const stuck = stuckExecuting(executingApprovals(), now, EXEC_MAX_MIN);
@@ -324,7 +340,8 @@ for (const s of stuck) {
   const marker = path.join(DEPT, `exec-stuck-${s.event_id}`);
   if (dry) { console.log(`[dry] алерт зависшей заявки: ${s.kind_of} ${s.event_id} (executing > ${EXEC_MAX_MIN}мин)`); continue; }
   if (fs.existsSync(marker)) continue; // уже алертили этот эпизод
-  notify(`🚨 dispatcher: заявка ${s.kind_of} ${s.event_id} зависла в executing >${EXEC_MAX_MIN}мин — раннер умер? разберись`);
+  // humanApproval вместо голого event_id — фидбэк оператора 16.07: алерт читается без ledger.
+  notify(`🚨 dispatcher: заявка ${s.kind_of} зависла в executing >${EXEC_MAX_MIN}мин: ${humanApproval(s)} — раннер умер? разберись`);
   try { fs.writeFileSync(marker, String(now)); } catch (e) { console.error(`dispatcher: не смог записать маркер зависшей заявки ${s.event_id}: ${e.message}`); }
 }
 
@@ -362,7 +379,8 @@ for (const row of executable) {
     console.log(`dispatcher: заявка ${kindOf} ${id} — раннер запущен transient-юнитом dept-runner-${id}`);
   } catch (e) {
     const detail = ((e.stderr && String(e.stderr).trim()) || e.message || String(e)).slice(0, 300);
-    notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${detail}) — зависнет, нужен recovery-разбор`);
+    // humanApproval вместо голого event_id — фидбэк оператора 16.07: алерт читается без ledger.
+    notify(`🚨 dispatcher: раннер НЕ запустился (${kindOf}): ${humanApproval({ event_id: id, summary: row.data.summary, from: row.data.from })} — помечена executing (${detail}) — зависнет, нужен recovery-разбор`);
   }
 }
 

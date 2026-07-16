@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv } = createRequire(import.meta.url)('../bin/dept-dispatcher');
+const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval } = createRequire(import.meta.url)('../bin/dept-dispatcher');
 
 const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
 const led = (home, args) => execFileSync(LEDGER, args, { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
@@ -101,6 +101,22 @@ test('stuckExecuting: пустой список / все свежие — пус
   const now = Date.now();
   assert.deepEqual(stuckExecuting([], now, 20), []);
   assert.deepEqual(stuckExecuting([{ event_id: 'e1', executing_since: new Date(now - 1000).toISOString() }], now, 20), []);
+});
+
+// Фидбэк оператора 16.07: алерты «заявка evt_…» нечитаемы без ledger — humanApproval строит
+// человеческую метку из summary/from заявки; при пустых полях — честный fallback на голый id.
+test('humanApproval: «<summary> — заявка <from> (<id>)»; fallback на голый id при пустых полях', () => {
+  assert.equal(humanApproval({ event_id: 'evt_1_ab', summary: 'найм: МК «диаверум-русс» (diaverum-russ)', from: 'dept-head' }),
+    'найм: МК «диаверум-русс» (diaverum-russ) — заявка dept-head (evt_1_ab)');
+  assert.equal(humanApproval({ event_id: 'evt_2_cd' }), 'заявка evt_2_cd'); // нет summary — голый id
+  assert.equal(humanApproval({ event_id: 'evt_3_ef', summary: '   ', from: 'x' }), 'заявка evt_3_ef'); // пробельный summary = пустой
+  assert.equal(humanApproval({ event_id: 'evt_4_gh', summary: 'усыпить воркера x' }), 'усыпить воркера x — заявка ? (evt_4_gh)'); // нет from — «?»
+});
+
+test('humanApproval: summary схлопывается в одну строку и режется до 120 codepoints', () => {
+  assert.equal(humanApproval({ event_id: 'e', summary: 'стр1\nстр2\tстр3', from: 'f' }), 'стр1 стр2 стр3 — заявка f (e)');
+  const label = humanApproval({ event_id: 'e', summary: 'д'.repeat(150), from: 'f' });
+  assert.equal(label, 'д'.repeat(120) + '… — заявка f (e)'); // кириллица режется по символам, не по UTF-16 units
 });
 
 test('newProbeLines: legacy back-compat — маркированная строка, чей legacy-хэш уже в .seen, подавляется', () => {

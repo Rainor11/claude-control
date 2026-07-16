@@ -212,10 +212,23 @@ case "$ACTION" in
     [ "${#SUMMARY}" -le "$SUMMARY_MAX" ] || die "--summary too long (>${SUMMARY_MAX} chars)"
     [ -n "$DETAIL" ] && DETAIL="$(printf '%s' "$DETAIL" | tr -d '\000-\010\013\014\016-\037' | utf8_trunc "$DETAIL_MAX")"
     ARG_KIND=event_id; ARG_VALUE="$EVENT_ID"
+    # Operator feedback 16.07: the card's first line was visually DOUBLED — detail templates
+    # (dept-request-render) open with the same headline phrase as the summary. If detail's
+    # first line equals the summary (trimmed, case-insensitive — templates only differ in
+    # the leading capital), drop the summary prefix and send detail alone. python3 (already
+    # required) does the compare: casefold() is UTF-8-aware, unlike `tr` in a C locale.
     PAYLOAD="$SUMMARY"
-    [ -n "$DETAIL" ] && PAYLOAD="$SUMMARY
+    if [ -n "$DETAIL" ]; then
+      if python3 -c 'import sys
+s, d = sys.argv[1], sys.argv[2]
+sys.exit(0 if d.split("\n", 1)[0].strip().casefold() == s.strip().casefold() else 1)' "$SUMMARY" "$DETAIL"; then
+        PAYLOAD="$DETAIL"
+      else
+        PAYLOAD="$SUMMARY
 
 $DETAIL"
+      fi
+    fi
     ;;
 esac
 

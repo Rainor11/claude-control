@@ -73,6 +73,31 @@ s = sys.stdin.buffer.read().decode("utf-8", "replace")
 n = int(sys.argv[1])
 sys.stdout.buffer.write(s[-n:].encode("utf-8"))' "$1"
 }
+# UTF-8-safe голова первых N СИМВОЛОВ, схлопнутая в одну строку (whitespace-runs → один
+# пробел, края обрезаны — иначе трейлинг-\n от jq стал бы лишним пробелом в алерте) — для
+# summary в TG-алерте; зеркало utf8_tail выше и humanApproval в dept-dispatcher.
+utf8_head() { # $1 = n симв., читает stdin
+  python3 -c 'import sys
+s = " ".join(sys.stdin.buffer.read().decode("utf-8", "replace").split())
+n = int(sys.argv[1])
+sys.stdout.buffer.write(s[:n].encode("utf-8"))' "$1"
+}
+
+# Человеческий контекст заявки для TG-алертов (фидбэк оператора 16.07: «✅ заявка evt_…
+# исполнена» нечитаемо — алерт должен читаться без ledger). Best-effort: ledger/jq могут
+# быть недоступны или строка уехала в архив — тогда label падает к голому event_id, как
+# раньше; исполнение из-за косметики алерта НЕ падает (никаких die в этом блоке).
+summary="" req_from=""
+row="$("$DL" list --kind approval --event-id "$approval" 2>/dev/null)" || row=""
+if [ -n "$row" ] && command -v jq >/dev/null 2>&1; then
+  summary="$(printf '%s' "$row" | jq -r '.data.summary // empty' 2>/dev/null | utf8_head 120)" || summary=""
+  req_from="$(printf '%s' "$row" | jq -r '.data.from // empty' 2>/dev/null | head -n1)" || req_from=""
+fi
+if [ -n "$summary" ]; then
+  label="$summary — заявка ${req_from:-?} ($approval)"
+else
+  label="заявка $approval"
+fi
 
 mkdir -p "$DEPT" 2>/dev/null || true
 LOG_FILE="$DEPT/runner-${approval}.log"
@@ -94,13 +119,14 @@ rc=$?
 
 if [ "$rc" -eq 0 ]; then
   note="$(utf8_tail 500 < "$out_file")"
+  # $label вместо голого event_id — фидбэк оператора 16.07: алерт должен читаться без ledger.
   if "$DL" approval-exec "$approval" --status executed --note "$note" --actor dispatcher >>"$LOG_FILE" 2>&1; then
-    "$NOTIFY" "✅ заявка $approval исполнена (раннер, executor=$executor_base)" >/dev/null 2>&1
+    "$NOTIFY" "✅ Исполнено: $label (executor=$executor_base)" >/dev/null 2>&1
     exit 0
   fi
   # Исполнитель УЖЕ сделал дело, но исход не записан — заявка останется в executing и
   # попадёт в recovery-детект диспетчера (DEPT_EXEC_MAX_MIN). Кричим сразу, не ждём таймера.
-  "$NOTIFY" "🚨 dept-exec-runner: заявка $approval ИСПОЛНЕНА, но approval-exec executed НЕ записан (см. $LOG_FILE) — зависнет в executing, разберись" >/dev/null 2>&1
+  "$NOTIFY" "🚨 dept-exec-runner: ИСПОЛНЕНО, но финал не записан: $label — approval-exec executed НЕ записан (см. $LOG_FILE), зависнет в executing, разберись" >/dev/null 2>&1
   exit 1
 fi
 
@@ -110,9 +136,10 @@ else
   msg="$(utf8_tail 500 < "$err_file")"
   [ -n "$msg" ] || msg="executor завершился с exit code $rc без вывода в stderr (см. $LOG_FILE)"
 fi
+# $label вместо голого event_id — фидбэк оператора 16.07 (см. блок «Человеческий контекст» выше).
 if "$DL" approval-exec "$approval" --status exec_failed --note "$msg" --actor dispatcher >>"$LOG_FILE" 2>&1; then
-  "$NOTIFY" "🔴 заявка $approval НЕ исполнена (executor=$executor_base): $msg" >/dev/null 2>&1
+  "$NOTIFY" "🔴 НЕ исполнено: $label (executor=$executor_base): $msg" >/dev/null 2>&1
   exit 1
 fi
-"$NOTIFY" "🚨 dept-exec-runner: заявка $approval провалилась, И approval-exec exec_failed НЕ записан (см. $LOG_FILE) — зависнет в executing, разберись" >/dev/null 2>&1
+"$NOTIFY" "🚨 dept-exec-runner: НЕ исполнено, И финал не записан: $label — approval-exec exec_failed НЕ записан (см. $LOG_FILE), зависнет в executing, разберись" >/dev/null 2>&1
 exit 1

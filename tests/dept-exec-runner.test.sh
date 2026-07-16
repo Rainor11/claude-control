@@ -83,7 +83,17 @@ exec_ed_count="$("$DL" list --kind approval_status | grep -c "\"ref\":\"$eid\".*
 runner_logs="$(find "$DEPT_HOME" -maxdepth 1 -name "runner-${eid}.log" | wc -l)"
 [ "$runner_logs" -eq 1 ] || fail "ожидался 1 runner-лог, найдено $runner_logs"
 
-echo "OK: два тика подряд → один раннер, заявка executed, дедуп подтверждён"
+# Фидбэк оператора 16.07: ✅-алерт раннера обязан нести человеческий контекст заявки
+# (summary + from из ledger), а не голый event_id — алерт читается без похода в ledger.
+# Notify пишется сразу ПОСЛЕ approval-exec executed — даём до 5с на гонку записи лога.
+human_ok=""
+for i in $(seq 1 10); do
+  if grep -q "✅ Исполнено: смок sleep — заявка dept-head ($eid)" "$NOTIFY_LOG" 2>/dev/null; then human_ok=1; break; fi
+  sleep 0.5
+done
+[ -n "$human_ok" ] || fail "✅-алерт раннера без человеческого контекста (summary/from): $(cat "$NOTIFY_LOG" 2>/dev/null)"
+
+echo "OK: два тика подряд → один раннер, заявка executed, дедуп подтверждён, алерт очеловечен"
 
 # ================================================================================
 # Часть 2: recovery-детект — искусственно состаренная executing-заявка → алерт + дедуп алерта
@@ -110,6 +120,9 @@ fs.writeFileSync(f, lines.join("\n") + "\n");
 out3="$("$DISPATCHER" tick 2>&1)"
 echo "$out3" | grep -q "1 заявок approved" && fail "заявка kind=planerka не должна попасть в approved-выборку (эффективный статус executing): $out3"
 grep -q "зависла в executing" "$NOTIFY_LOG" || fail "recovery-алерт НЕ отправлен: $(cat "$NOTIFY_LOG")"
+# Фидбэк оператора 16.07: recovery-алерт тоже очеловечен — summary + from + event_id.
+grep -q "смок stuck — заявка dept-head ($eid2)" "$NOTIFY_LOG" \
+  || fail "recovery-алерт без человеческого контекста (summary/from): $(cat "$NOTIFY_LOG")"
 [ -f "$DEPT_HOME/exec-stuck-${eid2}" ] || fail "маркер-файл зависшей заявки не создан"
 
 alert_count_before="$(grep -c "зависла в executing" "$NOTIFY_LOG")"
