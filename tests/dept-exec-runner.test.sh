@@ -1,9 +1,12 @@
 #!/bin/bash
 # tests/dept-exec-runner.test.sh — Task 11-fix: end-to-end смок дедупа исполнения долгих
 # заявок диспетчером в ИЗОЛИРОВАННОМ tmp DEPT_HOME (боевой флот/таймер НЕ трогает).
+# ТРЕБУЕТ живую systemd user session: раннер запускается реальным systemd-run
+# transient-юнитом (P3-CRITICAL-2) — заодно e2e-доказательство, что раннер переживает
+# завершение тика (в CI без systemd --user тест не годен).
 #
 # Доказывает баг-фикс напрямую: два тика dept-dispatcher подряд (второй запускается ПОКА
-# detached-раннер первого ещё выполняется) → ровно ОДИН раннер стартует и дописывает
+# раннер первого ещё выполняется в своём юните) → ровно ОДИН раннер стартует и дописывает
 # executed, второй тик видит заявку уже НЕ approved и пропускает. Плюс recovery-детект:
 # искусственно состаренная executing-заявка → алерт, дедуп повторного алерта маркер-файлом.
 set -euo pipefail
@@ -54,14 +57,14 @@ eid="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.l
 "$DL" approval-resolve "$eid" --status approved --actor operator >/dev/null
 
 FAKE_EXEC_SLEEP=3 out1="$(FAKE_EXEC_SLEEP=3 "$DISPATCHER" tick 2>&1)"
-echo "$out1" | grep -q "раннер запущен detached" || fail "тик 1 не запустил раннер: $out1"
+echo "$out1" | grep -q "раннер запущен transient-юнитом" || fail "тик 1 не запустил раннер: $out1"
 
 # тик 2 — СРАЗУ, пока раннер тика 1 ещё спит 3с (проверено ниже: раннер завершится позже)
 out2="$("$DISPATCHER" tick 2>&1)"
 echo "$out2" | grep -qE "0 заявок approved|пропущено" || true # заявка уже не approved → выборка пуста, это и есть дедуп
-echo "$out2" | grep -q "раннер запущен detached" && fail "тик 2 запустил ВТОРОЙ раннер — дедуп не сработал: $out2"
+echo "$out2" | grep -q "раннер запущен transient-юнитом" && fail "тик 2 запустил ВТОРОЙ раннер — дедуп не сработал: $out2"
 
-# ждём завершения detached-раннера тика 1 (до 10с, опрашиваем effective status)
+# ждём завершения раннера тика 1 (до 10с, опрашиваем effective status)
 executed=""
 for i in $(seq 1 20); do
   st="$("$DL" list --kind approval --status executed | grep -c "$eid" || true)"

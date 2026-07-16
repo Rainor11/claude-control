@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting } = createRequire(import.meta.url)('../bin/dept-dispatcher');
+const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv } = createRequire(import.meta.url)('../bin/dept-dispatcher');
 
 const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
 const led = (home, args) => execFileSync(LEDGER, args, { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
@@ -110,4 +110,26 @@ test('newProbeLines: legacy back-compat — маркированная стро�
   const legacy = createHash('sha256').update(visible).digest('hex').slice(0, 32);
   const lines = [`\x1eebid=evt_9\x1e${visible}`];
   assert.equal(newProbeLines(lines, new Set([legacy]), new Set()).length, 0);
+});
+
+// P3-CRITICAL-2: раннер обязан жить в СОБСТВЕННОМ transient-юните (systemd-run), не
+// detached-ребёнком — cgroup-зачистка oneshot-тика убивала его через миллисекунды
+// (вскрыто первым боевым наймом 2026-07-16; репродукция в песочнице). Проверяем сборку
+// argv: имя юнита от event_id, --collect, прокидка ТОЛЬКО whitelist-env, хвост раннера.
+test('runnerArgv: transient-юнит + прокидка whitelist-env + argv раннера', () => {
+  const argv = runnerArgv('evt_1_abcd', '/repo/bin/dept-exec-runner', '/repo/bin/dept-spawn-exec',
+    { PATH: '/x:/y', CLAUDE_CONTROL_DIR: '/cc', BRAIN_CLIENTS: '/bc', TELEGRAM_NOTIFY: '/tg',
+      CLAUDE_AUTO_HOME: '/dead', HOME: '/home/u', SECRET: 'no' });
+  assert.deepEqual(argv.slice(0, 4), ['--user', '--collect', '--quiet', '--unit=dept-runner-evt_1_abcd']);
+  const forwarded = argv.filter((_, i) => argv[i - 1] === '--setenv');
+  // ревью P3-CRITICAL-2: прокидывается ровно то, что читает bash-цепочка раннера;
+  // CLAUDE_AUTO_HOME (node-only), HOME, SECRET — НЕ прокидываются.
+  assert.deepEqual(forwarded, ['PATH=/x:/y', 'CLAUDE_CONTROL_DIR=/cc', 'BRAIN_CLIENTS=/bc', 'TELEGRAM_NOTIFY=/tg']);
+  assert.deepEqual(argv.slice(-5), ['/repo/bin/dept-exec-runner', '--approval', 'evt_1_abcd', '--executor', '/repo/bin/dept-spawn-exec']);
+});
+
+test('runnerArgv: пустые env-значения не прокидываются', () => {
+  const argv = runnerArgv('evt_2_bcde', '/r', '/e', { PATH: '', DEPT_HOME: '/d' });
+  const forwarded = argv.filter((_, i) => argv[i - 1] === '--setenv');
+  assert.deepEqual(forwarded, ['DEPT_HOME=/d']);
 });

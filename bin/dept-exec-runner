@@ -1,5 +1,7 @@
 #!/bin/bash
-# dept-exec-runner — detached-обёртка вокруг исполнителей заявок (dept-*-exec).
+# dept-exec-runner — обёртка вокруг исполнителей заявок (dept-*-exec); живёт в
+# СОБСТВЕННОМ transient-юните systemd-run (dept-runner-<event_id>), не detached-ребёнком
+# (P3-CRITICAL-2: cgroup-зачистка oneshot-тика убивала detached-раннер миллисекундно).
 #
 # Task 11-fix (P3-CRITICAL, вскрыт боевой планёркой 2026-07-15): раньше dept-dispatcher
 # запускал исполнителя СИНХРОННО (execFileSync, timeout 15 мин) — тик диспетчера блокировался
@@ -9,14 +11,14 @@
 # несколько параллельных исполнителей одной заявки, взаимоблокировка.
 #
 # Фикс: dept-dispatcher помечает заявку executing (дедуп на уровне ledger — approved→executing
-# идемпотентен) и запускает ЭТОТ раннер DETACHED (spawn detached+unref, stdio ignore) — тик НЕ
+# идемпотентен) и запускает ЭТОТ раннер отдельным юнитом (systemd-run --collect) — тик НЕ
 # ждёт исполнения. Раннер исполняет синхронно и НЕЗАВИСИМО от диспетчера пишет финальный
 # статус (executed/exec_failed) через approval-exec.
 #
 # Usage: dept-exec-runner --approval <event_id> --executor <path-to-dept-*-exec>
 #
 # Whitelist (anti-forge): --executor обязан быть файлом В ТОМ ЖЕ каталоге, что и этот раннер
-# (BINDIR), и его basename ∈ whitelist ниже — НЕ произвольный путь. Раннер спавнится detached,
+# (BINDIR), и его basename ∈ whitelist ниже — НЕ произвольный путь. Раннер работает фоном,
 # оператор не видит аргументы вызова в реальном времени — whitelist забор от инъекции
 # произвольного бинаря через --executor.
 set -u

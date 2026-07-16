@@ -10,8 +10,9 @@
 //      operator). Codex-аудит К3: approved-строка сама по себе НЕ мандат — /proc-гард
 //      в dept-ledger (approval-exec) первый забор, этот ролевой фильтр — второй,
 //      сверка detail↔request в исполнителях Task 8 — третий. Task 11-fix: заявка
-//      ПОМЕЧАЕТСЯ executing (дедуп на уровне ledger) и исполнитель запускается через
-//      dept-exec-runner DETACHED — тик НЕ ждёт исполнения (см. bin/dept-exec-runner).
+//      ПОМЕЧАЕТСЯ executing (дедуп на уровне ledger) и dept-exec-runner запускается в
+//      СОБСТВЕННОМ transient-юните systemd-run — тик НЕ ждёт исполнения (P3-CRITICAL-2:
+//      detached-ребёнок умирал при cgroup-зачистке oneshot-тика, см. runnerArgv).
 //      Recovery: заявки, застрявшие в executing дольше DEPT_EXEC_MAX_MIN (раннер
 //      умер) — алерт оператору, БЕЗ авто-рестарта (дедуп маркер-файлом на event_id).
 //   3. Детект неактивности МК (решение оператора №6): без DEPT_SLEEP_AUTO=1 —
@@ -23,7 +24,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { execFileSync, spawn } = require('child_process');
+const { execFileSync } = require('child_process');
 const crypto = require('crypto');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
@@ -69,7 +70,29 @@ function stuckExecuting(rows, nowMs, maxMin) {
   const thresholdMs = maxMin * 60_000;
   return rows.filter((r) => r.executing_since && (nowMs - Date.parse(r.executing_since)) > thresholdMs);
 }
-module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting };
+// P3-CRITICAL-2 (2026-07-16, первый боевой найм): раннер, запущенный detached+unref из
+// oneshot-тика, умирал через миллисекунды — detached выводит из process group, но НЕ из
+// cgroup юнита; systemd (KillMode=control-group, дефолт) при завершении тика зачищает
+// cgroup (SIGKILL, без следов: stdio ignore, а лог раннер пишет только ПОСЛЕ исполнителя).
+// Ревью Task 11-fix гоняло раннеры из shell-сессии — вне oneshot-cgroup, слепая зона.
+// Фикс: раннер живёт СОБСТВЕННЫМ transient-юнитом systemd-run (dept-runner-<event_id>) —
+// жизненный цикл независим от диспетчера, журнал в journalctl --user -u dept-runner-*,
+// --collect самоочищает failed-юниты, занятое имя юнита = доп. слой дедупа той же заявки.
+// systemd-run НЕ наследует env клиента — значимые переменные прокидываются явно (--setenv).
+// Whitelist = ровно то, что ЧИТАЕТ цепочка раннера (ревью P3-CRITICAL-2, сверено grep'ом):
+// PATH; DEPT_HOME + DEPT_POLICY_DIR (dept-ledger); CLAUDE_CONTROL_DIR (claude-auto,
+// planerka/sleep-exec); BRAIN_CLIENTS (spawn-exec); TELEGRAM_NOTIFY + таймаут (сам раннер).
+// CLAUDE_AUTO_HOME сюда НЕ входит — её читают только node-компоненты (dispatcher/liveness/
+// inbox), в bash-цепочке раннера она мертва.
+// Чистая функция: собирает argv systemd-run (тестируется без запуска).
+function runnerArgv(eventId, runnerBin, executorBin, env) {
+  const out = ['--user', '--collect', '--quiet', `--unit=dept-runner-${eventId}`];
+  for (const k of ['PATH', 'DEPT_HOME', 'DEPT_POLICY_DIR', 'CLAUDE_CONTROL_DIR', 'BRAIN_CLIENTS', 'TELEGRAM_NOTIFY', 'DEPT_EXEC_RUNNER_TIMEOUT_MS'])
+    if (env[k] !== undefined && env[k] !== '') out.push('--setenv', `${k}=${env[k]}`);
+  out.push(runnerBin, '--approval', eventId, '--executor', executorBin);
+  return out;
+}
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv };
 if (require.main !== module) return;
 
 // ---- CLI ---------------------------------------------------------------
@@ -106,6 +129,8 @@ const AUTO = process.env.DEPT_SLEEP_AUTO === '1';
 // Дефолты (20 мин = 1200000 ≥ 900000) инвариант держат; при тюнинге env — сохранять соотношение.
 const EXEC_MAX_MIN = numEnv('DEPT_EXEC_MAX_MIN', 20);
 const EXEC_RUNNER = path.join(BIN, 'dept-exec-runner');
+// Тест-шов: подменить systemd-run заглушкой в тестах/песочнице (DEPT_SYSTEMD_RUN=/bin/true).
+const SYSTEMD_RUN = process.env.DEPT_SYSTEMD_RUN || 'systemd-run';
 
 const EXECUTORS = {
   worker_spawn: 'dept-spawn-exec', mission_change: 'dept-mission-exec',
@@ -115,7 +140,7 @@ const EXECUTORS = {
 // Best-effort лок (см. liveness/rebase-check): ручной прогон параллельно с таймером
 // иначе гонит read-modify-write sleep-check-state.json/.dispatcher-lastrun-* без
 // синхронизации. Task 11-fix: обязанность 2 (исполнение заявок) больше НЕ блокирует тик —
-// раннер запускается detached, дольше всего тик может занять на обязанности 1/3 (пробы
+// раннер живёт в отдельном transient-юните, дольше всего тик может занять на обязанности 1/3 (пробы
 // СПЯЩИХ + claude-auto start/sleep/rebase, execFileSync таймаут 60с на каждый вызов,
 // воркеров может быть несколько). 20 мин "протухания" — таймер бьёт раз в 2 мин, запас
 // на легитимно долгий прогон при большом флоте, не только на секундный.
@@ -270,16 +295,17 @@ for (const [name, meta] of Object.entries(autoWorkers)) {
   }
 }
 
-// ---- 2) исполнение утверждённых заявок (Task 11-fix: executing + detached раннер) -----
+// ---- 2) исполнение утверждённых заявок (Task 11-fix: executing + отдельный юнит раннера) --
 // Старый баг (боевая планёрка 2026-07-15): execFileSync(executor, timeout 15мин) блокировал
 // тик диспетчера целиком; systemd (дефолтный TimeoutStartSec) убивал зависший на >N сек
 // dispatcher, осиротевший exec продолжал жить, а следующий тик видел approval всё ещё
 // "approved" и стартовал НОВЫЙ exec на ту же заявку → параллельные исполнители одной
 // заявки, взаимоблокировка. Фикс: (1) пометить executing ДО запуска — дедуп на уровне
 // ledger (approval-exec approved→executing идемпотентен: второй прогон получит
-// deduped:true и пропустит заявку); (2) запустить dept-exec-runner DETACHED — тик НЕ ждёт
-// исполнения, продолжает следующую заявку немедленно. Раннер сам пишет финальный статус
-// (executed/exec_failed) независимо от диспетчера — см. bin/dept-exec-runner.
+// deduped:true и пропустит заявку); (2) запустить dept-exec-runner в СОБСТВЕННОМ
+// transient-юните (systemd-run, см. runnerArgv/P3-CRITICAL-2) — тик НЕ ждёт исполнения.
+// Раннер сам пишет финальный статус (executed/exec_failed) независимо от диспетчера —
+// см. bin/dept-exec-runner.
 
 // Recovery: заявки, застрявшие в executing (раннер, вероятно, умер — hard-kill/OOM).
 // ДО обычного цикла исполнения — оператору важно узнать про зависшую заявку даже если в
@@ -323,24 +349,20 @@ for (const row of executable) {
     continue;
   }
   if (mark.deduped) { execSkippedCount++; console.log(`dispatcher: заявка ${kindOf} ${id} уже executing (другой тик/прогон взял) — пропуск`); continue; }
-  // Шаг 2: детач-запуск раннера. detached+unref — тик НЕ ждёт исполнения, продолжает
-  // следующую заявку немедленно. stdio:'ignore' — раннер сам пишет свой лог в DEPT/runner-<id>.log.
+  // Шаг 2: запуск раннера СОБСТВЕННЫМ transient-юнитом systemd-run, НЕ detached-ребёнком —
+  // см. комментарий у runnerArgv (P3-CRITICAL-2: cgroup-зачистка oneshot убивала detached-раннер
+  // через миллисекунды). execFileSync тик не блокирует: systemd-run возвращается сразу после
+  // старта юнита (~десятки мс), исполнение идёт в отдельном юните. Провал старта (вкл. занятое
+  // имя юнита при живом раннере той же заявки) — алерт; заявка остаётся executing,
+  // recovery-бэкстоп (EXEC_MAX_MIN) штатный.
   try {
-    const child = spawn(EXEC_RUNNER, ['--approval', id, '--executor', path.join(BIN, executor)], { detached: true, stdio: 'ignore' });
-    // spawn() НЕ бросает синхронно на ENOENT/EACCES (в отличие от execFileSync) — ошибка
-    // приходит АСИНХРОННО событием 'error' на следующем тике event loop. Без слушателя
-    // необработанный 'error' на EventEmitter кидает исключение и падает ВЕСЬ процесс
-    // dispatcher (проверено эмпирически) — заявка уже помечена executing, но раннер не
-    // стартовал, а дальнейшие заявки/обязанность 3 в этом тике вообще не обработались бы.
-    child.on('error', (e) => {
-      notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${e.message}) — зависнет, нужен recovery-разбор`);
-    });
-    child.unref();
+    execFileSync(SYSTEMD_RUN, runnerArgv(id, EXEC_RUNNER, path.join(BIN, executor), process.env),
+      { encoding: 'utf8', timeout: 15_000 });
     execStartedCount++;
-    console.log(`dispatcher: заявка ${kindOf} ${id} — раннер запущен detached (pid ${child.pid})`);
+    console.log(`dispatcher: заявка ${kindOf} ${id} — раннер запущен transient-юнитом dept-runner-${id}`);
   } catch (e) {
-    // Синхронный throw (маловероятен для spawn, но перекрываем на всякий случай) — та же логика.
-    notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${e.message}) — зависнет, нужен recovery-разбор`);
+    const detail = ((e.stderr && String(e.stderr).trim()) || e.message || String(e)).slice(0, 300);
+    notify(`🚨 dispatcher: заявка ${kindOf} ${id} помечена executing, но раннер НЕ запустился (${detail}) — зависнет, нужен recovery-разбор`);
   }
 }
 

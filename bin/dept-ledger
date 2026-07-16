@@ -27,7 +27,7 @@ const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff',
   'kb_change_request', 'decision_request']); // §5 спеки; worker_spawn/mission_change — approvals, не messages
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
 // Task 11-fix: 'executing' — промежуточный статус между approved и executed/exec_failed.
-// Диспетчер помечает заявку executing ДО запуска исполнителя detached (dept-exec-runner),
+// Диспетчер помечает заявку executing ДО запуска исполнителя в отдельном юните (dept-exec-runner),
 // чтобы следующий тик/прогон видел её НЕ approved (effectiveStatus) и не запускал второй
 // исполнитель на ту же заявку — см. cmdApprovalExec ниже и wiki-бриф P3-Task-11fix.
 const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed', 'executing'];
