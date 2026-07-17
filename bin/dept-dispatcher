@@ -260,7 +260,11 @@ function isStale(brainPath, txMtime) {
 function runProbe(cmd, timeoutSec) {
   const argv = Array.isArray(cmd) ? cmd : ['sh', '-c', String(cmd)];
   if (!argv.length || !argv[0]) return '';
-  try { return execFileSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: (timeoutSec || 30) * 1000 }); }
+  // EB_ASANA_EMIT_ID: без него asana-comments печатает строки БЕЗ ebid-маркера →
+  // ключ дедупа = legacy-hash, а живой watcher писал в .seen только 'g:<id>' →
+  // уже доставленное событие ложно будило спящего воркера. Диспетчер marker-aware
+  // (keysForLine), поэтому просим маркер всегда — как event-bridge-watch.
+  try { return execFileSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: (timeoutSec || 30) * 1000, env: { ...process.env, EB_ASANA_EMIT_ID: '1' } }); }
   catch (e) { return typeof e.stdout === 'string' ? e.stdout : ''; }
 }
 

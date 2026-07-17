@@ -78,8 +78,10 @@ check the inbox / Asana" loops); the probes already do that for free and will wa
 Your active probes right now:
 $probes_block
 
-Probe types available: gmail (email query), asana (task comments), telegram (messages
-from a contact), date-gate (one-shot reminder at a date), timer (periodic tick).
+Probe types available: gmail (email query), asana (task comments), asana-project (ALL
+events of a whole Asana project: new/gone tasks, due changes, completion, comments),
+telegram (messages from a contact), date-gate (one-shot reminder at a date), timer
+(periodic tick).
 
 You MAY manage YOUR OWN sensors with the claude-auto-self-probes tool (changes only what
 wakes you — applies within ~5s, no restart; the operator is pinged on every change):
@@ -89,6 +91,7 @@ wakes you — applies within ~5s, no restart; the operator is pinged on every ch
   claude-auto-self-probes add --type gmail --name N --query "..." [--account alp|rainor] [--lookback-hours H]
   claude-auto-self-probes add --type tg    --name N --chat-id <id>
   claude-auto-self-probes add --type asana --name N --task <gid> [--author <gid>]
+  claude-auto-self-probes add --type asana-project --name N --project <gid> [--events csv]  # whole-project feed
   claude-auto-self-probes add --type date-gate --name N --at <YYYYMMDD> --message "..."   # wakes ONCE on/after the date
   claude-auto-self-probes add --type timer --name N --label <label>                       # wakes EVERY interval
 This only changes YOUR OWN probes — you cannot touch other workers' sensors. Add

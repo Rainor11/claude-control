@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""asana-project — event-bridge probe: print NEW events of a whole Asana project.
+
+Snapshot-diff poller (webhooks/Events API deliberately NOT used: at-most-once
+delivery, silent webhook expiry, sync-token 412 re-crawls — see
+server_docs/monitoring/monitoring_scripts.md «Почему опрос, а не вебхуки Asana»).
+Each run crawls the project's task list, diffs it against the previous snapshot
+and emits one line per change:
+
+  task_new   — task appeared in the project (suppressed for tasks THIS worker
+               created, via the .asana-self-tasks ledger — same idea as the
+               .asana-self-stories comment ledger)
+  task_gone  — task disappeared (deleted OR removed from the project; confirmed
+               over TWO consecutive complete crawls to survive pagination races)
+  due        — due_on/due_at changed
+  completed / reopened — completion flip
+  comments   — new comment on any task (story-gid dedup; self-comments dropped
+               via .asana-self-stories)
+
+Delivery contract: every emitted line starts with the hidden stable-id marker
+\\x1eebid=<id>\\x1e (both consumers — event-bridge-watch and dept-dispatcher —
+are marker-aware; precedent: ledger-messages emits it unconditionally). The
+adapter does NOT track delivery: emitted events are appended to a replay
+journal and RE-printed every run for --replay-hours (default 168h); the bridge
+dedups already-delivered ids via its .seen. So an event that could not be
+injected (busy session) keeps being offered for a week, then expires. Journal
+eviction before delivery cannot be detected — accepted, documented limitation.
+
+Event ids are deterministic across crash recovery: the id embeds the as_of of
+the snapshot the diff was computed AGAINST, so a crash between journal write
+and snapshot write recomputes byte-identical ids (journal appends dedup by id).
+A genuine later repeat (due A→B→A→B) diffs against a NEWER snapshot → new id.
+
+State (per project, in --state-dir):
+  .asana-project-<gid>.snapshot.json   — task snapshot + gone/comment bookkeeping
+  .asana-project-<gid>.journal.jsonl   — replay journal (id, ts, type, line)
+  .asana-project-<gid>.lock            — single-flight lock
+
+Fail-open on network trouble (exit 0, no state change, retry next poll);
+fail-CLOSED on a corrupt snapshot (stderr + exit 0, snapshot preserved — never
+reset to a fresh baseline, that would silently drop the diff).
+
+Rate safety: hard per-run request budget (--request-budget, default 60 of the
+150/min free-tier PAT), page caps, 429 Retry-After honored once if short.
+
+Usage:
+  asana-project --project <gid> [--state-dir <dir>] [--events csv]
+                [--replay-hours N] [--request-budget N]
+  events csv ⊆ task_new,task_gone,due,completed,reopened,comments (default all)
+"""
+
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+ENV_FILE = "/home/rainor/server/.env"
+API_BASE_DEFAULT = "https://app.asana.com/api/1.0"
+SCHEMA_VERSION = 1
+MAX_PAGES = 100            # sanity cap per paginated listing (100*100 = 10k items)
+JOURNAL_CAP = 2000         # newest entries kept
+LEDGER_TAIL = 5000         # bounded ledger reads (>> hook cap 2000)
+SELF_TASK_TTL = 7 * 86400  # ignore self-task ledger entries older than this
+NAME_CAP = 80
+EXCERPT_CAP = 200
+LINE_CAP = 650             # visible part; keeps the one-line event frame sane
+ALL_EVENTS = ("task_new", "task_gone", "due", "completed", "reopened", "comments")
+
+def die(msg, code=1):
+    sys.stderr.write("asana-project: %s\n" % msg)
+    sys.exit(code)
+
+def log_err(msg):
+    sys.stderr.write("asana-project: %s\n" % msg)
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def parse_args(argv):
+    args = {"project": "", "state_dir": "", "events": ",".join(ALL_EVENTS),
+            "replay_hours": 168.0, "request_budget": 60}
+    i = 0
+    def val(flag):
+        nonlocal i
+        if i + 1 >= len(argv):
+            die("missing value for %s" % flag)
+        i += 1
+        return argv[i]
+    while i < len(argv):
+        a = argv[i]
+        if a == "--project":
+            args["project"] = val(a)
+        elif a == "--state-dir":
+            args["state_dir"] = val(a)
+        elif a == "--events":
+            args["events"] = val(a)
+        elif a == "--replay-hours":
+            try:
+                args["replay_hours"] = float(val(a))
+            except ValueError:
+                die("--replay-hours must be a number")
+        elif a == "--request-budget":
+            try:
+                args["request_budget"] = int(val(a))
+            except ValueError:
+                die("--request-budget must be an integer")
+        elif a in ("-h", "--help"):
+            sys.stdout.write(__doc__ + "\n")
+            sys.exit(0)
+        else:
+            die("unexpected arg: %s" % a)
+        i += 1
+    if not re.fullmatch(r"[0-9]+", args["project"] or ""):
+        die("--project <numeric gid> required")
+    if not args["state_dir"]:
+        args["state_dir"] = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
+    ev = [e.strip() for e in args["events"].split(",") if e.strip()]
+    bad = [e for e in ev if e not in ALL_EVENTS]
+    if bad or not ev:
+        die("--events must be a non-empty csv subset of: %s" % ",".join(ALL_EVENTS))
+    args["events"] = set(ev)
+    if not (0 < args["replay_hours"] <= 24 * 30):
+        die("--replay-hours must be in (0, 720]")
+    if not (1 <= args["request_budget"] <= 140):
+        die("--request-budget must be 1..140 (free-tier PAT is 150/min, leave headroom)")
+    return args
+
+def read_token():
+    env_file = os.environ.get("ASANA_PROJECT_ENV_FILE", ENV_FILE)
+    try:
+        with open(env_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("ASANA_ACCESS_TOKEN="):
+                    tok = line.split("=", 1)[1].strip().strip('"').strip("'").strip()
+                    if tok:
+                        return tok
+    except OSError:
+        pass
+    die("ASANA_ACCESS_TOKEN missing in %s" % env_file)
+
+def api_base():
+    # Test-only override, pinned to loopback so a hostile env var can never
+    # redirect the real Bearer token to an external host. Parsed STRUCTURALLY:
+    # a prefix check alone would pass http://localhost:80@attacker.example
+    # (userinfo trick — the real host is attacker.example).
+    base = os.environ.get("ASANA_PROJECT_API_BASE", "")
+    if base:
+        try:
+            u = urllib.parse.urlsplit(base)
+            if (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost")
+                    and u.username is None and u.password is None):
+                return base.rstrip("/")
+        except ValueError:
+            pass
+    return API_BASE_DEFAULT
+
+class Budget:
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+    def take(self):
+        if self.used >= self.limit:
+            raise BudgetExhausted()
+        self.used += 1
+
+class BudgetExhausted(Exception):
+    pass
+
+class FetchError(Exception):
+    pass
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would happily follow one to another origin WITH
+    the Authorization header attached. The Asana API never redirects normal
+    calls; treat any redirect as an error rather than a token-leak vector."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+def api_get(token, budget, path_or_url, params=None):
+    if path_or_url.startswith("http"):
+        # absolute URLs come only from next_page.uri — pin them to our origin
+        # so a poisoned/absurd pagination link can't exfiltrate the Bearer token
+        if not path_or_url.startswith(api_base() + "/"):
+            raise FetchError("off-origin url refused: %s" % path_or_url)
+        url = path_or_url
+    else:
+        url = api_base() + path_or_url
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token, "Accept": "application/json"})
+    for attempt in (1, 2):
+        budget.take()  # each real HTTP request costs budget, retries included
+        try:
+            with _OPENER.open(req, timeout=30) as resp:
+                doc = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if not isinstance(doc, dict):
+                    raise FetchError("non-object JSON response on %s" % url)
+                return doc
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1:
+                try:
+                    ra = int(e.headers.get("Retry-After", "999"))
+                except (TypeError, ValueError):
+                    ra = 999
+                if 0 < ra <= 10:
+                    time.sleep(ra)
+                    continue
+            raise FetchError("HTTP %s on %s" % (e.code, url))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise FetchError("%s on %s" % (e, url))
+    raise FetchError("retries exhausted on %s" % url)
+
+def fetch_all_pages(token, budget, path, params):
+    """Follow next_page.uri to the very end (Asana lists are oldest/priority
+    ordered — the last page matters). Raises on ANY page failure: the caller
+    must never diff a partial view."""
+    items, url, prm = [], path, dict(params)
+    for _ in range(MAX_PAGES):
+        doc = api_get(token, budget, url, prm)
+        data = doc.get("data")
+        if not isinstance(data, list):
+            raise FetchError("malformed page (data not a list) on %s" % url)
+        items.extend(data)
+        nxt = (doc.get("next_page") or {}).get("uri") if isinstance(doc.get("next_page"), dict) else None
+        if not nxt:
+            return items
+        url, prm = nxt, None
+    raise FetchError("page sanity cap (%d) hit on %s" % (MAX_PAGES, path))
+
+# ---- state -----------------------------------------------------------------
+
+def load_json_file(path):
+    """(exists, parsed|None). Corrupt file → (True, None): caller must fail
+    CLOSED (preserve the file), never reset to a fresh baseline."""
+    if not os.path.exists(path):
+        return False, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return True, json.load(f)
+    except (OSError, ValueError):
+        return True, None
+
+def atomic_write(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    # O_EXCL after removing any stale leftover: a pre-placed symlink at the
+    # predictable tmp name must never redirect the write/truncate (O_EXCL
+    # refuses to open through an existing entry, symlink included).
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        # fsync the directory too: without it a power crash could persist a
+        # LATER rename (snapshot) while dropping an EARLIER one (journal),
+        # breaking the journal-before-snapshot ordering. Best-effort.
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def load_journal(path):
+    """STRICT load of our own replay journal. Unlike the self-ledgers (foreign,
+    fail-open), the journal holds possibly-undelivered events and is rewritten
+    every run — silently treating damage as 'empty' would erase them for good.
+    Returns a list, or None = fail CLOSED (caller aborts, file preserved)."""
+    if not os.path.exists(path):
+        return []
+    out = []
+    try:
+        if os.path.islink(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                e = json.loads(line)
+                # Full field validation, incl. a PARSEABLE ts: an entry with a
+                # broken ts would otherwise sail through and be silently dropped
+                # by the age-prune as "expired" — that is exactly the silent
+                # deletion this loader exists to prevent.
+                if not (isinstance(e, dict)
+                        and isinstance(e.get("id"), str) and e["id"]
+                        and isinstance(e.get("line"), str) and e["line"]
+                        and isinstance(e.get("ts"), str)):
+                    return None
+                datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                out.append(e)
+    except (OSError, ValueError):
+        return None
+    return out
+
+def read_ledger_lines(path):
+    """Bounded tail read; missing/broken ledger = exclude nothing (fail-open,
+    same stance as asana-comments)."""
+    try:
+        if not os.path.isfile(path) or os.path.islink(path):
+            return []
+        if os.path.getsize(path) > 10 * 1024 * 1024:
+            log_err("ledger %s oversized — ignoring (fail-open)" % path)
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [l.rstrip("\n") for l in f.readlines()[-LEDGER_TAIL:]]
+    except OSError:
+        return []
+
+def self_story_gids(state_dir):
+    return set(g for g in read_ledger_lines(os.path.join(state_dir, ".asana-self-stories"))
+               if re.fullmatch(r"[0-9]{1,32}", g))
+
+def self_task_gids(state_dir):
+    """.asana-self-tasks lines: '<epoch>\t<gid>'. Entries expire after
+    SELF_TASK_TTL so a legitimate later remove/re-add is not suppressed."""
+    out, now = set(), time.time()
+    for line in read_ledger_lines(os.path.join(state_dir, ".asana-self-tasks")):
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        ts, gid = parts
+        if not (re.fullmatch(r"[0-9]+", ts) and re.fullmatch(r"[0-9]{1,32}", gid)):
+            continue
+        if now - int(ts) <= SELF_TASK_TTL:
+            out.add(gid)
+    return out
+
+# ---- formatting ------------------------------------------------------------
+
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+def clean(s, cap):
+    s = CTRL_RE.sub(" ", s or "").strip()
+    return s[:cap] + ("…" if len(s) > cap else "")
+
+def fmt_due(t):
+    return t.get("due_at") or t.get("due_on") or "нет"
+
+def visible_line(ts, text):
+    return ("[asana-project %s] %s" % (ts, text))[:LINE_CAP]
+
+# ---- main ------------------------------------------------------------------
+
+def main():
+    args = parse_args(sys.argv[1:])
+    token = read_token()
+    proj = args["project"]
+    sdir = args["state_dir"]
+    os.makedirs(sdir, exist_ok=True)
+
+    lock_path = os.path.join(sdir, ".asana-project-%s.lock" % proj)
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # another instance runs this project — silent skip
+
+    snap_path = os.path.join(sdir, ".asana-project-%s.snapshot.json" % proj)
+    journal_path = os.path.join(sdir, ".asana-project-%s.journal.jsonl" % proj)
+
+    exists, snap = load_json_file(snap_path)
+    if exists and not isinstance(snap, dict):
+        # covers both unparseable (None) and valid-but-wrong JSON (array etc.)
+        die("snapshot %s is corrupt — refusing to touch it (fix or remove manually)" % snap_path, 0)
+    if exists and not isinstance(snap.get("tasks"), dict):
+        die("snapshot %s has unexpected shape — refusing (schema %s?)"
+            % (snap_path, snap.get("schema")), 0)
+
+    budget = Budget(args["request_budget"])
+    crawl_start = now_iso()
+    try:
+        raw = fetch_all_pages(token, budget, "/projects/%s/tasks" % proj, {
+            "limit": 100,
+            "opt_fields": "name,completed,due_on,due_at,modified_at,created_at,assignee.name"})
+    except (FetchError, BudgetExhausted) as e:
+        log_err("crawl failed (%s) — no state change, retry next poll" % e)
+        sys.exit(0)
+
+    cur = {}
+    for t in raw:
+        gid = str(t.get("gid") or "")
+        if not re.fullmatch(r"[0-9]{1,32}", gid):
+            continue
+        if gid in cur:
+            continue  # duplicate from a pagination race — first occurrence wins
+        cur[gid] = {
+            "name": t.get("name") or "",
+            "completed": bool(t.get("completed")),
+            "due_on": t.get("due_on"),
+            "due_at": t.get("due_at"),
+            "modified_at": t.get("modified_at") or "",
+            "assignee": ((t.get("assignee") or {}).get("name") or "") if isinstance(t.get("assignee"), dict) else "",
+        }
+
+    # ---- first run: baseline, print nothing (consistent with other stateful adapters)
+    if not exists:
+        snap = {"schema": SCHEMA_VERSION, "as_of": crawl_start, "tasks": {},
+                "pending_gone": {}, "comment_queue": []}
+        for gid, t in cur.items():
+            t2 = dict(t)
+            # Comment watermark starts at crawl START (not finish): a comment
+            # created while we paged must not be skipped forever.
+            t2["comment_wm"] = crawl_start
+            t2["comment_wm_gids"] = []
+            snap["tasks"][gid] = t2
+        try:
+            atomic_write(snap_path, json.dumps(snap, ensure_ascii=False))
+        except OSError as e:
+            log_err("baseline write failed: %s" % e)
+        sys.exit(0)
+
+    base_as_of = snap.get("as_of") or "0"
+    prev = snap["tasks"]
+    pending_gone = snap.get("pending_gone") or {}
+    comment_queue = set(snap.get("comment_queue") or [])
+    want = args["events"]
+    ts = now_iso()
+    events = []  # (id, type, visible_text)
+
+    def eid(task_gid, kind, payload=""):
+        # Deterministic across crash recovery (same base snapshot → same id),
+        # unique across genuine repeats (newer base as_of).
+        core = "ap:%s:%s:%s:%s" % (proj, base_as_of, task_gid, kind)
+        return core + ((":" + payload) if payload else "")
+
+    self_tasks = self_task_gids(sdir) if "task_new" in want else set()
+
+    # ---- new tasks
+    for gid in cur:
+        if gid in prev:
+            continue
+        if "task_new" not in want:
+            continue
+        if gid in self_tasks:
+            continue  # the worker itself created it — no self-wake
+        t = cur[gid]
+        events.append((eid(gid, "new"), "task_new",
+                       "Новая задача «%s» (task=%s, срок %s%s)" % (
+                           clean(t["name"], NAME_CAP), gid, fmt_due(t),
+                           (", исполнитель " + clean(t["assignee"], 40)) if t["assignee"] else "")))
+
+    # ---- gone tasks (two consecutive complete crawls to confirm)
+    new_pending = {}
+    for gid in prev:
+        if gid in cur:
+            continue
+        if pending_gone.get(gid):
+            if "task_gone" in want:
+                t = prev[gid]
+                events.append((eid(gid, "gone", t.get("modified_at") or ""), "task_gone",
+                               "Задача «%s» (task=%s) пропала из проекта — удалена или убрана"
+                               % (clean(t["name"], NAME_CAP), gid)))
+        else:
+            new_pending[gid] = 1  # first miss — wait for confirmation next crawl
+
+    # ---- field changes
+    for gid, t in cur.items():
+        if gid not in prev:
+            continue
+        p = prev[gid]
+        occ = t.get("modified_at") or ""
+        if "due" in want and (p.get("due_on"), p.get("due_at")) != (t.get("due_on"), t.get("due_at")):
+            events.append((eid(gid, "due", "%s>%s@%s" % (fmt_due(p), fmt_due(t), occ)), "due",
+                           "Срок задачи «%s» (task=%s): %s → %s"
+                           % (clean(t["name"], NAME_CAP), gid, fmt_due(p), fmt_due(t))))
+        if p.get("completed") != t.get("completed"):
+            if t["completed"] and "completed" in want:
+                events.append((eid(gid, "completed", occ), "completed",
+                               "Задача «%s» (task=%s) закрыта" % (clean(t["name"], NAME_CAP), gid)))
+            elif not t["completed"] and "reopened" in want:
+                events.append((eid(gid, "reopened", occ), "reopened",
+                               "Задача «%s» (task=%s) переоткрыта" % (clean(t["name"], NAME_CAP), gid)))
+
+    # ---- comments (bounded by remaining request budget; unfinished → queue)
+    next_wm = {}       # gid -> (wm, wm_gids) to persist
+    still_queued = set()
+    if "comments" in want:
+        self_stories = self_story_gids(sdir)
+        candidates = []
+        for gid, t in cur.items():
+            p = prev.get(gid)
+            if p is None:
+                candidates.append(gid)  # new task may already carry comments
+            elif (t.get("modified_at") or "") > (p.get("modified_at") or "") or gid in comment_queue:
+                candidates.append(gid)
+        for gid in candidates:
+            p = prev.get(gid) or {}
+            wm = p.get("comment_wm") or base_as_of
+            wm_gids = set(p.get("comment_wm_gids") or [])
+            try:
+                stories = fetch_all_pages(token, budget, "/tasks/%s/stories" % gid, {
+                    "limit": 100,
+                    "opt_fields": "type,created_at,created_by.name,text"})
+            except BudgetExhausted:
+                # cursor NOT advanced — this task and the rest rescan next poll
+                still_queued.add(gid)
+                still_queued.update(candidates[candidates.index(gid)+1:])
+                log_err("request budget exhausted mid-comments — %d task(s) deferred"
+                        % len(still_queued))
+                break
+            except FetchError as e:
+                still_queued.add(gid)
+                log_err("stories fetch failed for %s (%s) — deferred" % (gid, e))
+                continue
+            best_wm, best_gids = wm, set(wm_gids)
+            for s in stories:
+                sgid = str(s.get("gid") or "")
+                if s.get("type") != "comment" or not re.fullmatch(r"[0-9]{1,32}", sgid):
+                    continue
+                c_at = s.get("created_at") or ""
+                # equality handled via gid set at the watermark — two stories
+                # with the same timestamp can't cause loss or dupes
+                if c_at < wm or (c_at == wm and sgid in wm_gids):
+                    continue
+                if sgid not in self_stories:
+                    author = ((s.get("created_by") or {}).get("name") or "кто-то") if isinstance(s.get("created_by"), dict) else "кто-то"
+                    events.append(("s" + sgid, "comments",
+                                   "Новый коммент в «%s» (task=%s) от %s: %s"
+                                   % (clean((cur.get(gid) or {}).get("name", ""), NAME_CAP), gid,
+                                      clean(author, 40), clean(s.get("text"), EXCERPT_CAP))))
+                if c_at > best_wm:
+                    best_wm, best_gids = c_at, {sgid}
+                elif c_at == best_wm:
+                    best_gids.add(sgid)
+            next_wm[gid] = (best_wm, sorted(best_gids))
+
+    # ---- journal: load (STRICT), append new (dedup by id), prune, rewrite atomically
+    journal = load_journal(journal_path)
+    if journal is None:
+        die("journal %s is corrupt/unreadable — refusing to touch it (undelivered events may be inside; fix or remove manually)" % journal_path, 0)
+    known = set(e["id"] for e in journal)
+    for evid, kind, text in events:
+        if evid in known:
+            continue
+        journal.append({"id": evid, "ts": ts, "type": kind, "line": visible_line(ts, text)})
+        known.add(evid)
+    cutoff = time.time() - args["replay_hours"] * 3600
+    def fresh(e):
+        try:
+            return datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc).timestamp() >= cutoff
+        except (KeyError, ValueError):
+            return False
+    journal = [e for e in journal if fresh(e)]
+    if len(journal) > JOURNAL_CAP:
+        # size cap wins over the replay window — make the eviction VISIBLE
+        # (undelivered events among the dropped ones are gone for good)
+        log_err("journal cap %d: dropping %d event(s) still inside the replay window"
+                % (JOURNAL_CAP, len(journal) - JOURNAL_CAP))
+        journal = journal[-JOURNAL_CAP:]
+    try:
+        atomic_write(journal_path, "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in journal))
+    except OSError as e:
+        log_err("journal write failed (%s) — not persisting snapshot either" % e)
+        sys.exit(0)  # journal-first invariant: without the journal, no snapshot advance
+
+    # ---- snapshot advance (journal already durable)
+    new_tasks = {}
+    for gid, t in cur.items():
+        t2 = dict(t)
+        p = prev.get(gid)
+        if gid in next_wm:
+            t2["comment_wm"], t2["comment_wm_gids"] = next_wm[gid][0], next_wm[gid][1]
+        elif p is not None:
+            t2["comment_wm"] = p.get("comment_wm") or base_as_of
+            t2["comment_wm_gids"] = p.get("comment_wm_gids") or []
+        else:
+            # brand-new task we could not scan yet: if it is queued for a
+            # comment rescan, the watermark must reach back to the PREVIOUS
+            # crawl (base_as_of) so nothing between the crawls is skipped;
+            # otherwise (comments disabled) crawl start is fine.
+            t2["comment_wm"] = base_as_of if gid in still_queued else crawl_start
+            t2["comment_wm_gids"] = []
+        new_tasks[gid] = t2
+    # keep still-pending gone tasks in the snapshot until confirmed
+    for gid in new_pending:
+        new_tasks[gid] = prev[gid]
+    snap_out = {"schema": SCHEMA_VERSION, "as_of": crawl_start, "tasks": new_tasks,
+                "pending_gone": new_pending, "comment_queue": sorted(still_queued)}
+    try:
+        atomic_write(snap_path, json.dumps(snap_out, ensure_ascii=False))
+    except OSError as e:
+        log_err("snapshot write failed: %s — journal already has the events (safe: next run dedups by id)" % e)
+
+    # ---- emit the whole replay window; the bridge dedups delivered ids
+    out = sys.stdout
+    for e in journal:
+        out.write("\x1eebid=%s\x1e%s\n" % (e["id"], e["line"]))
+    out.flush()
+
+if __name__ == "__main__":
+    main()

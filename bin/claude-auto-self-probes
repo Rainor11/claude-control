@@ -41,7 +41,7 @@ MAX_PROBES_DEFAULT=20      # default ceiling on total probes when spec.json has 
 MIN_INTERVAL=300           # floor on interval_sec a worker may set (5 min)
 MAX_INTERVAL=604800        # 1 week
 MAX_LOOKBACK=336           # hours (14 days)
-WL_ADD='gmail tg asana timer date-gate'   # adapter TYPES a worker may ADD (NOT emit-lines)
+WL_ADD='gmail tg asana asana-project timer date-gate'   # adapter TYPES a worker may ADD (NOT emit-lines)
 REASON=""                       # optional operator-facing reason (--reason) for a change
 
 die() { echo "self-probes: $*" >&2; exit 1; }
@@ -284,7 +284,7 @@ cmd_remove() {
 
 # add: build the adapter argv ourselves from typed params (NEVER a raw cmd).
 cmd_add() {
-  local type="" name="" query="" account="alp" chat_id="" task="" author="" label="" lookback="" interval="" gate="" message=""
+  local type="" name="" query="" account="alp" chat_id="" task="" author="" label="" lookback="" interval="" gate="" message="" project="" events=""
   # Every value-taking flag consumes its value with the SAME guarded pattern as
   # --reason: `shift; [ $# -gt 0 ] && shift || true`. A bare `shift 2` on a trailing
   # valueless flag (e.g. `... --message`) fails ("count out of range") but leaves $#
@@ -300,6 +300,8 @@ cmd_add() {
       --chat-id) chat_id="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --task) task="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --author) author="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --project) project="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+      --events) events="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --label) label="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --lookback-hours) lookback="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
       --interval) interval="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
@@ -316,7 +318,11 @@ cmd_add() {
   current_probes | jq -e --arg n "$name" 'any(.[]; .name==$n) | not' >/dev/null 2>&1 || die "add: probe '$name' already exists (remove it first)"
 
   # interval default per type + floor
-  [ -n "$interval" ] || { [ "$type" = timer ] && interval=86400 || interval=3600; }
+  [ -n "$interval" ] || case "$type" in
+    timer) interval=86400 ;;
+    asana-project) interval=900 ;;   # whole-project feed: few requests per tick, keep it responsive
+    *) interval=3600 ;;
+  esac
   valid_interval "$interval"
   if [ -n "$lookback" ]; then
     printf '%s' "$lookback" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "add: --lookback-hours must be a number"
@@ -359,6 +365,28 @@ cmd_add() {
         cmd_json="$(jq -nc --arg a "$adapter" --arg t "$task" --arg sd "$STATE_DIR" \
           '[$a,"--task",$t,"--state-dir",$sd]')"
       fi ;;
+    asana-project)
+      printf '%s' "$project" | grep -qE '^[0-9]+$' || die "add asana-project: --project <numeric gid> required"
+      # State (snapshot/journal) is PER PROJECT — a second probe on the same
+      # project would fight over it (different --events would cross-filter).
+      current_probes | jq -e --arg p "$project" '
+        [ .[] | (.cmd // []) as $c
+          | select( (($c[0] // "")|split("/")|map(select(length>0))|last)=="asana-project" )
+          | ([ range(1; ($c|length)) | select($c[.]=="--project") | ($c[.+1] // "") ] | first // "")
+        ] | index($p) | not' >/dev/null 2>&1 \
+        || die "add asana-project: a probe for project $project already exists (remove it first)"
+      if [ -n "$events" ]; then
+        printf '%s' "$events" | grep -qE '^(task_new|task_gone|due|completed|reopened|comments)(,(task_new|task_gone|due|completed|reopened|comments))*$' \
+          || die "add asana-project: --events must be a csv subset of task_new,task_gone,due,completed,reopened,comments"
+      fi
+      adapter="$ADAPTERS_DIR/asana-project"; source="asana"
+      if [ -n "$events" ]; then
+        cmd_json="$(jq -nc --arg a "$adapter" --arg p "$project" --arg e "$events" --arg sd "$STATE_DIR" \
+          '[$a,"--project",$p,"--events",$e,"--state-dir",$sd]')"
+      else
+        cmd_json="$(jq -nc --arg a "$adapter" --arg p "$project" --arg sd "$STATE_DIR" \
+          '[$a,"--project",$p,"--state-dir",$sd]')"
+      fi ;;
     timer)
       [[ "$label" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "add timer: --label required, chars [a-zA-Z0-9_.-]"
       adapter="$ADAPTERS_DIR/timer-tick"; source="timer"
@@ -388,9 +416,12 @@ cmd_add() {
   # in the trusted adapters dir (TCB), not a swapped symlink.
   [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ] || die "add: adapter '$adapter' missing / not a regular executable"
 
-  local probe new detail
-  probe="$(jq -nc --arg n "$name" --arg s "$source" --argjson iv "$interval" --argjson c "$cmd_json" \
-    '{name:$n, source:$s, interval_sec:$iv, cmd:$c}')"
+  local probe new detail tmo_json="null"
+  # asana-project crawls a whole project (+ stories of changed tasks) — the
+  # watcher's default 30s probe timeout is too tight for a large project.
+  [ "$type" = asana-project ] && tmo_json=120
+  probe="$(jq -nc --arg n "$name" --arg s "$source" --argjson iv "$interval" --argjson c "$cmd_json" --argjson t "$tmo_json" \
+    '{name:$n, source:$s, interval_sec:$iv, cmd:$c} + (if $t != null then {timeout_sec:$t} else {} end)')"
   new="$(current_probes | jq -c --argjson p "$probe" '. + [$p]')"
   if [ "$type" = date-gate ]; then
     detail="📅 сработает $(date -d "${gate:0:4}-${gate:4:2}-${gate:6:2}" +%d.%m.%Y 2>/dev/null)"
@@ -420,6 +451,10 @@ claude-auto-self-probes — управление СВОИМИ датчиками
   add --type gmail     --name N --query "..." [--account alp|rainor] [--lookback-hours H] [--interval S] [--reason "..."]
   add --type tg        --name N --chat-id <id> [--lookback-hours H] [--interval S] [--reason "..."]
   add --type asana     --name N --task <gid> [--author <gid>] [--interval S] [--reason "..."]
+  add --type asana-project --name N --project <gid> [--events csv] [--interval S] [--reason "..."]
+        ВЕСЬ проект Asana одним датчиком: новые/пропавшие задачи, сдвиги сроков,
+        закрытие/переоткрытие, новые комменты. events ⊆ task_new,task_gone,due,
+        completed,reopened,comments (по умолчанию все). Один датчик на проект.
   add --type date-gate --name N --at <YYYYMMDD> --message "..." [--interval S] [--reason "..."]
         разовое напоминание к дате — будит ОДИН раз на/после даты, потом молчит.
         ПРЕДПОЧТИТЕЛЬНО для напоминаний «сделать X к <дате>». После срабатывания

@@ -107,6 +107,7 @@ emit_identity_sections() {
   echo "  claude-auto-self-probes retime <name> <seconds> [--reason \"...\"]"
   echo "  claude-auto-self-probes remove <name> [--reason \"...\"]"
   echo "  claude-auto-self-probes add --type gmail|tg|asana --name N … [--reason \"...\"]"
+  echo "  claude-auto-self-probes add --type asana-project --name N --project <gid> [--events csv]  # a WHOLE Asana project: new/gone tasks, due changes, completion, comments"
   echo "  claude-auto-self-probes add --type date-gate --name N --at <YYYYMMDD> --message \"…\"   # one-shot reminder at a date"
   echo "  claude-auto-self-probes add --type timer     --name N --label <label>                  # recurring tick"
   echo "Add \`--reason \"…\"\` so the operator sees WHY. This touches only YOUR probes — never"
@@ -434,7 +435,7 @@ write_worker_settings() {
         SessionStart:[{hooks:[{type:"command", command:$identity}]}],
         PreToolUse:[{matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email",
                      hooks:[{type:"command", command:$pgate}]}],
-        PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story",
+        PostToolUse:[{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story|mcp__asana__asana_create_task|mcp__asana__asana_create_subtask|mcp__asana__asana_duplicate_task",
                       hooks:[{type:"command", command:$ledger}]},
                      {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email",
                       hooks:[{type:"command", command:$gledger}]}],
@@ -950,6 +951,12 @@ probe_has_baseline() {
       cid="$sign$((10#$cid))"
       [ -f "$sdir/.tg-messages-$cid.json" ]
       ;;
+    asana-project)
+      local proj
+      proj="$(probe_argv_val "$p" --project)"
+      [[ "$proj" =~ ^[0-9]+$ ]] || return 1
+      [ -f "$sdir/.asana-project-$proj.snapshot.json" ]
+      ;;
     *) return 0 ;;  # не stateful-адаптер — baseline не нужен
   esac
 }
@@ -972,7 +979,7 @@ cmd_sleep() {
   if [ -f "$cfg" ]; then
     while IFS= read -r p; do
       pname="$(jq -r '.name' <<<"$p")"
-      if jq -e '.cmd[0] | test("(gmail-messages|tg-messages|asana-comments)$")' <<<"$p" >/dev/null 2>&1; then
+      if jq -e '.cmd[0] | test("(gmail-messages|tg-messages|asana-comments|asana-project)$")' <<<"$p" >/dev/null 2>&1; then
         probe_has_baseline "$name" "$p" || \
           echo "  ВНИМАНИЕ: у пробы '$pname' нет прогретого baseline — первое событие после сна рискует пропасть; разбуди воркера на один тик watcher'а перед сном" >&2
       fi
@@ -1155,7 +1162,7 @@ cmd_remove() {
 # Adapters that keep per-target dedup/baseline state; we force --state-dir to the
 # worker's own state dir so several workers don't collide in the shared
 # adapters/state dir (and a crafted config can't redirect that state elsewhere).
-STATEFUL_ADAPTERS_RE='(gmail-messages|tg-messages|asana-comments)'
+STATEFUL_ADAPTERS_RE='(gmail-messages|tg-messages|asana-comments|asana-project)'
 
 # probes_validate_normalize <infile> <statedir>  — print a HARDENED, normalized
 # probe config to stdout, or `die`. Shared by BOTH `adopt --probe-config` and
@@ -1202,6 +1209,16 @@ probes_validate_normalize() {
     tmo="$(jq -r '.timeout_sec // 30' <<<"$p")"
     { [[ "$tmo" =~ ^[0-9]+$ ]] && [ "$tmo" -ge 1 ] && [ "$tmo" -le 300 ]; } || die "probes: probe '$name_i' timeout_sec must be integer 1..300"
   done
+
+  # asana-project: ONE probe per project per worker (snapshot/journal are
+  # per-project files — two probes would share them but keep separate .seen,
+  # double-delivering every event; different --events would cross-filter).
+  local dupproj
+  dupproj="$(jq -r '[ .probes[]? | (.cmd // []) as $c
+      | select( (($c[0] // "" | tostring)|split("/")|map(select(length>0))|last)=="asana-project" )
+      | ([ range(1; ($c|length)) | select(($c[.]|tostring)=="--project") | (($c[.+1] // "")|tostring) ] | last // "") ]
+    | group_by(.) | map(select(length>1) | .[0]) | map(select(.!="")) | first // empty' "$infile" 2>/dev/null)"
+  [ -z "$dupproj" ] || die "probes: several asana-project probes watch the same project $dupproj — state is per-project, keep exactly ONE probe per project"
 
   # `split | map(select(length>0)) | last` matches basename even for a trailing
   # slash (so cmd[0]="x/" canonicalizes to "$ad/x", agreeing with the -f check).
@@ -1274,7 +1291,8 @@ cmd_set_probes() {
   # Best-effort: must never fail an already-applied set-probes (no `set -e` here).
   local _eb_keyjq='
     (.cmd // []) as $c
-    | if (($c|length)>0) and (($c[0]|split("/")|map(select(length>0))|last)=="asana-comments")
+    | (if ($c|length)>0 then ($c[0]|split("/")|map(select(length>0))|last) else "" end) as $base
+    | if $base=="asana-comments"
       then (reduce range(1; ($c|length)) as $i
               ({t:"",a:"",pos:""};
                (($c[$i] // "") | if type=="string" then . else tostring end) as $x
@@ -1285,27 +1303,92 @@ cmd_set_probes() {
                  else . end))
            | (if .t=="" then .pos else .t end) as $task
            | "asana\t\($task)\t\(.a)"
+      elif $base=="asana-project"
+      then (reduce range(1; ($c|length)) as $i
+              ({p:""};
+               (($c[$i] // "") | if type=="string" then . else tostring end) as $x
+               | if $x=="--project" then .p=(($c[$i+1]//"")|tostring) else . end))
+           | "asana-project\t\(.p)"
       else "other" end'
-  local _old_names="" _new_names="" _surv_keys="" _old_meta="" _nm=""
+  local _old_names="" _new_names="" _surv_kn="" _old_meta="" _nm=""
   _old_names="$(printf '%s' "$_old_json" | jq -r '.probes[]?.name // empty' 2>/dev/null || true)"
   _new_names="$(jq -r '.probes[]?.name // empty' "$cfg" 2>/dev/null || true)"
   _old_meta="$(printf '%s' "$_old_json" | jq -r "[.probes[]? | {name, k:($_eb_keyjq)}] | .[] | \"\(.name)\t\(.k)\"" 2>/dev/null || true)"
-  _surv_keys="$(jq -r "[.probes[]? | ($_eb_keyjq)] | .[]" "$cfg" 2>/dev/null | awk -F'\t' '$1=="asana"{k=$2; if($3!="")k=$2"-"$3; print k}' || true)"
+  # survivors as "<kind>:<key>\t<name>" — the key part tells whether shared
+  # per-target state must be kept; the name part lets a RENAME migrate the
+  # removed probe's .seen into its successor (else the successor's empty .seen
+  # would replay the entire journal / post-baseline window as new).
+  _surv_kn="$(jq -r "[.probes[]? | {name, k:($_eb_keyjq)}] | .[] | \"\(.k)\t\(.name)\"" "$cfg" 2>/dev/null \
+    | awk -F'\t' '$1=="asana"{k=$2; if($3!="")k=$2"-"$3; print "asana:"k"\t"$4}
+                  $1=="asana-project"{if($2!="")print "asana-project:"$2"\t"$3}' || true)"
   while IFS= read -r _nm; do
     [ -n "$_nm" ] || continue
     printf '%s\n' "$_new_names" | grep -qxF -- "$_nm" && continue   # still present -> keep
     local _id; _id="$(printf '%s' "$_nm" | tr -c 'A-Za-z0-9_-' '_')"
-    rm -f "$statedir/$_id.seen" "$statedir/.lastrun-$_id" "$statedir/$_id.dead" 2>/dev/null || true
-    local _line _kind _task _author _key
+    # Resolve the removed probe's shared-state key BEFORE deleting anything.
+    local _line _kind _task _author _key="" _proj
     _line="$(printf '%s\n' "$_old_meta" | awk -F'\t' -v n="$_nm" '$1==n{print; exit}')"
     _kind="$(printf '%s' "$_line" | awk -F'\t' '{print $2}')"
     if [ "$_kind" = "asana" ]; then
       _task="$(printf '%s' "$_line" | awk -F'\t' '{print $3}')"
       _author="$(printf '%s' "$_line" | awk -F'\t' '{print $4}')"
       if [[ "$_task" =~ ^[0-9]+$ ]] && { [ -z "$_author" ] || [[ "$_author" =~ ^[0-9]+$ ]]; }; then
-        _key="$_task"; [ -n "$_author" ] && _key="${_task}-${_author}"
-        printf '%s\n' "$_surv_keys" | grep -qxF -- "$_key" || rm -f "$statedir/.asana-comments-$_key.baseline" 2>/dev/null || true
+        _key="asana:$_task"; [ -n "$_author" ] && _key="asana:${_task}-${_author}"
       fi
+    elif [ "$_kind" = "asana-project" ]; then
+      _proj="$(printf '%s' "$_line" | awk -F'\t' '{print $3}')"
+      [[ "$_proj" =~ ^[0-9]+$ ]] && _key="asana-project:$_proj"
+    fi
+    # Ident collision: names are unique, but their sanitized idents may not be
+    # ("a.b" and "a_b" both -> "a_b"). If a SURVIVING probe shares the removed
+    # probe's ident, the per-ident files ($_id.seen/.dead/...) now belong to the
+    # survivor — deleting them would wipe its dedup state and replay everything.
+    # The survivor simply inherits them; only per-target state logic runs below.
+    local _collide=0 _x
+    while IFS= read -r _x; do
+      [ -n "$_x" ] || continue
+      [ "$(printf '%s' "$_x" | tr -c 'A-Za-z0-9_-' '_')" = "$_id" ] && { _collide=1; break; }
+    done <<< "$_new_names"
+    # RENAME case: a survivor keeps watching the same target -> merge the old
+    # .seen into the survivor's .seen (delivered stays delivered), keep state.
+    local _surv_nm=""
+    if [ -n "$_key" ]; then
+      _surv_nm="$(printf '%s\n' "$_surv_kn" | awk -F'\t' -v k="$_key" '$1==k{print $2; exit}')"
+    fi
+    if [ "$_collide" -eq 0 ]; then
+      # Migrate .seen AND .dead to the successor (delivered stays delivered,
+      # quarantined stays quarantined — the 7d journal would otherwise re-fire
+      # both). A file is deleted ONLY after its merge verifiably succeeded —
+      # a failed merge (disk full, perms) must not destroy the only good copy.
+      local _f _dst _rm_ok
+      if [ -n "$_surv_nm" ]; then
+        local _sid; _sid="$(printf '%s' "$_surv_nm" | tr -c 'A-Za-z0-9_-' '_')"
+        for _f in seen dead; do
+          [ -f "$statedir/$_id.$_f" ] || continue
+          [ "$_sid" != "$_id" ] || continue
+          _dst="$statedir/$_sid.$_f"; _rm_ok=1
+          if cat "$statedir/$_id.$_f" >> "$_dst" 2>/dev/null \
+             && sort -u -o "$_dst" "$_dst" 2>/dev/null; then :; else _rm_ok=0; fi
+          [ "$_rm_ok" -eq 1 ] && rm -f "$statedir/$_id.$_f" 2>/dev/null || true
+        done
+        # leftovers only when a merge failed; runtime stamps are always safe to drop
+        rm -f "$statedir/.lastrun-$_id" "$statedir/.dispatcher-lastrun-$_id" 2>/dev/null || true
+      else
+        rm -f "$statedir/$_id.seen" "$statedir/.lastrun-$_id" "$statedir/$_id.dead" \
+              "$statedir/.dispatcher-lastrun-$_id" 2>/dev/null || true
+      fi
+    fi
+    # Per-target shared state: drop ONLY when no survivor watches the target.
+    if [ -n "$_key" ] && [ -z "$_surv_nm" ]; then
+      case "$_key" in
+        asana:*)         rm -f "$statedir/.asana-comments-${_key#asana:}.baseline" 2>/dev/null || true ;;
+        # .lock is deliberately KEPT: a still-running adapter holds flock on
+        # that inode — deleting it would let a re-added probe start a second
+        # concurrent crawl on a fresh inode (single-flight broken). A 0-byte
+        # leftover lock is harmless.
+        asana-project:*) rm -f "$statedir/.asana-project-${_key#asana-project:}.snapshot.json" \
+                               "$statedir/.asana-project-${_key#asana-project:}.journal.jsonl" 2>/dev/null || true ;;
+      esac
     fi
   done <<< "$_old_names"
 }
@@ -1523,7 +1606,7 @@ cmd_upgrade() {
     | .hooks.PostToolUse = (
         [ (.hooks.PostToolUse // [])[]
           | select( ([ .hooks[]?.command // empty | select(test("claude-auto-(asana|gmail)-self-ledger")) ] | length) == 0 ) ]
-        + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story", hooks:[{type:"command", command:$ledgercmd}]},
+        + [{matcher:"mcp__asana__asana_create_task_comment|mcp__asana__asana_create_task_story|mcp__asana__asana_create_task|mcp__asana__asana_create_subtask|mcp__asana__asana_duplicate_task", hooks:[{type:"command", command:$ledgercmd}]},
            {matcher:"mcp__google-workspace__send_email|mcp__google-workspace-rainor__send_email", hooks:[{type:"command", command:$gledgercmd}]}] )
     | .hooks.PreToolUse = (
         [ (.hooks.PreToolUse // [])[]

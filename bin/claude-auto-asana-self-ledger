@@ -16,6 +16,12 @@
 # violating the requirement that human inputs reach the worker. This hook runs
 # inside THIS worker's process, so it records only what THIS worker posted.
 #
+# The same trick covers TASKS for the asana-project probe: a worker that itself
+# creates a task in a watched project would be woken by its own task_new event.
+# Task-creating tools route to a second ledger .asana-self-tasks ('<epoch>\t<gid>'
+# lines — entries EXPIRE in the adapter, so a later legit remove/re-add of the
+# same task is not suppressed forever).
+#
 # Contract: PostToolUse hook. stdin = the hook JSON (has .tool_name, .tool_input,
 # .tool_response). $1 = the worker's event-bridge state dir (where the adapter
 # reads the ledger). ALWAYS exits 0 — never blocks the tool. A parse miss is
@@ -25,8 +31,6 @@ set -u
 
 STATE_DIR="${1:-}"
 [ -n "$STATE_DIR" ] || exit 0
-LEDGER="$STATE_DIR/.asana-self-stories"
-LOCK="$STATE_DIR/.asana-self-stories.lock"
 ERRLOG="$STATE_DIR/asana-self-ledger.errors.log"
 CAP=2000   # keep the last N gids; MUST stay >> adapter fetch window (limit=100)
 
@@ -35,6 +39,20 @@ command -v jq >/dev/null 2>&1 || exit 0
 payload="$(cat 2>/dev/null)" || exit 0
 [ -n "$payload" ] || exit 0
 
+# Route by tool: task-creating tools -> .asana-self-tasks; everything else
+# (the comment/story tools of the original matcher) -> .asana-self-stories.
+tool="$(printf '%s' "$payload" | jq -r '.tool_name // ""' 2>/dev/null)" || tool=""
+case "$tool" in
+  *asana_create_task|*asana_create_subtask|*asana_duplicate_task)
+    KIND=task
+    LEDGER="$STATE_DIR/.asana-self-tasks"
+    LOCK="$STATE_DIR/.asana-self-tasks.lock" ;;
+  *)
+    KIND=story
+    LEDGER="$STATE_DIR/.asana-self-stories"
+    LOCK="$STATE_DIR/.asana-self-stories.lock" ;;
+esac
+
 # Defensive GID extraction. tool_response may be the raw MCP result object
 # ({content:[{type:text,text:"<json>"}]}), an unwrapped content array, or a JSON
 # string; the inner story json may be {gid} or {data:{gid}}. Pull the first
@@ -42,12 +60,15 @@ payload="$(cat 2>/dev/null)" || exit 0
 # NOTE on optional access: `.data.gid?` only guards the final `.gid` — `.data` on
 # a string still throws an UNSUPPRESSED error and aborts the whole generator. Use
 # `.data?.gid?` so the `.data` index is optional too.
+# new_task paths FIRST: asana_duplicate_task returns a JOB object whose .gid is
+# the job, not the task — the task lives in .new_task.gid. For every other tool
+# the new_task paths are absent and the plain .gid wins as before.
 gid="$(printf '%s' "$payload" | jq -er '
   def gids:
-    ( .gid?, .data?.gid?,
-      ( select(type=="object") | .content[]? | select(.type?=="text") | .text? | fromjson? | (.gid?, .data?.gid?) ),
-      ( select(type=="array")  | .[]?      | select(.type?=="text") | .text? | fromjson? | (.gid?, .data?.gid?) ),
-      ( select(type=="string") | fromjson? | (.gid?, .data?.gid?) ) );
+    ( .new_task?.gid?, .data?.new_task?.gid?, .gid?, .data?.gid?,
+      ( select(type=="object") | .content[]? | select(.type?=="text") | .text? | fromjson? | (.new_task?.gid?, .data?.new_task?.gid?, .gid?, .data?.gid?) ),
+      ( select(type=="array")  | .[]?      | select(.type?=="text") | .text? | fromjson? | (.new_task?.gid?, .data?.new_task?.gid?, .gid?, .data?.gid?) ),
+      ( select(type=="string") | fromjson? | (.new_task?.gid?, .data?.new_task?.gid?, .gid?, .data?.gid?) ) );
   [ (.tool_response | gids) ]
   | map(select(type=="string" and test("^[0-9]{1,32}$")))
   | first // empty
@@ -87,8 +108,17 @@ if [ -L "$LEDGER" ]; then
   { printf '[%s] refusing (in-lock): %s is a symlink\n' "$(date -u +%FT%TZ 2>/dev/null)" "$LEDGER"; } >> "$ERRLOG" 2>/dev/null || true
   exit 0
 fi
-if ! grep -qxF "$gid" "$LEDGER" 2>/dev/null; then
-  printf '%s\n' "$gid" >> "$LEDGER" 2>/dev/null || exit 0
+# Entry format & dedup differ per ledger kind: stories = bare gid lines,
+# tasks = '<epoch>\t<gid>' (the adapter expires task entries by the epoch).
+if [ "$KIND" = task ]; then
+  entry="$(date +%s)	$gid"
+  is_dup() { awk -F'\t' -v g="$gid" '$2==g{f=1} END{exit !f}' "$LEDGER" 2>/dev/null; }
+else
+  entry="$gid"
+  is_dup() { grep -qxF "$gid" "$LEDGER" 2>/dev/null; }
+fi
+if ! is_dup; then
+  printf '%s\n' "$entry" >> "$LEDGER" 2>/dev/null || exit 0
   lines=$(wc -l < "$LEDGER" 2>/dev/null || echo 0)
   if [ "${lines:-0}" -gt "$CAP" ]; then
     tmp="$(mktemp "$STATE_DIR/.ledger.XXXXXX" 2>/dev/null)" && {
