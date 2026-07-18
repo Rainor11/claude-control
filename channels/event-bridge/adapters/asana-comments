@@ -11,6 +11,23 @@
 # comments created strictly after baseline, then advance baseline. The bridge
 # also dedups by line hash, so restarts never double-push.
 #
+# EDIT detection: an edited story keeps its gid and created_at (only text and
+# is_edited change; is_edited stays true forever, so it cannot distinguish a
+# 2nd edit from the 1st). We therefore keep a per-story CONTENT fingerprint
+# (sha256, first 32 hex) in .asana-comments-<key>.fingerprints ("gid<TAB>hash"
+# lines). A story whose current content differs from its stored fingerprint is
+# emitted as an "[edited]" line whose hidden marker id is <gid>@e<current-hash>
+# — a distinct dedup key per content VERSION. Stored fingerprints are
+# write-once per gid (content as FIRST seen): like the ts baseline, we never
+# advance them on print — the line re-prints every poll and dedup-after-delivery
+# stays the bridge's job (.seen after successful inject), so an edit whose
+# injection failed (worker busy) is retried, not lost, while a delivered edit
+# never re-wakes (same key). First fetch with no fingerprint file registers ALL
+# existing comments silently (migration: history is never replayed as edits).
+# Both the fingerprint state and the "[edited]" emission are gated on
+# EB_ASANA_EMIT_ID=1 — a legacy (marker-unaware) runner gets the byte-identical
+# old behavior.
+#
 # Token: ASANA_ACCESS_TOKEN from /home/rainor/server/.env (Bearer via curl
 # --config so it never appears in argv).
 #
@@ -18,7 +35,9 @@
 #   asana-comments --task <gid> [--author <gid>] [--state-dir <dir>] [--project <gid>]
 set -u
 
-ENV_FILE=/home/rainor/server/.env
+# Test seams (mirror adapters/asana-project): env-file and API-base overrides.
+ENV_FILE="${ASANA_COMMENTS_ENV_FILE:-/home/rainor/server/.env}"
+API_BASE="${ASANA_COMMENTS_API_BASE:-https://app.asana.com/api/1.0}"
 STATE_DIR_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)/state"
 
 TASK_GID=""
@@ -50,9 +69,11 @@ ASANA_TOKEN=$(printf '%s' "$ASANA_TOKEN" | tr -d '[:space:]')
 mkdir -p "$STATE_DIR" 2>/dev/null || die "cannot create state dir $STATE_DIR"
 BASE_KEY="$TASK_GID"; [ -n "$AUTHOR_GID" ] && BASE_KEY="${TASK_GID}-${AUTHOR_GID}"
 BASELINE_FILE="${STATE_DIR}/.asana-comments-${BASE_KEY}.baseline"
+FPR_FILE="${STATE_DIR}/.asana-comments-${BASE_KEY}.fingerprints"
+FPR_TMP=""
 
 CURL_CFG=$(mktemp /tmp/.asana-comments-curl.XXXXXX) || die "mktemp curl cfg"
-trap 'rm -f "$CURL_CFG"' EXIT
+trap 'rm -f "$CURL_CFG" ${FPR_TMP:+"$FPR_TMP"}' EXIT
 chmod 600 "$CURL_CFG"
 printf 'header = "Authorization: Bearer %s"\n' "$ASANA_TOKEN" > "$CURL_CFG"
 
@@ -74,7 +95,7 @@ fetch_all_stories() {
   local pages="" page i=0
   # Follow Asana's own next_page.uri (opaque, already URL-encoded) rather than
   # hand-building &offset= — never assume the token's character set.
-  local next="https://app.asana.com/api/1.0/tasks/${TASK_GID}/stories?limit=100&opt_fields=gid,created_at,created_by.gid,created_by.name,text,type"
+  local next="${API_BASE}/tasks/${TASK_GID}/stories?limit=100&opt_fields=gid,created_at,created_by.gid,created_by.name,text,type"
   while [ -n "$next" ]; do
     i=$((i+1))
     if [ "$i" -gt "$SANITY_MAX_PAGES" ]; then
@@ -127,8 +148,9 @@ fi
 # of post-baseline author comments each poll; the bridge dedups what it already
 # delivered. The baseline only caps how far back we ever look (set on first run).
 # When EB_ASANA_EMIT_ID=1 (set only by a marker-aware event-bridge-watch), prepend a
-# HIDDEN stable-id marker  \x1eebid=<story_gid>\x1e  so the watcher can dedup by the
-# immutable story gid instead of the whole line (an edited comment no longer re-fires).
+# HIDDEN stable-id marker  \x1eebid=<story_gid>\x1e  so the watcher can dedup by the immutable story gid instead of the whole
+# line (an edited comment does not re-fire THIS line; the edit-detection block below
+# emits it as its own "[edited]" event instead).
 # The VISIBLE part after the marker is byte-identical to the legacy line, so an old
 # (marker-unaware) watcher — which never sets the env — keeps getting the exact prior
 # output, and the watcher's legacy-hash back-compat path recognizes already-seen lines.
@@ -142,4 +164,71 @@ printf '%s' "$combined" | jq -r --arg ts "$BASELINE_TS" --arg author "$AUTHOR_GI
   | (if $emitid=="1" then "ebid=\((.gid // "")|tostring)" else "" end)
     + "[asana \(.created_at)] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
 '
+
+# --- edit detection (marker-aware runners only; see header) -------------------
+# The fingerprint map covers EVERY comment story regardless of baseline/author/
+# self filters (those apply at EMISSION) — edits of PRE-baseline comments are
+# detected too, which the ts-window above can never see.
+if [ "${EB_ASANA_EMIT_ID:-}" = "1" ]; then
+  # "gid<TAB>base64(text)" per comment story; the fingerprint is sha256 of the
+  # @base64 string (deterministic for a given text; first 32 hex, like the
+  # watcher's legacy hash).
+  fpr_tsv=$(printf '%s' "$combined" | jq -r '
+    .data[] | select(.type=="comment")
+    | [((.gid // "") | tostring), ((.text // "") | @base64)] | @tsv')
+  if [ ! -f "$FPR_FILE" ]; then
+    # Migration/first fetch: register every existing comment silently — history
+    # (including pre-deploy edits) must never replay as "[edited]". Temp+mv in
+    # the state dir so a crash mid-write can't leave a torn map (a torn hash
+    # would fire a spurious edit).
+    FPR_TMP=$(mktemp "${FPR_FILE}.XXXXXX" 2>/dev/null) && {
+      while IFS=$'\t' read -r gid b64; do
+        [ -n "$gid" ] || continue
+        printf '%s\t%s\n' "$gid" "$(printf '%s' "$b64" | sha256sum | cut -c1-32)"
+      done <<< "$fpr_tsv" > "$FPR_TMP"
+      mv -f "$FPR_TMP" "$FPR_FILE" && FPR_TMP=""
+    }
+  else
+    # Load stored fingerprints (last line wins — a raced duplicate registration
+    # then converges on the newer content instead of firing a spurious edit).
+    declare -A FPR=()
+    while IFS=$'\t' read -r gid h; do
+      [ -n "$gid" ] && FPR[$gid]="$h"
+    done < "$FPR_FILE"
+    changed=""   # "gid<TAB>current-hash" lines -> formatted by jq below
+    while IFS=$'\t' read -r gid b64; do
+      [ -n "$gid" ] || continue
+      h=$(printf '%s' "$b64" | sha256sum | cut -c1-32)
+      if [ -z "${FPR[$gid]:-}" ]; then
+        # First sighting of this gid: register only (single appended line —
+        # O_APPEND, no torn-map risk). The new-comment window above already
+        # emits it; a same-poll create+edit is indistinguishable anyway (we
+        # fingerprint the text as first seen).
+        printf '%s\t%s\n' "$gid" "$h" >> "$FPR_FILE"
+      elif [ "${FPR[$gid]}" != "$h" ]; then
+        changed+="$gid"$'\t'"$h"$'\n'
+      fi
+    done <<< "$fpr_tsv"
+    # Emit one "[edited]" line per changed story. Marker id <gid>@e<hash> gives
+    # the bridge a distinct dedup key per content VERSION: the same edit
+    # re-prints every poll (retry until delivered, then .seen silences it), a
+    # NEWER edit gets a new key and fires again. Author/self filters mirror the
+    # new-comment path (Asana does not expose WHO edited; created_by is the
+    # original author; edits of the worker's own ledgered comments stay muted).
+    if [ -n "$changed" ]; then
+      printf '%s' "$combined" | jq -r --arg author "$AUTHOR_GID" --arg self "$self_gids" --arg changed "$changed" '
+        ($self | split("\n") | map(select(length>0))) as $selfids
+        | ($changed | split("\n") | map(select(length>0) | split("\t") | {key: .[0], value: .[1]}) | from_entries) as $ch
+        | .data[]
+        | select(.type=="comment")
+        | ((.gid // "") | tostring) as $g
+        | $ch[$g] as $h
+        | select($h != null)
+        | select($author=="" or (.created_by.gid==$author))
+        | select($selfids | index($g) | not)
+        | "ebid=\($g)@e\($h)[asana \(.created_at)] [edited] \(.created_by.name // .created_by.gid): \((.text // "") | gsub("[\r\n]+";" "))"
+      '
+    fi
+  fi
+fi
 exit 0

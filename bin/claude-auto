@@ -1381,7 +1381,8 @@ cmd_set_probes() {
     # Per-target shared state: drop ONLY when no survivor watches the target.
     if [ -n "$_key" ] && [ -z "$_surv_nm" ]; then
       case "$_key" in
-        asana:*)         rm -f "$statedir/.asana-comments-${_key#asana:}.baseline" 2>/dev/null || true ;;
+        asana:*)         rm -f "$statedir/.asana-comments-${_key#asana:}.baseline" \
+                               "$statedir/.asana-comments-${_key#asana:}.fingerprints" 2>/dev/null || true ;;
         # .lock is deliberately KEPT: a still-running adapter holds flock on
         # that inode — deleting it would let a re-added probe start a second
         # concurrent crawl on a fresh inode (single-flight broken). A 0-byte
