@@ -2,6 +2,7 @@
   "allow": [
     "Bash(/opt/projects/active/claude-control/bin/dept-ledger:*)",
     "Bash(/opt/projects/active/claude-control/bin/dept-approve:*)",
+    "Bash(/opt/projects/active/claude-control/bin/dept-withdraw:*)",
     "Edit(//{{CLIENT_DIR_REL}}/**)",
     "Write(//{{CLIENT_DIR_REL}}/**)"
   ],
