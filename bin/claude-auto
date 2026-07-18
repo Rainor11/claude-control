@@ -1021,6 +1021,9 @@ cmd_rebase() {
     local fj fstate
     fj="$("$BIN_DIR/dept-memory-freshness" --brain-path "$bp" --session-id "$(jq -r '.session_id' "$spec")" \
       --stale-after-secs "$(stale_after_secs)" 2>/dev/null)" || fj=''
+    if [ -z "$fj" ]; then
+      echo "rebase: детектор свежести недоступен — STALE-гард пропущен" >&2
+    fi
     fstate="$(printf '%s' "$fj" | jq -r '.state // ""' 2>/dev/null)"
     # ПОВЕДЕНИЕ СОХРАНЕНО БАЙТ-В-БАЙТ (Codex крит. №6): старый код считал mem_mtime=0 и
     # сравнивал tx_mtime-0 с порогом → при живом транскрипте и НУЛЕВОЙ памяти всегда die.
