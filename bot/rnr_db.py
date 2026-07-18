@@ -98,8 +98,8 @@ def _init(conn):
             payload         TEXT,                     -- one-time-send body, or dept-approval
                                                        -- summary(+detail) (bound, shown + used)
             reason          TEXT,                     -- worker's stated reason (DATA, shown labeled)
-            status          TEXT NOT NULL DEFAULT 'open',  -- open|approved|sending|denied|executed|failed
-            decided_via     TEXT,                     -- 'button'
+            status          TEXT NOT NULL DEFAULT 'open',  -- open|approved|sending|denied|executed|failed|withdrawn
+            decided_via     TEXT,                     -- 'button' | 'worker' (phase 4 withdraw)
             decided_at      TEXT,
             executed_at     TEXT,                     -- action performed
             notified_at     TEXT,                     -- outcome injected back to the worker (terminal)
@@ -370,6 +370,47 @@ def claim_approval(qid, decision, decided_via="button"):
         conn.close()
 
 
+def claim_withdraw(event_id, worker, reason=None):
+    """Phase 4 (R14/R16): atomic once-only claim for a WORKER withdrawing THEIR OWN
+    dept-approval card. Keyed by arg_value=event_id (not qid — dept-withdraw only knows
+    the ledger event_id, never the bot's internal qid). Authorization is INSIDE the
+    single atomic UPDATE (worker=? AND status='open') — a separate SELECT-then-UPDATE
+    would TOCTOU-race the operator's ✅/❌ (claim_approval, same WHERE status='open'
+    invariant). First writer of the two wins; this is the SQLite-side half of the race —
+    dept-withdraw only proceeds to write `withdrawn` into the ledger after this call
+    succeeds (see bin/dept-withdraw step 1 vs step 2 ordering comment).
+
+    Returns:
+      'withdrawn' — first successful claim.
+      'already'   — idempotent repeat: THIS worker already withdrew it (a prior run's
+                    ledger step may have failed after this SQLite step succeeded;
+                    dept-withdraw's retry must reach the ledger without erroring here).
+      None        — not found under arg_kind=event_id for this worker, or the row is
+                    no longer 'open' (operator's button already decided it, or some
+                    other worker's arg_value collided) — caller must fail-closed and
+                    NOT write to the ledger.
+    """
+    conn = connect()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE approvals SET status='withdrawn', decided_via='worker', decided_at=?, result=? "
+                "WHERE arg_kind='event_id' AND arg_value=? AND worker=? AND status='open'",
+                (now_iso(), _sane_text(reason), event_id, worker),
+            )
+            if cur.rowcount == 1:
+                return "withdrawn"
+            row = conn.execute(
+                "SELECT status FROM approvals WHERE arg_kind='event_id' AND arg_value=? AND worker=?",
+                (event_id, worker),
+            ).fetchone()
+            if row and row["status"] == "withdrawn":
+                return "already"
+            return None
+    finally:
+        conn.close()
+
+
 def lease_sending(qid):
     """At-most-once guard for the non-idempotent one-time-send: atomically move
     approved → sending. Returns the row if WE won the lease, else None (so a crash
@@ -554,6 +595,11 @@ def main(argv=None):
     sp = sub.add_parser("get-appr-by-qid")
     sp.add_argument("--qid", required=True)
 
+    sp = sub.add_parser("withdraw-approval")
+    sp.add_argument("--event-id", required=True)
+    sp.add_argument("--worker", required=True)
+    sp.add_argument("--reason")
+
     a = p.parse_args(argv)
 
     if a.cmd == "init":
@@ -597,6 +643,12 @@ def main(argv=None):
         return 0
     if a.cmd == "get-appr-by-qid":
         _emit(get_appr_by_qid(a.qid)); return 0
+    if a.cmd == "withdraw-approval":
+        # exit 0 on 'withdrawn' (first claim) AND 'already' (idempotent repeat by the
+        # SAME worker) — dept-withdraw's retry-after-ledger-crash path (R14) must not
+        # error here a second time. exit 1 on None (not mine / not found / not open
+        # anymore) — dept-withdraw's `||` turns that into fail-closed die().
+        return 0 if claim_withdraw(a.event_id, a.worker, a.reason) else 1
     return 1
 
 

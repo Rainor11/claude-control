@@ -30,7 +30,7 @@ const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
 // Диспетчер помечает заявку executing ДО запуска исполнителя в отдельном юните (dept-exec-runner),
 // чтобы следующий тик/прогон видел её НЕ approved (effectiveStatus) и не запускал второй
 // исполнитель на ту же заявку — см. cmdApprovalExec ниже и wiki-бриф P3-Task-11fix.
-const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed', 'executing'];
+const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed', 'executing', 'withdrawn'];
 // Типы событий, которые воркер не может писать generic-командой `append` (дыра 17.07).
 // Гард К3 (assertNotWorkerSession) стоял только на approval-resolve/approval-exec, а
 // `append --kind approval_status --data '{"ref":…,"status":"approved"}'` писал ТОТ ЖЕ
@@ -394,10 +394,63 @@ function cmdApprovalResolve(a) {
         const err = new Error('approval-resolve: аппрув уже исполняется (executing) — менять решение поздно');
         err.cliError = true; throw err;
       }
+      // Фаза 4 (R14, второй ремень против гонки withdraw ↔ ✅): dept-withdraw гасит карточку
+      // в SQLite ПЕРВОЙ, а ledger пишет ВТОРЫМ — окно между этими шагами оператор мог успеть
+      // нажать ✅ до того, как бот увидел status!='open'. Без этой проверки такой approve
+      // проехал бы в ledger уже ПОСЛЕ withdrawn (last-write-wins) и раннер исполнил бы отозванное.
+      if (apr && eff === 'withdrawn') {
+        const err = new Error('approval-resolve: заявка отозвана автором — решать нечего');
+        err.cliError = true; throw err;
+      }
       if (apr && eff === a.status) return { event_id: ref, deduped: true };
       const data = { ref, status: a.status };
       validateEvent('approval_status', data);
       return brief(writeEventUnlocked('approval_status', data, a.actor));
+    });
+  } catch (e) {
+    if (e && e.cliError) die(e.message);
+    throw e;
+  }
+  out(result);
+}
+
+// Логика допуска к отзыву — чистая и тестируемая. Вынесена из обработчика намеренно:
+// подделать /proc в тестах нельзя, а env-шов в callerWorkerName() открыл бы ровно ту
+// дыру, которую этот гард закрывает (Bash(dept-ledger:*) у воркеров в allow) — R16.
+// caller: имя воркера из /proc либо null (не сессия воркера).
+function authorizeWithdraw(caller, apr, eff) {
+  if (!caller) return { err: 'approval-withdraw: запускается только из сессии воркера — у оператора для этого кнопка ❌ на карточке' };
+  if (!apr) return { err: 'approval-withdraw: аппрув не найден' };
+  if (apr.data.from !== caller) {
+    return { err: `approval-withdraw: отозвать может только автор заявки («${apr.data.from}»), ты — «${caller}»` };
+  }
+  if (eff === 'withdrawn') return { ok: true, deduped: true };
+  if (eff !== 'open') return { err: `approval-withdraw: заявка уже решена (${eff}) — отзывать поздно` };
+  return { ok: true };
+}
+
+// Отзыв заявки автором (фаза 4). Кейс: оператор решил вопрос напрямую в сессии, заявка
+// утратила смысл. ❌ работал бы, но врёт семантически — воркер получил бы «ОТКЛОНИЛ» и
+// скорректировал поведение, хотя решение просто стало неактуально.
+//
+// Гард ИНВЕРСНЫЙ к assertNotWorkerSession: только из сессии воркера и только автору.
+function cmdApprovalWithdraw(a) {
+  const ref = a._[1] || die('approval-withdraw: нужен <event_id>');
+  const caller = callerWorkerName();
+  let result;
+  try {
+    result = withLock(() => {
+      const events = readAll();
+      let apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
+      if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
+      const eff = apr ? effectiveStatus(events, apr, 'approval_status', 'open') : null;
+      const auth = authorizeWithdraw(caller, apr, eff);
+      if (auth.err) { const err = new Error(auth.err); err.cliError = true; throw err; }
+      if (auth.deduped) return { event_id: ref, deduped: true };
+      const data = { ref, status: 'withdrawn' };
+      if (a.reason) data.reason = String(a.reason).slice(0, 400);
+      validateEvent('approval_status', data);
+      return brief(writeEventUnlocked('approval_status', data, caller));
     });
   } catch (e) {
     if (e && e.cliError) die(e.message);
@@ -622,7 +675,7 @@ function cmdRotate(a) {
       // Task 11-fix: 'executing' НЕ перечислен здесь ни в одной ветке → всегда считается
       // "не закрыто" (как approved для exec-kind) и НЕ ротируется — заявка ждёт раннера,
       // dept-dispatcher читает только активный файл, потерять её ротацией нельзя.
-      approval: (s, e) => ['denied', 'executed', 'exec_failed'].includes(s)
+      approval: (s, e) => ['denied', 'executed', 'exec_failed', 'withdrawn'].includes(s)
         || (s === 'approved' && !EXEC_KINDS_ROT.has(e.data.kind_of)),
       incident: (s) => ['resolved', 'wontfix', 'duplicate'].includes(s),
     };
@@ -684,11 +737,17 @@ function ROTATE_DAYS_DEFAULT_ENV() {
 const HANDLERS = {
   append: cmdAppend, list: cmdList, send: cmdSend, ack: cmdAck, resolve: cmdResolve,
   'approval-open': cmdApprovalOpen, 'approval-resolve': cmdApprovalResolve, 'approval-exec': cmdApprovalExec,
+  'approval-withdraw': cmdApprovalWithdraw,
   'incident-open': cmdIncidentOpen,
   'registry-set': cmdRegistrySet, 'registry-get': cmdRegistryGet, 'registry-list': cmdRegistryList,
   'policy-current': cmdPolicyCurrent, 'policy-ack': cmdPolicyAck, 'policy-check': cmdPolicyCheck,
   'incident-resolve': cmdIncidentResolve, snapshot: cmdSnapshot, rotate: cmdRotate,
 };
+// Экспорт чистой функции допуска для unit-тестов (createRequire в dept-ledger.test.mjs) —
+// без этого раннего return require() выполнил бы CLI-хвост файла (argv пуст → usage → exit 1),
+// убивая процесс тестового раннера (образец dept-dispatcher:112-113).
+module.exports = { authorizeWithdraw };
+if (require.main !== module) return;
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 try {

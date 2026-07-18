@@ -1,0 +1,67 @@
+#!/bin/bash
+# dept-withdraw — отзыв СВОЕЙ заявки автором (фаза 4).
+#
+# Кейс: оператор решил вопрос напрямую в сессии → заявка утратила смысл. Кнопка ❌
+# сработала бы, но врёт: воркер получил бы «ОТКЛОНИЛ» и скорректировал поведение.
+#
+# Порядок шагов НЕ переставлять (R14, разбор гонки withdraw ↔ нажатие ✅):
+#   1) гасим карточку у бота (SQLite-арбитр claim по status='open');
+#   2) только потом пишем withdrawn в ledger.
+# При провале шага 2 получаем «карточка погашена + ledger open» — безвредно (заявку
+# добьёт напоминание диспетчера). Обратный порядок дал бы «ledger withdrawn + карточка
+# живая» → оператор жмёт ✅ → бот пишет approved → last-write-wins → воркер исполняет
+# отозванное.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RNR_DB="${RNR_DB_BIN:-$BINDIR/../bot/rnr_db.py}"
+CLAUDE_INSTALL="${CLAUDE_INSTALL:-/home/rainor/.local/share/claude}"
+die() { echo "dept-withdraw: $*" >&2; exit 1; }
+
+# ---- identity (spoof-resistant) — дословно из dept-approve resolve_name ----
+resolve_name() {
+  local pid="$PPID" depth=0 nm exe
+  while [ "${pid:-0}" -gt 1 ] && [ "$depth" -lt 25 ]; do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | command grep -qxE -- '--resume|--session-id'; then
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+      case "$exe" in
+        "$CLAUDE_INSTALL"/*)
+          nm="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_AUTO_NAME=//p' | head -1)"
+          [ -n "$nm" ] && { printf '%s' "$nm"; return 0; }
+          ;;
+      esac
+    fi
+    pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    depth=$((depth+1))
+  done
+  return 1
+}
+
+event_id="" reason=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --event-id) event_id="$2"; shift 2 ;;
+    --reason) reason="$2"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+[ -n "$event_id" ] || die "usage: dept-withdraw --event-id <evt_...> --reason '<почему заявка неактуальна>'"
+[ -n "$reason" ] || die "--reason обязателен: оператор увидит его на погашенной карточке"
+
+actor="$(resolve_name)" || actor="${DEPT_APPROVE_TEST_ACTOR:-}"
+[ -n "$actor" ] || die "запускается только из сессии воркера"
+
+# Шаг 1: карточка. FAIL-CLOSED (Codex важное №2): отсутствующий/неисполняемый rnr_db.py —
+# это отказ, а не «пропустить шаг». Пропуск дал бы запрещённое состояние «ledger withdrawn
+# + живая карточка»: оператор жмёт ✅ → бот пишет approved → last-write-wins → воркер
+# исполняет отозванное.
+[ -f "$RNR_DB" ] || die "не найден $RNR_DB — погасить карточку нечем; в журнал ничего не записано"
+python3 "$RNR_DB" withdraw-approval --event-id "$event_id" --worker "$actor" --reason "$reason" \
+  || die "не смог погасить карточку: заявка не твоя, не найдена в очереди бота, либо оператор уже решил её кнопкой. В журнал ничего не записано"
+
+# Шаг 2: журнал. Идемпотентность полного пути (Codex важное №1/№3): если шаг 1 прошёл, а
+# шаг 2 упал (сеть/лок), повторный запуск обязан ДОЙТИ до журнала — rnr_db отдаёт exit 0
+# и на «уже withdrawn мной», не только на первый переход open→withdrawn.
+"$DL" approval-withdraw "$event_id" --reason "$reason" \
+  || die "карточка погашена, но запись отзыва в журнал НЕ прошла — повтори ту же команду (шаги идемпотентны); если не помогает, сообщи оператору"
+echo "dept-withdraw: заявка $event_id отозвана"
