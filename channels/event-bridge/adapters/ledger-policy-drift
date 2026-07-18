@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// ledger-policy-drift — датчик «молчуны» для Руководителя (фаза 4).
+//
+// Контракт адаптера event-bridge: печатает ДЕТЕРМИНИРОВАННУЮ строку на состояние, exit 0.
+// Дедуп делает bridge — по sha256 ВИДИМОЙ строки (bin/event-bridge-watch:134-135).
+//
+// Отсюда главное конструктивное решение: строка НЕ содержит ни имён молчунов, ни их
+// счётчика. Иначе каждый прилетевший ack менял бы строку → новый хэш → повторный инжект,
+// и Руководитель получал бы до N-1 нуджей на одну рассылку. Строка = (версия, бакет
+// времени) → максимум 3 нуджа на версию правил: через 30 мин, 6 ч и сутки. Имена
+// Руководитель добывает сам (policy-check по реестру) — это и есть его работа по контролю.
+//
+// Почему не policy-check целиком: он валит и по TTL (24ч) — датчик на нём флагал бы весь
+// флот ежедневно, включая тех, кто ack'нул действующую версию. TTL — ленивый энфорсмент
+// турникета на гейте, к планёрке отношения не имеет. Дрейф = версия ≠ действующей ИЛИ
+// ack старше mtime файла правил.
+'use strict';
+const { execFileSync } = require('child_process');
+const path = require('path');
+
+const DEPT_ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп']);
+const GRACE_MS = 30 * 60_000;
+
+// Бакет эскалации. null = молчим (флот ещё читает). Пороги — от mtime файла правил,
+// т.е. от момента, когда версия стала действующей.
+function driftBucket(policyMtimeMs, nowMs) {
+  const age = nowMs - policyMtimeMs;
+  if (age >= 24 * 3600_000) return 'сутки';
+  if (age >= 6 * 3600_000) return '6 часов';
+  if (age >= GRACE_MS) return '30 минут';
+  return null;
+}
+
+// registry: {workers:{name:{role}}}; acks: события policy_ack в порядке журнала;
+// current: {version, mtimeMs}; states: {name: 'active'|'sleeping'|…} из autonomous.json.
+// Возвращает ОТСОРТИРОВАННЫЙ список (детерминизм — иначе дедуп bridge поплывёт).
+function silentWorkers(registry, acks, current, states = {}) {
+  const last = new Map();
+  for (const e of acks) {
+    if (e.kind !== 'policy_ack' || !e.data) continue;
+    last.set(e.data.worker, e); // журнал упорядочен → последний выигрывает
+  }
+  const out = [];
+  for (const [name, w] of Object.entries((registry || {}).workers || {})) {
+    if (!DEPT_ROLES.has(w.role)) continue;
+    // Только активные (Codex важное №5): спящий не подтвердит никогда — рассылка его
+    // намеренно пропускает (решение оператора №2), правила он догонит турникетом при
+    // первом approve после пробуждения. Без этого фильтра спящий diaverum-russ (ack v4)
+    // держал бы датчик в вечном дрейфе и выдал бы все три нуджа впустую.
+    if (states[name] !== 'active') continue;
+    const a = last.get(name);
+    if (!a) { out.push(name); continue; }
+    if (a.data.policy_version !== current.version) { out.push(name); continue; }
+    // «Перечитал ДО правки правил» — тот же критерий, что у турникета (dept-ledger:537).
+    if (Date.parse(a.ts) < current.mtimeMs) { out.push(name); continue; }
+  }
+  return out.sort();
+}
+
+module.exports = { driftBucket, silentWorkers, DEPT_ROLES };
+if (require.main !== module) return;
+
+// ---- CLI ----
+let observer = '';
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--worker') observer = argv[++i];
+  else if (argv[i] === '--state-dir') i++; // состояние не нужно: истина в ledger
+}
+if (!observer) { process.stderr.write('usage: ledger-policy-drift --worker <name>\n'); process.exit(1); }
+
+const DL = path.join(__dirname, '..', '..', '..', 'bin', 'dept-ledger');
+const dl = (args) => execFileSync(DL, args, { encoding: 'utf8', timeout: 30_000 });
+const lines = (s) => s.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+let current, registry, acks, states = {};
+try {
+  current = JSON.parse(dl(['policy-current']));
+  registry = lines(dl(['registry-list']))[0];
+  acks = lines(dl(['list', '--kind', 'policy_ack', '--limit', '500']));
+} catch (e) {
+  // Датчик молчит при недоступном ledger: инжект «не смог проверить» — шум, а не сигнал.
+  process.stderr.write(`ledger-policy-drift: ledger недоступен: ${e.message}\n`);
+  process.exit(0);
+}
+// Состояния — из autonomous.json (единственный источник active/sleeping; в registry.json
+// поля state НЕТ). Не прочитали — молчим: без состояний посчитали бы спящих молчунами.
+try {
+  const ctrl = process.env.CLAUDE_CONTROL_DIR || path.join(process.env.HOME, '.claude-control');
+  const auto = JSON.parse(require('fs').readFileSync(path.join(ctrl, 'autonomous.json'), 'utf8'));
+  for (const [n, w] of Object.entries(auto.workers || {})) states[n] = w.state;
+} catch { process.exit(0); }
+
+// policy-current отдаёт только {version, file} — mtime берём с файла сами (Codex важное
+// №4: без явной подстановки в current проверка «ack старше правки правил» молча мертва).
+let mtimeMs = 0;
+try { mtimeMs = require('fs').statSync(current.file).mtimeMs; } catch { process.exit(0); }
+current.mtimeMs = mtimeMs;
+
+const bucket = driftBucket(mtimeMs, Date.now());
+if (!bucket) process.exit(0);
+const silent = silentWorkers(registry, acks, current, states);
+if (!silent.length) process.exit(0);
+
+// Строка без имён и счётчика — см. шапку. Меняется только при смене версии/бакета.
+console.log(`[ack-drift] Правила ${current.version} действуют дольше ${bucket}, но подтвердили не все. `
+  + `Проверь: dept-ledger registry-list + dept-ledger policy-check --worker <имя> по каждой роли отдела; `
+  + `молчунам напомни по шине (send --type policy_refresh); если не реагируют — доложи оператору.`);

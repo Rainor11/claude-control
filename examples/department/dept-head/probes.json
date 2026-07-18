@@ -1,5 +1,8 @@
 { "probes": [
   { "name": "dept-bus", "source": "ledger", "interval_sec": 60, "timeout_sec": 30,
     "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/ledger-messages",
+            "--worker", "dept-head"] },
+  { "name": "ack-drift", "source": "ledger", "interval_sec": 600, "timeout_sec": 30,
+    "cmd": ["/opt/projects/active/claude-control/channels/event-bridge/adapters/ledger-policy-drift",
             "--worker", "dept-head"] }
 ] }
