@@ -607,3 +607,47 @@ test('die-под-локом: approval-resolve на несуществующий 
   assert.throws(() => run(home, ['approval-resolve', 'evt_0_none', '--status', 'approved']));
   assert.doesNotThrow(() => run(home, ['append', '--kind', 'agent_run', '--data', '{"worker":"x","run_kind":"wake"}']));
 });
+
+// Дыра 17.07: гард К3 (assertNotWorkerSession) стоял только на approval-resolve/approval-exec,
+// а generic append/registry-set писали ТЕ ЖЕ привилегированные события в обход. Тесты ниже
+// покрывают то, что тестируемо без подделки /proc (обратного шва для эмуляции воркера нет) —
+// см. брифинг Task 0.
+
+test('PRIVILEGED_KINDS: пин списка привилегированных типов события', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const m = /PRIVILEGED_KINDS\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(src);
+  assert.ok(m, 'PRIVILEGED_KINDS не найден — переименовали? обнови тест');
+  const kinds = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
+  // approval_status — самоодобрение; registry_change — самоповышение до руководителя;
+  // incident_status — закрытие инцидента о себе; policy_ack — ack за другого воркера.
+  assert.deepEqual(kinds, ['approval_status', 'incident_status', 'policy_ack', 'registry_change']);
+});
+
+test('append привилегированного типа зовёт гард сессии воркера', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const fn = src.slice(src.indexOf('function cmdAppend'), src.indexOf('function cmdList'));
+  assert.match(fn, /assertNotWorkerSession/,
+    'cmdAppend обязан звать assertNotWorkerSession для привилегированных kind — иначе approval-resolve обходится generic append (дыра 17.07)');
+});
+
+test('registry-set зовёт гард сессии воркера (самоповышение до руководителя)', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const fn = src.slice(src.indexOf('function cmdRegistrySet'), src.indexOf('function cmdRegistryGet'));
+  assert.match(fn, /assertNotWorkerSession/,
+    'cmdRegistrySet обязан звать гард — иначе воркер назначает себя руководителем и его заявки берёт pickExecutable');
+});
+
+test('append НЕпривилегированного типа по-прежнему свободен (agent_run пишет claude-auto)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const r = JSON.parse(run(home, ['append', '--kind', 'agent_run', '--data',
+    JSON.stringify({ worker: 'w', run_kind: 'rebase' })]));
+  assert.ok(r.event_id, 'agent_run обязан оставаться доступным — его пишет claude-auto из сессии воркера при rebase');
+});
+
+test('append approval_status от НЕ-воркера проходит (бот/оператор/диспетчер)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const a = JSON.parse(run(home, ['approval-open', '--kind-of', 'other', '--summary', 'x', '--actor', 'mk-a']));
+  const r = JSON.parse(run(home, ['append', '--kind', 'approval_status', '--data',
+    JSON.stringify({ ref: a.event_id, status: 'approved' }), '--actor', 'operator']));
+  assert.ok(r.event_id, 'тесты идут не из сессии воркера — гард обязан пропустить');
+});

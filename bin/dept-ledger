@@ -31,6 +31,16 @@ const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
 // чтобы следующий тик/прогон видел её НЕ approved (effectiveStatus) и не запускал второй
 // исполнитель на ту же заявку — см. cmdApprovalExec ниже и wiki-бриф P3-Task-11fix.
 const APPROVAL_STATUSES = ['approved', 'denied', 'executed', 'exec_failed', 'executing'];
+// Типы событий, которые воркер не может писать generic-командой `append` (дыра 17.07).
+// Гард К3 (assertNotWorkerSession) стоял только на approval-resolve/approval-exec, а
+// `append --kind approval_status --data '{"ref":…,"status":"approved"}'` писал ТОТ ЖЕ
+// статус в обход — воспроизведено: заявка становилась approved без оператора. Полная
+// цепочка: registry-set self→руководитель + approval-open worker_spawn + append approved
+// = найм без кнопки. У воркеров Bash(dept-ledger:*) в allow, так что вход открыт всем.
+//
+// agent_run/message/message_status/incident СОЗНАТЕЛЬНО не здесь: их штатно пишут
+// claude-auto и сами воркеры (rebase-события, шина, открытие инцидента о себе).
+const PRIVILEGED_KINDS = new Set(['approval_status', 'registry_change', 'incident_status', 'policy_ack']);
 const ROTATE_DAYS_DEFAULT = 30;
 const POLICY_DIR = process.env.DEPT_POLICY_DIR || '/home/rainor/brain/wiki/work/ai-dev/отдел/правила';
 // Number(garbage) → NaN, а `x > NaN` всегда false — старое `Number(env || 24)` при кривом
@@ -225,6 +235,10 @@ function appendEvent(kind, data, actor) {
 
 function cmdAppend(args) {
   const kind = args.kind || die('append: --kind обязателен');
+  // Дыра 17.07: generic append писал approval_status/registry_change в обход гарда К3,
+  // стоявшего только на типизированных командах. Решение по аппруву записывает
+  // бот/оператор/диспетчер (policy 2.4), роль в реестре меняет оператор.
+  if (PRIVILEGED_KINDS.has(kind)) assertNotWorkerSession(`append --kind ${kind}`);
   let data;
   try { data = JSON.parse(args.data || ''); } catch { die('append: --data не валидный JSON'); }
   if (data === null || typeof data !== 'object' || Array.isArray(data)) die('append: --data должен быть JSON-объектом');
@@ -455,6 +469,11 @@ function cmdIncidentOpen(a) {
 function cmdRegistrySet(a) {
   const name = a._[1];
   if (!name) die('usage: dept-ledger registry-set <worker> --role <r> …');
+  // Дыра 17.07: воркер мог назначить себя руководителем (registry-set <self> --role
+  // руководитель) — и pickExecutable диспетчера начал бы принимать его заявки
+  // (worker_spawn/planerka/mission_change/sleep) как заявки Руководителя. Реестр ведут
+  // оператор и bootstrap-исполнители (они идут из systemd-раннера, не из сессии воркера).
+  assertNotWorkerSession('registry-set');
   let updated;
   try {
     // Один withLock на RMW реестра + аудит-событие — иначе под конкуренцией порядок
