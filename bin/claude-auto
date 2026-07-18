@@ -856,27 +856,16 @@ status_memory() {
     [ -n "$wfile" ] && { echo "  transcript: $wfile"; tx_mtime="$(stat -c %Y "$wfile" 2>/dev/null || echo 0)"; }
   fi
 
-  if [ -z "$bp" ]; then echo "  deal memory: n/a (not a brain worker)"; return 0; fi
-  if [ ! -d "$bp" ]; then
-    echo "  deal memory: PATH MISSING ($bp) — deal folder moved/renamed; will not recreate"
-    return 0
-  fi
-  local mem_mtime=0 f m
-  shopt -s nullglob
-  for f in "$bp/timeline.md" "$bp/decisions.md" "$bp"/open-questions* "$bp"/открытые-вопросы*; do
-    [ -f "$f" ] || continue
-    m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
-    [ "$m" -gt "$mem_mtime" ] 2>/dev/null && mem_mtime="$m"
-  done
-  shopt -u nullglob
-  local stale_after; stale_after="$(stale_after_secs)"
-  if [ "$mem_mtime" -eq 0 ]; then
-    echo "  deal memory: NONE YET ($bp has no timeline/decisions/open-questions)"
-  elif [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "$stale_after" ]; then
-    echo "  deal memory: STALE — memory last edited $(date -u -d "@$mem_mtime" '+%Y-%m-%dT%H:%M:%SZ'), transcript active until $(date -u -d "@$tx_mtime" '+%Y-%m-%dT%H:%M:%SZ')"
-  else
-    echo "  deal memory: fresh (last edit $(date -u -d "@$mem_mtime" '+%Y-%m-%dT%H:%M:%SZ'))"
-  fi
+  local fj; fj="$("$BIN_DIR/dept-memory-freshness" --brain-path "$bp" --session-id "$sid" \
+    --stale-after-secs "$(stale_after_secs)" 2>/dev/null)" || fj=''
+  local fstate; fstate="$(printf '%s' "$fj" | jq -r '.state // "n/a"' 2>/dev/null)"
+  case "$fstate" in
+    stale) echo "  deal memory: STALE — память отстала от транскрипта на $(printf '%s' "$fj" | jq -r '.gapSec') с (свежайший файл: $(printf '%s' "$fj" | jq -r '.newestFile'))" ;;
+    none-yet) echo "  deal memory: NONE YET ($bp — нет ни манифеста, ни timeline/decisions)" ;;
+    path-missing) echo "  deal memory: PATH MISSING ($bp) — папка сделки переехала/переименована; не воссоздаём" ;;
+    fresh) echo "  deal memory: fresh (свежайший файл: $(printf '%s' "$fj" | jq -r '.newestFile'))" ;;
+    *) echo "  deal memory: n/a (не brain-воркер или детектор недоступен)" ;;
+  esac
 }
 
 cmd_status() {
@@ -1025,21 +1014,28 @@ cmd_rebase() {
 
   # STALE-гард: rebase стирает сессию — несвежая память = потеря контекста
   local home="$WORKERS_DIR/$name" spec="$WORKERS_DIR/$name/spec.json"
-  local bp sid wfile tx_mtime=0 mem_mtime=0 f m
+  local bp sid
   bp="$(jq -r --arg n "$name" '.workers[$n].brain_path // empty' "$REGISTRY" 2>/dev/null)"
   sid="$(jq -r '.session_id' "$spec")"
   if [ -n "$bp" ] && [ -d "$bp" ] && [ "$force_stale" != true ]; then
-    wfile="$(ls -1 "$HOME/.claude/projects"/*/"$sid.jsonl" 2>/dev/null | head -1)"
-    [ -n "$wfile" ] && tx_mtime="$(stat -c %Y "$wfile" 2>/dev/null || echo 0)"
-    shopt -s nullglob
-    for f in "$bp/timeline.md" "$bp/decisions.md" "$bp"/open-questions* "$bp"/открытые-вопросы*; do
-      [ -f "$f" ] || continue
-      m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$mem_mtime" ] 2>/dev/null && mem_mtime="$m"
-    done
-    shopt -u nullglob
-    if [ "$tx_mtime" -gt 0 ] && [ $(( tx_mtime - mem_mtime )) -gt "$(stale_after_secs)" ]; then
-      die "rebase: память STALE (транскрипт активнее файлов) — потеря контекста. Пусть воркер докурирует память, или --force-stale"
+    local fj fstate
+    fj="$("$BIN_DIR/dept-memory-freshness" --brain-path "$bp" --session-id "$(jq -r '.session_id' "$spec")" \
+      --stale-after-secs "$(stale_after_secs)" 2>/dev/null)" || fj=''
+    fstate="$(printf '%s' "$fj" | jq -r '.state // ""' 2>/dev/null)"
+    # ПОВЕДЕНИЕ СОХРАНЕНО БАЙТ-В-БАЙТ (Codex крит. №6): старый код считал mem_mtime=0 и
+    # сравнивал tx_mtime-0 с порогом → при живом транскрипте и НУЛЕВОЙ памяти всегда die.
+    # То есть сессия с транскриптом и без единого файла памяти к пересборке ЗАПРЕЩЕНА
+    # сегодня. Блокировать только 'stale' = тихо снять эту защиту. Оба состояния
+    # блокирующие; 'none-yet' — только при живом транскрипте (txMtimeMs>0), иначе это
+    # свежесозданный воркер, которому rebase законен.
+    if [ "$fstate" = "stale" ]; then
+      die "rebase: память STALE (транскрипт активнее файлов памяти на $(printf '%s' "$fj" | jq -r '.gapSec') с) — потеря контекста. Пусть воркер докурирует память, или --force-stale"
     fi
+    if [ "$fstate" = "none-yet" ] && [ "$(printf '%s' "$fj" | jq -r '.txMtimeMs // 0')" != "0" ]; then
+      die "rebase: у сделки нет ни одного файла памяти ($bp — ни манифеста, ни timeline/decisions), а сессия активна — пересборка стёрла бы весь контекст. Пусть воркер зафиксирует память, или --force-stale"
+    fi
+    # Детектор недоступен/сломан ($fj пуст) → НЕ блокируем молча: гард обязан либо
+    # сработать осознанно, либо не мешать (тихий отказ на пустом JSON хуже отсутствия гарда).
   fi
 
   local old_sid new_sid; old_sid="$sid"; new_sid="$(cat /proc/sys/kernel/random/uuid)"

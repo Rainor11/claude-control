@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { memoryFreshness } = require('./dept-memory-freshness');
 
 const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
 const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
@@ -125,38 +126,6 @@ function readCompactions(name) {
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   } catch { return 0; }
 }
-// STALE — та же эвристика, что status_memory/cmd_rebase в claude-auto (bash):
-// mtime транскрипта (по session_id) vs max(mtime timeline.md/decisions.md/
-// open-questions*/открытые-вопросы* в brain_path) > CLAUDE_AUTO_STALE_SECONDS.
-// Не brain-воркер (brain_path пуст/каталог снесён) или транскрипт не найден —
-// не считать STALE (нечего сравнивать, не эпохальный false-positive).
-function isStale(brainPath, sessionId) {
-  if (!brainPath) return false;
-  let entries;
-  try { entries = fs.readdirSync(brainPath); } catch { return false; }
-  let txMtime = 0;
-  if (sessionId) {
-    const projRoot = path.join(process.env.HOME, '.claude', 'projects');
-    try {
-      for (const d of fs.readdirSync(projRoot)) {
-        const f = path.join(projRoot, d, sessionId + '.jsonl');
-        if (fs.existsSync(f)) { txMtime = fs.statSync(f).mtimeMs; break; }
-      }
-    } catch {}
-  }
-  if (txMtime === 0) return false;
-  let memMtime = 0;
-  const candidates = ['timeline.md', 'decisions.md', ...entries.filter(e => e.startsWith('open-questions') || e.startsWith('открытые-вопросы'))];
-  for (const c of candidates) {
-    try {
-      const m = fs.statSync(path.join(brainPath, c)).mtimeMs;
-      if (m > memMtime) memMtime = m;
-    } catch {}
-  }
-  if (memMtime === 0) return false; // ещё нет памяти вообще — не STALE (см. status_memory "NONE YET")
-  return (txMtime - memMtime) > STALE_AFTER_MS;
-}
-
 // Битый/отсутствующий реестр НЕ должен валить прогон тихим стектрейсом в journal:
 // работа watchdog-инструмента — замечать то, что никто не смотрит, включая
 // собственную неспособность работать. Алерт → чистый exit (лок снимет 'exit'-хук).
@@ -184,7 +153,8 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
   const anchorMs = anchor ? Date.parse(anchor) : NaN;
   const ageMs = Number.isFinite(anchorMs) ? now - anchorMs : 0;
   const compactions = readCompactions(name);
-  const stale = isStale(autoMeta.brain_path, spec.session_id);
+  const fresh = memoryFreshness(autoMeta.brain_path, spec.session_id, STALE_AFTER_MS);
+  const stale = fresh.state === 'stale';
   const alreadyAlerted = !!(state[name] && state[name].alerted);
   const w = { ageMs, compactions, stale, alreadyAlerted, enforce: ENFORCE };
 

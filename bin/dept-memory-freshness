@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+// dept-memory-freshness — ЕДИНСТВЕННЫЙ источник истины о свежести памяти клиента.
+//
+// Зачем модуль: эвристика жила в 4 копиях (claude-auto status_memory + claude-auto
+// cmd_rebase STALE-гард + dept-rebase-check isStale + dept-dispatcher) и разошлась со
+// схемой brain — не видела манифест клиента и трек-файлы многотрековой схемы, зато
+// искала open-questions*, которых в схеме не существует. Итог 17.07: все 4 активных МК
+// висели в ложном STALE. Один источник — чтобы «умный детектор» не превратился в 4
+// расходящихся умных детектора (фаза 4, R6/R7).
+//
+// Модель: сравниваем mtime САМОГО СВЕЖЕГО файла памяти клиента с mtime транскрипта
+// сессии. Транскрипт ушёл далеко вперёд ⇒ воркер работает, но память не курирует.
+// Иммунно к часам/tz и к двойному Stop+TaskCompleted (в отличие от счётчика шагов).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+// Схема brain (wiki/work/ai-dev/клиенты/<slug>/): манифест + timeline/decisions,
+// включая трек-суффиксы многотрековых клиентов (timeline-<трек>.md). open-questions*
+// оставлены как исторический глоб — безвредны, схема может их завести.
+const MEMORY_GLOBS = ['CLAUDE.md', 'timeline*', 'decisions*', 'open-questions*', 'открытые-вопросы*'];
+
+function matchesGlob(name) {
+  if (name === 'CLAUDE.md') return true;
+  return name.startsWith('timeline') || name.startsWith('decisions')
+    || name.startsWith('open-questions') || name.startsWith('открытые-вопросы');
+}
+
+function transcriptMtimeMs(sessionId, projectsRoot) {
+  if (!sessionId) return 0;
+  let dirs;
+  try { dirs = fs.readdirSync(projectsRoot); } catch { return 0; }
+  for (const d of dirs) {
+    const f = path.join(projectsRoot, d, sessionId + '.jsonl');
+    try { return fs.statSync(f).mtimeMs; } catch { /* следующая папка проекта */ }
+  }
+  return 0;
+}
+
+// ЯДРО: транскрипт уже найден вызывающим. Такая сигнатура нужна dept-dispatcher —
+// он вычисляет txMtime сам (для idleDays) и session_id не читает вовсе (:454, :463).
+// Подстановка session_id-варианта туда дала бы txMtime на месте sessionId → транскрипт
+// не найден → вечный 'fresh' → STALE-гард авто-сна отключился бы МОЛЧА (Codex крит. №1).
+function memoryFreshnessFromTx(brainPath, txMtimeMs, staleAfterMs) {
+  const nil = { memMtimeMs: 0, txMtimeMs: txMtimeMs || 0, newestFile: null, gapSec: 0 };
+  if (!brainPath) return { state: 'n/a', ...nil };
+  let entries;
+  try { entries = fs.readdirSync(brainPath); }
+  catch { return { state: 'path-missing', ...nil }; }
+
+  let memMtimeMs = 0, newestFile = null;
+  for (const name of entries) {
+    if (!matchesGlob(name)) continue;
+    let st;
+    try { st = fs.statSync(path.join(brainPath, name)); } catch { continue; }
+    if (!st.isFile()) continue; // p3#21: каталог с именем timeline* не должен считаться памятью
+    if (st.mtimeMs > memMtimeMs) { memMtimeMs = st.mtimeMs; newestFile = name; }
+  }
+  // Ни одного файла памяти. ВАЖНО для вызывателей: 'none-yet' при ЖИВОМ транскрипте —
+  // блокирующее состояние для rebase (claude-auto сегодня даёт тут die: разрыв
+  // tx-0 всегда > порога). Отдельным состоянием — чтобы status_memory печатал честный
+  // вердикт, а гард видел разницу «памяти нет» vs «память отстала» (Codex крит. №6).
+  if (memMtimeMs === 0) return { state: 'none-yet', ...nil };
+  // Транскрипт не найден — сравнивать не с чем; консервативно НЕ stale (иначе rebase
+  // блокировался бы у любого воркера со свежесозданной/переехавшей сессией).
+  if (!txMtimeMs) return { state: 'fresh', memMtimeMs, txMtimeMs: 0, newestFile, gapSec: 0 };
+  const gapMs = txMtimeMs - memMtimeMs;
+  return {
+    state: gapMs > staleAfterMs ? 'stale' : 'fresh',
+    memMtimeMs, txMtimeMs, newestFile, gapSec: Math.max(0, Math.round(gapMs / 1000)),
+  };
+}
+
+// ОБЁРТКА: сама находит транскрипт по sessionId. Зовут dept-rebase-check и CLI.
+// opts.projectsRoot — только для тестов; в бою — ~/.claude/projects.
+function memoryFreshness(brainPath, sessionId, staleAfterMs, opts = {}) {
+  const projectsRoot = opts.projectsRoot || process.env.CLAUDE_PROJECTS_ROOT
+    || path.join(process.env.HOME || '', '.claude', 'projects');
+  return memoryFreshnessFromTx(brainPath, transcriptMtimeMs(sessionId, projectsRoot), staleAfterMs);
+}
+
+module.exports = { memoryFreshness, memoryFreshnessFromTx, MEMORY_GLOBS };
+if (require.main !== module) return;
+
+// ---- CLI (для bash-вызывателей: claude-auto) ----
+// Whitelist флагов + обязательные аргументы: молчаливое проглатывание опечатки
+// («--brain_path» вместо «--brain-path») дало бы n/a и тихо снятый гард.
+const ALLOWED = new Set(['brain-path', 'session-id', 'stale-after-secs']);
+const usage = () => {
+  process.stderr.write('usage: dept-memory-freshness --brain-path <p> --session-id <s> [--stale-after-secs <n>]\n');
+  process.exit(2);
+};
+const a = { 'stale-after-secs': '1800' };
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  const m = /^--(.+)$/.exec(argv[i]);
+  if (!m || !ALLOWED.has(m[1]) || argv[i + 1] === undefined) usage();
+  a[m[1]] = argv[++i];
+}
+if (!a['brain-path']) usage();
+const secs = Number(a['stale-after-secs']);
+// Зеркало stale_after_secs() из claude-auto: мусор/0 → дефолт 1800. Иначе мусорный env
+// тихо отключал бы гард (баг M-4, /bug фазы 3).
+const staleAfterMs = (Number.isFinite(secs) && secs > 0 ? secs : 1800) * 1000;
+process.stdout.write(JSON.stringify(
+  memoryFreshness(a['brain-path'] || null, a['session-id'] || null, staleAfterMs)) + '\n');

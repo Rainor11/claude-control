@@ -15,7 +15,7 @@ fail() { echo "FAIL: $1"; exit 1; }
 
 # ---- sandbox bin: копии + фейковый исполнитель (whitelist-имя dept-sleep-exec) ----------
 SANDBOX="$(mktemp -d)"
-cp "$DIR/bin/dept-ledger" "$DIR/bin/dept-dispatcher" "$DIR/bin/dept-exec-runner" "$SANDBOX/"
+cp "$DIR/bin/dept-ledger" "$DIR/bin/dept-dispatcher" "$DIR/bin/dept-exec-runner" "$DIR/bin/dept-memory-freshness" "$SANDBOX/"
 cat > "$SANDBOX/dept-sleep-exec" <<'EOF'
 #!/bin/bash
 # фейковый исполнитель заявки sleep: спит N секунд (даёт второму тику время догнать

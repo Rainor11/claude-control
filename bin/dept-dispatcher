@@ -26,6 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
+const { memoryFreshnessFromTx } = require('./dept-memory-freshness');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
 // Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
@@ -241,20 +242,6 @@ function transcriptMtime(name) {
   } catch {}
   return 0;
 }
-// STALE — та же эвристика, что dept-rebase-check.isStale (mtime транскрипта vs
-// max(mtime timeline.md/decisions.md/открытые-вопросы* в brain_path)).
-function isStale(brainPath, txMtime) {
-  if (!brainPath || !txMtime) return false;
-  let entries;
-  try { entries = fs.readdirSync(brainPath); } catch { return false; }
-  let memMtime = 0;
-  const candidates = ['timeline.md', 'decisions.md', ...entries.filter((e) => e.startsWith('open-questions') || e.startsWith('открытые-вопросы'))];
-  for (const c of candidates) {
-    try { const m = fs.statSync(path.join(brainPath, c)).mtimeMs; if (m > memMtime) memMtime = m; } catch {}
-  }
-  if (memMtime === 0) return false; // памяти вообще ещё нет — не STALE
-  return (txMtime - memMtime) > STALE_AFTER_MS;
-}
 // Запуск одной пробы: партиальный stdout возвращаем ДАЖЕ при ненулевом exit/timeout —
 // probe-скрипты (как и в event-bridge-watch) могут упасть, но уже что-то напечатать.
 function runProbe(cmd, timeoutSec) {
@@ -464,7 +451,11 @@ for (const [name, meta] of Object.entries(deptWorkers)) {
 
   if (idleDays < CFG.idleDays) { delete sleepState[name]; continue; } // активен — сброс дедупа/эпизода
 
-  const stale = isStale(autoMeta.brain_path, txMtime);
+  // memoryFreshnessFromTx — не memoryFreshness: у нас на руках уже txMtime (:454), а
+  // session_id диспетчер не читает вовсе. Подстановка sessionId-варианта отправила бы
+  // txMtime на место session_id → транскрипт не найден → вечный fresh → STALE-гард
+  // авто-сна отключился бы молча (Codex крит. №1).
+  const stale = memoryFreshnessFromTx(autoMeta.brain_path, txMtime, STALE_AFTER_MS).state === 'stale';
   const openAppr = hasOpenApproval(name);
   const queued = hasQueued(name);
   const already = !!(sleepState[name] && sleepState[name].asked);
