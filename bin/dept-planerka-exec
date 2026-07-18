@@ -1,31 +1,43 @@
 #!/bin/bash
-# dept-planerka-exec — исполнитель заявки planerka: плановый rebase всех активных
-# воркеров отдела (руководитель/мк/архивариус/тп), чтобы каждый перечитал свежие правила
-# при следующем старте сессии. Запускается dept-dispatcher'ом (--approval <event_id>)
-# или оператором (прямой флаг --reason).
+# dept-planerka-exec — планёрка отдела: РАССЫЛКА правил по шине (фаза 4).
 #
-# Идемпотентен: повторный прогон (тот же --approval после hard-kill между исполнением и
-# записью approval-exec диспетчером) просто ещё раз ребейзит весь флот — лишняя
-# пересборка уже свежих сессий безвредна, эффект (все на актуальных правилах) не меняется.
+# Было (фазы 2-3): пересборка сессий всего активного флота через claude-auto rebase.
+# Проблема, вскрытая боем: у МК с живым клиентским контекстом rebase упирался в STALE-гард
+# → 🔴-сегмент «ошибки, разберись» на каждой планёрке (штатная защита, читалась как сбой),
+# а успешный rebase сбрасывал контекст живого обсуждения ради перечитывания правил.
 #
-# Anti-forge (Codex-аудит К4): в режиме --approval detail заявки РЕНДЕРИТСЯ ЗАНОВО из
-# data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
-# ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
+# Стало (решение оператора 17.07): планёрка = типизированное сообщение шины «перечитай
+# policy-vN + ack» активным воркерам. Сессии не трогаются. Спящих не будим (догонят
+# турникетом при первом approve после пробуждения). Rebase остаётся ТОЛЬКО гигиене
+# (dept-rebase-check: возраст/компакции) и mission-update.
+#
+# Busy-воркеры отдельной обработки не требуют: доставку делает event-bridge-watch с
+# backoff и карантином — отсюда ушли ретрай-бюджет и PLANERKA_RETRY_SLEEP.
+#
+# Режимы: --approval <event_id> (диспетчер, с anti-forge сверкой detail↔request)
+#         --reason '<s>'        (оператор напрямую)
 set -u
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
-CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
-RETRY_SLEEP="${PLANERKA_RETRY_SLEEP:-10}"   # пауза между попытками rebase busy-воркера (тест выставляет 0)
 die() { echo "dept-planerka-exec: $*" >&2; exit 1; }
 
 approval="" reason=""
-while [ $# -gt 0 ]; do case "$1" in
-  --approval) approval="${2:-}"; shift 2 ;;
-  --reason) reason="${2:-}"; shift 2 ;;
-  *) die "unknown arg $1" ;;
-esac; done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --approval) approval="$2"; shift 2 ;;
+    --reason) reason="$2"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+deptReg="$("$DL" registry-list)" || die "registry-list не удался"
+# Дефолтный отправитель — Руководитель отдела (единственная роль «руководитель» в
+# реестре), а не буквально "operator": даже прямой --reason (оператор жмёт кнопку
+# руками) рассылается ОТ ИМЕНИ Руководителя — это его ack'и потом трекать (R2).
+head_worker="$(printf '%s' "$deptReg" | jq -r '.workers | to_entries[] | select(.value.role=="руководитель") | .key' | head -n1)"
+requester="${head_worker:-operator}"
 
 if [ -n "$approval" ]; then
   row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
@@ -37,52 +49,57 @@ if [ -n "$approval" ]; then
   rendered_detail="$("$RR" planerka "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
   [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
   reason="$(jq -r '.reason // empty' <<<"$request_json")"
+  # Отправитель рассылки — автор заявки (Руководитель): он же контролирует ack'и (R2).
+  requester="$(jq -r '.data.from // "operator"' <<<"$row")"
 fi
 reason="${reason:-плановая планёрка}"
 
-deptReg="$("$DL" registry-list)" || die "registry-list не удался"
+pol="$("$DL" policy-current)" || die "policy-current не удался"
+pver="$(jq -r '.version' <<<"$pol")"; pfile="$(jq -r '.file' <<<"$pol")"
+[ -n "$pver" ] && [ "$pver" != "null" ] || die "не удалось определить действующую версию правил"
+
 targets="$(printf '%s' "$deptReg" | jq -r '.workers | to_entries[] | select(.value.role as $r | ["руководитель","мк","архивариус","тп"] | index($r)) | .key')"
 
-rebased=(); deferred=(); errored=(); sleeping_list=()
+# Кап reason в body: адаптер шины (ledger-messages) режет body до 300 символов МОЛЧА —
+# без капа хвост инструкции (путь к правилам + команда ack) не доехал бы до воркера.
+# Обрезка ПО КОДОВЫМ ТОЧКАМ через jq, а не `cut -c`: `cut -c` в этом окружении режет по
+# БАЙТАМ независимо от локали (проверено: 400×«о» → cut -c1-80 отдаёт 40 символов, не 80,
+# и на нечётной границе байт разрезал бы мультибайтный UTF-8 символ пополам).
+reason_short="$(printf '%s' "$reason" | jq -Rsr '.[0:80]')"
+subject="Планёрка: перечитай правила $pver и подтверди"
+# Абсолютный путь к dept-ledger (не bare-имя) — policy 3.0: bare-имени нет в PATH воркера.
+body="Причина: ${reason_short}. Перечитай ${pfile} и выполни: ${DL} policy-ack --version ${pver}"
+
+sent=(); sleeping_list=(); failed=()
 while IFS= read -r w; do
   [ -n "$w" ] || continue
   wstate="$(jq -r --arg n "$w" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
   if [ "$wstate" = "sleeping" ]; then
     sleeping_list+=("$w")
-    echo "$w: спит — пропуск (планёрка спящих не будит, датчики разбудят на новом событии)"
+    echo "$w: спит — пропуск (решение 17.07: не будим; догонит турникетом при первом approve)"
     continue
   fi
   if [ "$wstate" != "active" ]; then
     echo "$w: state=${wstate:-нет в autonomous.json} — пропуск (не active/sleeping)"
     continue
   fi
-  # КОРОТКИЙ ретрай busy-воркера (M-3: комментарий актуализирован под detached-модель
-  # Task 11-fix). Текущая механика: dept-dispatcher помечает заявку executing и запускает
-  # dept-exec-runner в СОБСТВЕННОМ transient-юните (systemd-run) — тик диспетчера НЕ
-  # блокируется исполнением и лок не держит; timeout 900с (DEPT_EXEC_RUNNER_TIMEOUT_MS)
-  # висит на РАННЕРЕ, который синхронно исполняет этот скрипт. Висеть до 20 мин на ОДНОМ
-  # busy-воркере — значит сжечь бюджет раннера (планёрка упрётся в timeout → exec_failed,
-  # частично применённая и без авто-ретрая), пока остальной флот не ребейзнут. Поэтому:
-  # до 3 попыток × 10с (≤~30с на воркера), затем — в ОТЛОЖЕННЫЕ и к следующему. Планёрка
-  # не обязана дожать всех в одном проходе: незаребейзенного busy-воркера добьёт
-  # rebase-check по возрасту сессии, ЛИБО следующая планёрка, ЛИБО policy-турникет
-  # заставит перечитать правила перед следующим значимым действием (механический забор —
-  # безопасно). Суммарный бюджет ≤ N × 30с (флот ~8 ≈ 4 мин) с запасом под 900с раннера.
-  ok=false
-  for i in 1 2 3; do
-    rout="$("$CA" rebase "$w" --reason "планёрка: $reason" 2>&1)"; rrc=$?
-    echo "$rout"
-    if [ "$rrc" -eq 0 ]; then ok=true; break; fi
-    if [ "$rrc" -ne 3 ]; then echo "$w: rebase завершился ошибкой (rc=$rrc) — в сегмент ошибок"; break; fi
-    [ "$i" -lt 3 ] && [ "$RETRY_SLEEP" -gt 0 ] && sleep "$RETRY_SLEEP"
-  done
-  # Три исхода: ok (rc=0) → ребейзнут; busy (rc=3 после 3 попыток) → отложен (безобиден,
-  # добьёт rebase-check/турникет); hard-error (rc∉{0,3}, напр. STALE-память/exit 1) →
-  # в отдельный сегмент ОШИБОК. Невидимость ошибки хуже, чем ложный busy — это ровно та
-  # категория, что требует внимания оператора, поэтому 🔴-сегмент в сводке (fixup по ревью).
-  if [ "$ok" = true ]; then rebased+=("$w"); elif [ "$rrc" -eq 3 ]; then deferred+=("$w"); else errored+=("$w"); fi
+  if "$DL" send --type policy_refresh --to "$w" --subject "$subject" --body "$body" --actor "$requester" >/dev/null 2>&1; then
+    sent+=("$w"); echo "$w: policy_refresh $pver отправлен"
+  else
+    failed+=("$w"); echo "$w: ОТПРАВКА НЕ УДАЛАСЬ" >&2
+  fi
 done <<<"$targets"
 
-summary="Планёрка отдела («$reason»): ребейзнуты: ${rebased[*]:-нет}; отложены (busy, добьёт rebase-check/турникет): ${deferred[*]:-нет}; 🔴 ошибки (rc≠0,3 — разберись): ${errored[*]:-нет}; спят: ${sleeping_list[*]:-нет}"
+summary="Планёрка отдела («$reason»): разослано ${pver} — ${sent[*]:-нет}; спят (пропущены, догонят турникетом) — ${sleeping_list[*]:-нет}; 🔴 не разослано — ${failed[*]:-нет}. Сессии не пересобирались; ack'и контролирует Руководитель."
 echo "$summary"
 "$NOTIFY" "$summary" >/dev/null 2>&1 || echo "dept-planerka-exec: notify FAILED" >&2
+# Частичная рассылка — НЕ успех (Codex важное №11): «разослано 5 из 7» с exit 0 дало бы
+# executed на карточке, и оператор увидел бы 🔴 только внутри текста сводки. Ненулевой код
+# → раннер пишет exec_failed + шлёт «🔴 НЕ исполнено» с хвостом лога.
+# Повторный прогон безопасен: воркер, получивший второй policy_refresh, перечитает правила
+# ещё раз — это no-op (policy-ack идемпотентен по версии, повторный ack той же vN штатен).
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "dept-planerka-exec: не доставлено ${#failed[@]} воркерам: ${failed[*]}" >&2
+  exit 1
+fi
+exit 0

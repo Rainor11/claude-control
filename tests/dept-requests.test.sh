@@ -169,56 +169,83 @@ out7="$(CLAUDE_AUTO_BIN=/bin/false "$DIR/bin/dept-sleep-exec" --worker test-work
   || fail "dept-sleep-exec на уже-спящем воркере должен вернуть exit 0 (no-op)"
 echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об идемпотентном no-op (уже спит)"
 
-# ---- 8) dept-planerka-exec: busy → отложен (короткий ретрай), hard-error → сегмент ошибок --
-# (fixup Task 8: (а) раньше висел до 20 мин на busy-воркере → SIGTERM под dispatcher-timeout,
-# теперь ≤3 попытки × RETRY_SLEEP → «отложенные»; (б) hard-error rc∉{0,3} — отдельный 🔴-сегмент,
-# а не тихая пропажа из сводки). Изолированный DEPT_HOME/CONTROL_DIR + мок claude-auto (rc=3 busy,
-# rc=1 hard-error, rc=0 остальные) + мок notify. PLANERKA_RETRY_SLEEP=0 — тест не должен ждать.
-PL_DEPT="$(mktemp -d)"
-PL_CTRL="$(mktemp -d)"
+# --- dept-planerka-exec: рассылка policy_refresh вместо ребейза (фаза 4) ---
+# Было: exec звал claude-auto rebase по флоту, busy → ретраи, STALE → 🔴-сегмент.
+# Стало: exec шлёт policy_refresh активным, спящих пропускает, claude-auto не зовёт вовсе.
+PL_DEPT="$(mktemp -d)"; PL_CTRL="$(mktemp -d)"; PL_POL="$(mktemp -d)"
+printf '# правила v9\n' > "$PL_POL/policy-v9.md"
 mkdir -p "$PL_CTRL/workers"
-DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-ok-p --role мк --client c1 >/dev/null
-DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-busy-p --role мк --client c2 >/dev/null
-DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-err-p --role мк --client c3 >/dev/null
-DEPT_HOME="$PL_DEPT" "$DL" registry-set mk-sleep-p --role мк --client c4 >/dev/null
-jq -n '{workers:{"mk-ok-p":{state:"active"},"mk-busy-p":{state:"active"},"mk-err-p":{state:"active"},"mk-sleep-p":{state:"sleeping"}}}' \
+DL_PL() { DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" "$DIR/bin/dept-ledger" "$@"; }
+DL_PL registry-set dept-head   --role руководитель >/dev/null
+DL_PL registry-set mk-act-p    --role мк --client cli-a >/dev/null
+DL_PL registry-set mk-sleep-p  --role мк --client cli-b >/dev/null
+DL_PL registry-set dept-tp-p   --role тп >/dev/null
+DL_PL registry-set legacy-p    --role legacy >/dev/null
+jq -n '{workers:{"dept-head":{state:"active"},"mk-act-p":{state:"active"},"mk-sleep-p":{state:"sleeping"},"dept-tp-p":{state:"active"},"legacy-p":{state:"active"}}}' \
   > "$PL_CTRL/autonomous.json"
 
+# claude-auto НЕ должен быть вызван вообще — мок падает, если его позвали
 PL_CA="$(mktemp -d)/fake-ca-planerka"
 cat > "$PL_CA" <<'EOF'
 #!/bin/bash
-# rebase <worker> --reason <r>: busy → rc=3 (занят), hard-error → rc=1 (напр. STALE/exit 1), иначе rc=0
-[ "$1" = "rebase" ] && [ "$2" = "mk-busy-p" ] && exit 3
-[ "$1" = "rebase" ] && [ "$2" = "mk-err-p" ] && exit 1
-exit 0
+echo "CLAUDE_AUTO_CALLED $*" >> "$MOCK_LOG"
+exit 99
 EOF
 chmod +x "$PL_CA"
-export PL_NOTIFY_LOG="$(mktemp)"
-PL_NOTIFY="$(mktemp -d)/fake-notify"
+export PL_NOTIFY_LOG="$(mktemp)"; PL_NOTIFY="$(mktemp -d)/fake-notify"
 cat > "$PL_NOTIFY" <<'EOF'
 #!/bin/bash
 echo "NOTIFY $*" >> "$PL_NOTIFY_LOG"
 EOF
 chmod +x "$PL_NOTIFY"
 
-pl_start=$(date +%s)
-out8="$(DEPT_HOME="$PL_DEPT" CLAUDE_CONTROL_DIR="$PL_CTRL" CLAUDE_AUTO_BIN="$PL_CA" \
-  TELEGRAM_NOTIFY="$PL_NOTIFY" PLANERKA_RETRY_SLEEP=0 \
-  "$DIR/bin/dept-planerka-exec" --reason 'смок планёрки')" \
-  || fail "dept-planerka-exec упал"
-pl_end=$(date +%s)
-[ $((pl_end - pl_start)) -lt 30 ] || fail "dept-planerka-exec висел >30с (должен откладывать busy, а не ждать)"
-# сегмент = ярлык + всё до следующей `;` (4 сегмента, greedy .* ложно перекрыл бы соседние)
-seg="$(echo "$out8" | grep -o 'Планёрка отдела.*')"
-seg_of() { printf '%s' "$seg" | grep -oE "$1[^;]*"; }
-seg_of 'ребейзнуты: '                 | grep -q 'mk-ok-p'    || fail "mk-ok-p не в ребейзнутых"
-seg_of 'отложены \(busy'              | grep -q 'mk-busy-p'  || fail "mk-busy-p не в отложенных (busy)"
-seg_of 'ошибки \(rc'                  | grep -q 'mk-err-p'   || fail "mk-err-p не в сегменте ошибок"
-seg_of 'спят: '                       | grep -q 'mk-sleep-p' || fail "mk-sleep-p не в спящих"
-# hard-error НЕ должен просочиться в отложенные/ребейзнутые (иначе оператор не заметит ошибку)
-seg_of 'отложены \(busy' | grep -q 'mk-err-p' && fail "mk-err-p ошибочно в отложенных (busy)"
-seg_of 'ребейзнуты: '    | grep -q 'mk-err-p' && fail "mk-err-p ошибочно в ребейзнутых"
-grep -q 'NOTIFY' "$PL_NOTIFY_LOG" || fail "TG-сводка планёрки не отправлена (мок notify не вызван)"
-grep -q '🔴 ошибки' "$PL_NOTIFY_LOG" || fail "🔴-сегмент ошибок не попал в TG-сводку"
+pl_start="$(date +%s)"
+out8="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+  CLAUDE_AUTO_BIN="$PL_CA" MOCK_LOG="$MOCK_LOG" TELEGRAM_NOTIFY="$PL_NOTIFY" \
+  "$DIR/bin/dept-planerka-exec" --reason 'смок рассылки')" \
+  || fail "dept-planerka-exec упал: $out8"
+pl_end="$(date +%s)"
+
+[ $((pl_end - pl_start)) -lt 15 ] || fail "рассылка висела >15с (не должна ничего ждать)"
+command grep -q 'CLAUDE_AUTO_CALLED' "$MOCK_LOG" && fail "claude-auto вызван — планёрка больше НЕ ребейзит"
+
+# policy_refresh ушёл активным штабным и МК, но не спящему и не legacy
+for w in dept-head mk-act-p dept-tp-p; do
+  DL_PL list --kind message --filter "to=$w" --status queued \
+    | jq -e 'select(.data.type=="policy_refresh")' >/dev/null \
+    || fail "$w не получил policy_refresh"
+done
+DL_PL list --kind message --filter 'to=mk-sleep-p' --status queued | command grep -q . \
+  && fail "спящему mk-sleep-p ушло сообщение (решение оператора №2: спящих не будим)"
+DL_PL list --kind message --filter 'to=legacy-p' --status queued | command grep -q . \
+  && fail "legacy-воркеру ушло сообщение (роли отдела: руководитель/мк/архивариус/тп)"
+
+# отправитель — Руководитель (заявка его), а не operator/dispatcher
+DL_PL list --kind message --filter 'to=mk-act-p' --status queued \
+  | jq -e 'select(.data.from=="dept-head")' >/dev/null \
+  || fail "отправитель рассылки не dept-head"
+
+# сводка: разослано / спят / версия правил
+echo "$out8" | command grep -q 'разослано' || fail "в сводке нет сегмента «разослано»: $out8"
+echo "$out8" | command grep -q 'v9'        || fail "в сводке нет версии правил: $out8"
+echo "$out8" | command grep -q 'mk-sleep-p' || fail "спящий не отмечен в сводке: $out8"
+command grep -q 'NOTIFY' "$PL_NOTIFY_LOG"  || fail "TG-сводка не отправлена"
+
+# КАПЫ АДАПТЕРА (R3): subject ≤200, body ≤300 — иначе инструкция молча обрежется
+body_len="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | jq -r '.data.body' | wc -m)"
+subj_len="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | jq -r '.data.subject' | wc -m)"
+[ "$body_len" -le 300 ] || fail "body рассылки $body_len симв. > 300 — адаптер шины обрежет инструкцию"
+[ "$subj_len" -le 200 ] || fail "subject рассылки $subj_len симв. > 200 — адаптер шины обрежет"
+
+# длинный reason не должен ломать кап body
+DL_PL registry-set mk-long-p --role мк --client cli-c >/dev/null
+jq '.workers["mk-long-p"] = {state:"active"}' "$PL_CTRL/autonomous.json" > "$PL_CTRL/a.tmp" && mv "$PL_CTRL/a.tmp" "$PL_CTRL/autonomous.json"
+long_reason="$(printf 'о%.0s' $(seq 1 400))"
+DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+  TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$long_reason" >/dev/null \
+  || fail "exec упал на длинном reason"
+long_len="$(DL_PL list --kind message --filter 'to=mk-long-p' --status queued | jq -r '.data.body' | head -1 | wc -m)"
+[ "$long_len" -le 300 ] || fail "reason 400 симв. пробил кап body ($long_len > 300)"
+echo "  planerka-exec: рассылка OK"
 
 echo PASS
