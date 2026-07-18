@@ -24,7 +24,7 @@ const REQUIRED = {
   policy_ack: ['worker', 'policy_version'],
 };
 const MSG_TYPES = new Set(['question', 'proposal', 'incident', 'handoff',
-  'kb_change_request', 'decision_request']); // §5 спеки; worker_spawn/mission_change — approvals, не messages
+  'kb_change_request', 'decision_request', 'policy_refresh']); // §5 спеки; worker_spawn/mission_change — approvals, не messages
 const MSG_STATUSES = new Set(['acked', 'handled', 'dead']);
 // Task 11-fix: 'executing' — промежуточный статус между approved и executed/exec_failed.
 // Диспетчер помечает заявку executing ДО запуска исполнителя в отдельном юните (dept-exec-runner),
@@ -310,8 +310,11 @@ function cmdSend(a) {
   if (roleOf(from) === 'мк' && roleOf(a.to) === 'мк') {
     die('send: прямое сообщение МК→МК запрещено (policy 3.1) — отправь question руководителю');
   }
-  if (roleOf(a.to) === 'руководитель' && !['question', 'proposal', 'decision_request'].includes(a.type)) {
-    die('send: руководителю идут только question/proposal/decision_request (§5 спеки) — handoff шли профильному штабному, incident открывай через incident-open');
+  // policy_refresh — рассылка планёрки «перечитай policy-vN + ack» (фаза 4): Руководитель
+  // перечитывает правила наравне со всеми, поэтому исключён из фильтра §5. Остальные
+  // ограничения адресата-руководителя не тронуты.
+  if (roleOf(a.to) === 'руководитель' && !['question', 'proposal', 'decision_request', 'policy_refresh'].includes(a.type)) {
+    die('send: руководителю идут только question/proposal/decision_request/policy_refresh (§5 спеки) — handoff шли профильному штабному, incident открывай через incident-open');
   }
   if (a.type === 'kb_change_request' && roleOf(a.to) && roleOf(a.to) !== 'архивариус') {
     die('send: kb_change_request адресуется только Архивариусу (policy 3.4)');
