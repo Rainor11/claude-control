@@ -19,7 +19,9 @@
 set -u
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# CLAUDE_AUTO_HOME — тот же корень, что чтят watchdog (claude-auto-liveness) и dispatcher
+# (dept-dispatcher CC_HOME); CLAUDE_CONTROL_DIR остаётся fallback для остальных обёрток.
+CONTROL_DIR="${CLAUDE_AUTO_HOME:-${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 die() { echo "dept-liveness-exec: $*" >&2; exit 1; }
 
@@ -38,6 +40,17 @@ request_json="$(jq -c '.data.request // {}' <<<"$row")"
 ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
 rendered_detail="$("$RR" liveness_restart "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
 [ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+
+# Codex second opinion: прямой вызов (без диспетчера) исполнял открытую/отклонённую/
+# отозванную заявку — dept-liveness-exec никогда не сверял ЭФФЕКТИВНЫЙ статус аппрува.
+# dept-dispatcher помечает заявку executing (dept-ledger approval-exec --status executing)
+# СТРОГО ДО запуска этого раннера (см. dept-dispatcher, шаг "пометить executing" перед
+# запуском раннера) — так что штатный путь всегда застаёт статус executing. list --status
+# использует effectiveStatus того же dept-ledger (последний approval_status по ref), не
+# сырое data.status аппрува.
+exec_row="$("$DL" list --kind approval --event-id "$approval" --status executing)"
+[ -n "$exec_row" ] || die "заявка не в статусе executing — исполняет только диспетчер после ✅ оператора"
+
 worker="$(jq -r '.worker // empty' <<<"$request_json")"
 [ -n "$worker" ] || die "request не содержит worker"
 [[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad worker '$worker' в request"

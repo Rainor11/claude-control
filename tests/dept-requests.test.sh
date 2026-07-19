@@ -368,6 +368,10 @@ out10a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min
   || fail "вторая заявка liveness_restart не прошла"
 liv_eid2="$(echo "$out10a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 "$DL" approval-resolve "$liv_eid2" --status approved --actor operator >/dev/null
+# T4 F2: dept-liveness-exec теперь требует эффективный статус executing — зеркалим шаг
+# диспетчера (approved→executing ДО запуска раннера, dept-dispatcher:444), иначе exec сам
+# отказал бы happy-path заявкам.
+"$DL" approval-exec "$liv_eid2" --status executing --actor dispatcher >/dev/null
 : > "$FAKE_SYSTEMCTL_LOG"
 out10b="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid2")" \
   || fail "dept-liveness-exec (happy path) упал: $out10b"
@@ -391,6 +395,7 @@ out10c="$("$DIR/bin/dept-liveness-request" --worker test-liveness-noreg --frozen
   || fail "dept-liveness-request отверг active воркера без регистрации в реестре отдела"
 liv_eid5="$(echo "$out10c" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 "$DL" approval-resolve "$liv_eid5" --status approved --actor operator >/dev/null
+"$DL" approval-exec "$liv_eid5" --status executing --actor dispatcher >/dev/null
 : > "$FAKE_SYSTEMCTL_LOG"
 out10d="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid5")" \
   || fail "dept-liveness-exec отверг active воркера без регистрации в реестре отдела: $out10d"
@@ -402,6 +407,7 @@ out11a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min
   || fail "третья заявка liveness_restart не прошла"
 liv_eid3="$(echo "$out11a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 "$DL" approval-resolve "$liv_eid3" --status approved --actor operator >/dev/null
+"$DL" approval-exec "$liv_eid3" --status executing --actor dispatcher >/dev/null
 FAKE_SYSTEMCTL_FAIL="$(mktemp -d)/fake-systemctl-fail"
 cat > "$FAKE_SYSTEMCTL_FAIL" <<'EOF'
 #!/bin/bash
@@ -424,11 +430,27 @@ out12a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min
   || fail "четвёртая заявка liveness_restart не прошла"
 liv_eid4="$(echo "$out12a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 "$DL" approval-resolve "$liv_eid4" --status approved --actor operator >/dev/null
+"$DL" approval-exec "$liv_eid4" --status executing --actor dispatcher >/dev/null
 jq '.workers["test-liveness-w"].state = "sleeping"' "$CLAUDE_CONTROL_DIR/autonomous.json" > "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" \
   && mv "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" "$CLAUDE_CONTROL_DIR/autonomous.json"
 out12b="$("$DIR/bin/dept-liveness-exec" --approval "$liv_eid4" 2>&1)" \
   && fail "dept-liveness-exec исполнил заявку на не-active воркере"
 echo "$out12b" | command grep -q 'не active' || fail "нет пояснения про не-active воркера при исполнении"
+
+# ---- 13) T4 F2: exec на заявке в статусе open (диспетчер её ещё не забрал) → отказ, ------
+# systemctl НЕ вызван. Прямой вызов dept-liveness-exec мимо диспетчера — ровно та дыра,
+# которую закрывает статус-гейт (до фикса exec исполнил бы open/denied/withdrawn заявку).
+# test-liveness-w уснул в тесте #12 — берём test-liveness-noreg (остался active, тест 10b).
+out13a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-noreg --frozen-min 4 --transcript-min 3)" \
+  || fail "пятая заявка liveness_restart не прошла"
+liv_eid6="$(echo "$out13a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" list --kind approval --event-id "$liv_eid6" --status open >/dev/null \
+  || fail "заявка $liv_eid6 ожидалась в статусе open (диспетчер её ещё не пометил executing)"
+: > "$FAKE_SYSTEMCTL_LOG"
+out13b="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid6" 2>&1)" \
+  && fail "dept-liveness-exec исполнил заявку в статусе open (диспетчер её ещё не забрал)"
+echo "$out13b" | command grep -q 'не в статусе executing' || fail "нет пояснения про статус-гейт executing на open-заявке"
+[ -s "$FAKE_SYSTEMCTL_LOG" ] && fail "systemctl вызван на open-заявке — статус-гейт не остановил ДО побочных эффектов"
 
 echo "  liveness-restart: OK"
 

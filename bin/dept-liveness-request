@@ -28,7 +28,9 @@ DL="$BINDIR/dept-ledger"
 RR="$BINDIR/dept-request-render"
 RNR_DB="${RNR_DB_BIN:-$BINDIR/../bot/rnr_db.py}"
 OPERATOR_ENV="${CLAUDE_AUTO_OPERATOR_ENV:-/home/rainor/server/.env}"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# CLAUDE_AUTO_HOME — тот же корень, что чтят watchdog (claude-auto-liveness) и dispatcher
+# (dept-dispatcher CC_HOME); CLAUDE_CONTROL_DIR остаётся fallback для остальных обёрток.
+CONTROL_DIR="${CLAUDE_AUTO_HOME:-${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}}"
 die() { echo "dept-liveness-request: $*" >&2; exit 1; }
 
 worker="" frozen="" transcript=""
