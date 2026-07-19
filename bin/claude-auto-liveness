@@ -48,9 +48,10 @@ function decide(prev, cur, cfg) {
 }
 
 // Чистая функция: следующий state[name] для веток reset / anim_alert / none-continuation / alert
-// (restart/incident остаются инлайн в цикле — там ветвление по успеху systemctl/ledger, не по
-// hash). notifyOk — результат notify() для действий, где он нужен (anim_alert/alert); для
-// reset/none игнорируется (у них нет своего notify-вызова).
+// (restart/incident остаются инлайн в цикле — там ветвление по успеху подачи заявки в ledger
+// (dept-liveness-request) / dept-ledger incident-open, не по hash). notifyOk — результат
+// notify() для действий, где он нужен (anim_alert/alert); для reset/none игнорируется (у них
+// нет своего notify-вызова).
 // Экран считается "ожившим", если hash сменился относительно prev (или prev вовсе нет) — тогда
 // alerted/wouldNotified/wouldIncidentNotified сбрасываем: алерт был про СТАРОЕ замершее состояние
 // экрана, оно больше не актуально. Точное совпадение hash (no-op основной лестницы alert→restart)
@@ -97,7 +98,8 @@ function nextState(prev, cur, action, notifyOk) {
 //      от action этого тика (оператор мог решить заявку, пока экран стоит на месте);
 //      ledgerView = {cardStatus, executedAt} — последний approval_status по ref
 //      («последний выигрывает», как effectiveStatus в dept-ledger).
-//      → {op:'close_executed', executedAt} | {op:'wait'} | {op:'silent_denied'} | {op:'clear'}
+//      → {op:'close_executed', executedAt} | {op:'wait'} | {op:'silent_denied'} |
+//        {op:'silent_withdrawn'} | {op:'clear'}
 // close_executed отдаёт executedAt ИМЕННО из ledgerView (ts события executed в ledger), не
 // cur.ts «сейчас» — от него зависит reincident-детект (decide(): prev.restartedAt свежий).
 function cardStep(prev, cur, ledgerView) {
@@ -108,10 +110,18 @@ function cardStep(prev, cur, ledgerView) {
     if (status === 'denied') {
       return prev.cardScreenHash === cur.screenHash ? { op: 'silent_denied' } : { op: 'clear' };
     }
+    // T3-ревью F1: withdrawn — не переподавать мгновенно (буква плана T3.1: denied/executed/
+    // withdrawn → не переподаём, пока экран тот же). Ведёт себя как denied: молчим, пока
+    // экран не сменился; сменился — clear и разрешаем обычной лестнице подать заново.
+    if (status === 'withdrawn') {
+      return prev.cardScreenHash === cur.screenHash ? { op: 'silent_withdrawn' } : { op: 'clear' };
+    }
     if (status === 'open' || status === 'approved' || status === 'executing') return { op: 'wait' };
-    // withdrawn ИЛИ статус не определился (заявка потеряна/чтение не удалось выше по стеку,
-    // сюда попадает только УЖЕ подтверждённый вызывающим факт «статуса нет») — снять карточку,
-    // разрешить переподачу на следующем шаге лестницы.
+    // Статус не определился (заявка потеряна/архивирована — queryCardStatus уже подтвердил
+    // «approval тоже не найден» выше по стеку) — снять карточку безусловно, ИГНОРИРУЯ hash.
+    // Исключение принято ревью намеренно: иначе архивная карточка на неизменном экране держала
+    // бы cardEventId вечно (silent-веткам возвращаться некуда — approval_status для неё больше
+    // не читается), и лестница никогда не подала бы заявку заново.
     return { op: 'clear' };
   }
   return lv.existingCardId ? { op: 'adopt', eventId: lv.existingCardId } : { op: 'file' };
@@ -169,9 +179,9 @@ if (!dry) {
   process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
 }
 
-// timeout: подвисший tmux/systemctl/dept-ledger (напр. мёртвый tmux-сервер) иначе вешает
-// execFileSync навсегда — сам watchdog зависает вместо детекта чужого зависания, и ни один
-// воркер ПОСЛЕ зависшего в цикле не проверяется, saveState() не вызывается.
+// timeout: подвисший tmux/dept-ledger/dept-liveness-request (напр. мёртвый tmux-сервер) иначе
+// вешает execFileSync навсегда — сам watchdog зависает вместо детекта чужого зависания, и ни
+// один воркер ПОСЛЕ зависшего в цикле не проверяется, saveState() не вызывается.
 function sh(cmd, args) { try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: 10_000 }); } catch { return null; } }
 // ВАЖНО: и сокет, и сессия называются claude-<name> (см. claude-auto-run) —
 // цель capture-pane именно claude-<name>, не <name>.
@@ -219,7 +229,15 @@ function queryCardStatus(eventId) {
   if (rows === null) return null;
   if (rows.length) {
     const last = rows[rows.length - 1];
-    return { status: last.data.status, executedAt: last.data.status === 'executed' ? Date.parse(last.ts) : null };
+    let executedAt = null;
+    if (last.data.status === 'executed') {
+      const parsed = Date.parse(last.ts);
+      // T3-ревью F2: битый/отсутствующий ts события — NaN дальше рвёт new Date(NaN).toISOString()
+      // в dry-run и портит reincident-детект (decide(): prev.restartedAt должен быть числом) —
+      // fallback на "сейчас", не теряем закрытие эпизода из-за плохого поля в ledger.
+      executedAt = Number.isFinite(parsed) ? parsed : Date.now();
+    }
+    return { status: last.data.status, executedAt };
   }
   // Нет approval_status — подтверждаем, что сам approval ещё в активном файле (не архиве).
   const apr = dlList(['--kind', 'approval', '--event-id', eventId]);
@@ -332,8 +350,13 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
       if (dry) console.log(`[dry] ${name}: карточка ${prev.cardEventId} отклонена, экран тот же — не переподаю`);
       continue;
     }
-    // step.op === 'clear': withdrawn ИЛИ статус не определился — снять карточку и продолжить
-    // обычную лестницу ниже (reset её и так бы стёр — nextState('reset') не спреадит card-поля).
+    if (step.op === 'silent_withdrawn') {
+      if (dry) console.log(`[dry] ${name}: карточка ${prev.cardEventId} отозвана, экран тот же — не переподаю`);
+      continue;
+    }
+    // step.op === 'clear': denied/withdrawn с изменившимся экраном ИЛИ статус не определился —
+    // снять карточку и продолжить обычную лестницу ниже (reset её и так бы стёр — nextState('reset')
+    // не спреадит card-поля).
     if (dry) { console.log(`[dry] ${name}: карточка ${prev.cardEventId} снята — переподал бы при следующем зависании`); continue; }
     prev = state[name] = { ...prev, cardEventId: undefined, cardScreenHash: undefined };
   }

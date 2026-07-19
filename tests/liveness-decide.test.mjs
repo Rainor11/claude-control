@@ -208,9 +208,16 @@ for (const status of ['open', 'approved', 'executing']) {
   });
 }
 
-test('cardStep: карточка withdrawn — clear (разрешить переподачу)', () => {
+test('cardStep: карточка withdrawn, экран тот же — silent_withdrawn (не переподавать мгновенно, T3.1)', () => {
   const prev = { screenHash: 'aaa', firstSeen: 1000, alerted: true, restartedAt: 0, cardEventId: 'evt_1', cardScreenHash: 'aaa' };
   const cur = { ts: 9999, screenHash: 'aaa', transcriptMtime: 500 };
+  const step = cardStep(prev, cur, { cardStatus: 'withdrawn' });
+  assert.equal(step.op, 'silent_withdrawn');
+});
+
+test('cardStep: карточка withdrawn, экран сменился — clear (эпизод завершён естественно)', () => {
+  const prev = { screenHash: 'aaa', firstSeen: 1000, alerted: true, restartedAt: 0, cardEventId: 'evt_1', cardScreenHash: 'aaa' };
+  const cur = { ts: 9999, screenHash: 'bbb', transcriptMtime: 500 };
   const step = cardStep(prev, cur, { cardStatus: 'withdrawn' });
   assert.equal(step.op, 'clear');
 });
