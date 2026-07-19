@@ -310,6 +310,25 @@ command grep -q 'insert-approval' "$LIV_RNR_LOG" || fail "карточка не 
 command grep -q -- '--worker watchdog' "$LIV_RNR_LOG" || fail "карточка не помечена worker=watchdog"
 command grep -q -- "--arg-value $liv_eid" "$LIV_RNR_LOG" || fail "карточка не ссылается на event_id заявки"
 
+# 8c2 (T2 F2): rnr_db.py insert-approval ВСЕГДА возвращает rc=3 (симулирует qid-коллизию,
+# LIV_RNR_FAIL=1) → retry-ветка должна РЕАЛЬНО сработать 5 раз (до фикса F2 rc захватывался
+# ПОСЛЕ `fi`, где bash отдаёт exit-код if-compound'а, а не упавшего условия — он всегда 0,
+# поэтому [ "$rc" = 3 ] никогда не срабатывал: цикл умирал на первой же попытке с ложным
+# "db error rc=0"). Итог фикса: 5 честных попыток, "не смог выделить уникальный qid",
+# ненулевой exit, карточка НЕ построена; заявка в ledger (открыта РЕАЛЬНЫМ approval-open
+# до вызова мока) остаётся open — fail-closed направление, заявка не теряется.
+: > "$LIV_RNR_LOG"
+out8c2="$(LIV_RNR_FAIL=1 "$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 7 --transcript-min 4 2>&1)" \
+  && fail "dept-liveness-request прошёл успешно, хотя rnr_db.py insert-approval всегда падает (LIV_RNR_FAIL=1)"
+echo "$out8c2" | command grep -q 'не смог выделить уникальный qid' \
+  || fail "нет честного сообщения об исчерпанных retry (регресс F2: rc после fi всегда 0 давал ложный 'db error rc=0' на первой попытке)"
+liv_attempts="$(command grep -c 'insert-approval' "$LIV_RNR_LOG" || true)"
+[ "$liv_attempts" = "5" ] || fail "retry-ветка qid-коллизии не отработала 5 раз (attempts=$liv_attempts) — мёртвая ветка F2 не ожила"
+liv_eid_fail="$(echo "$out8c2" | command grep -oE 'evt_[0-9]+_[a-z0-9]+' | head -1)"
+[ -n "$liv_eid_fail" ] || fail "не удалось извлечь event_id заявки из сообщения об ошибке"
+liv_fail_row="$("$DL" list --kind approval --event-id "$liv_eid_fail" --status open)"
+[ -n "$liv_fail_row" ] || fail "заявка $liv_eid_fail должна остаться open в ledger при провале доставки карточки (fail-closed)"
+
 # карточку отправить нечем (rnr_db.py недоступен) → dept-liveness-request FAIL-CLOSED
 # (заявка в ledger уже открыта — увидит её reminder диспетчера, но вызывающий обязан
 # узнать о провале доставки карточки сразу, exit 1)
@@ -353,9 +372,9 @@ out10b="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "
 command grep -q -- '--user restart claude-auto@test-liveness-w.service' "$FAKE_SYSTEMCTL_LOG" \
   || fail "systemctl вызван не с ожидаемыми аргументами"
 echo "$out10b" | command grep -q 'перезапущен' || fail "нет подтверждения перезапуска в выводе"
-"$DL" list --kind agent_run --filter "worker=test-liveness-w" \
-  | jq -e 'select(.data.run_kind=="liveness_restart")' >/dev/null \
-  || fail "agent_run liveness_restart не записан"
+"$DL" list --kind agent_run --filter "ref=$liv_eid2" \
+  | jq -e 'select(.data.run_kind=="liveness_restart" and .data.worker=="test-liveness-w")' >/dev/null \
+  || fail "agent_run liveness_restart не записан (или без ref=$liv_eid2 — T2 F3)"
 
 # ---- 11) exec: systemctl упал → exit 1 с внятным stderr, agent_run НЕ пишется ------------
 out11a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 30 --transcript-min 25)" \
@@ -372,6 +391,12 @@ chmod +x "$FAKE_SYSTEMCTL_FAIL"
 out11b="$(SYSTEMCTL="$FAKE_SYSTEMCTL_FAIL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid3" 2>&1)" \
   && fail "dept-liveness-exec НЕ упал при ошибке systemctl"
 echo "$out11b" | command grep -q 'systemctl restart' || fail "нет внятного сообщения об ошибке systemctl"
+# T2 F3: комментарий выше обещает "agent_run НЕ пишется" — раньше это было недоказуемо
+# (agent_run не нёс ref заявки, а happy-path #10 уже писал запись для того же worker,
+# что дало бы ложное совпадение). Теперь ref=liv_eid3 отличает ЭТУ (упавшую) заявку.
+"$DL" list --kind agent_run --filter "ref=$liv_eid3" \
+  | jq -e 'select(.data.run_kind=="liveness_restart")' >/dev/null \
+  && fail "agent_run записан для заявки liveness_restart, где systemctl упал (ref=$liv_eid3) — die должен идти ДО append"
 
 # ---- 12) exec: воркер уснул МЕЖДУ подачей заявки и решением оператора → отказ при исполнении --
 out12a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 8 --transcript-min 6)" \

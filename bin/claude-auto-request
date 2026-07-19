@@ -256,8 +256,14 @@ for _try in 1 2 3 4 5; do
   [ -n "$ARG_VALUE" ] && args+=(--arg-value "$ARG_VALUE")
   [ -n "$PAYLOAD" ]   && args+=(--payload "$PAYLOAD")
   [ -n "$REASON" ]    && args+=(--reason "$REASON")
-  if python3 "$DB" "${args[@]}" 2>/dev/null; then qid="$cand"; break; fi
+  # rc захватываем СРАЗУ после команды (не после `if ...; then ... fi`) — bash отдаёт
+  # exit-код самого if-compound'а (0, если ветка then не выполнилась и elif/else нет),
+  # а не exit-код упавшего условия. С захватом после `fi` retry по rc=3 (qid-коллизия)
+  # был мёртв, а die ниже врал "rc=0" на любой реальной ошибке (найдено ревью T2, копия
+  # того же паттерна из dept-liveness-request).
+  python3 "$DB" "${args[@]}" 2>/dev/null
   rc=$?
+  if [ "$rc" = 0 ]; then qid="$cand"; break; fi
   [ "$rc" = 3 ] && continue
   die "could not register the request (db error rc=$rc)"
 done

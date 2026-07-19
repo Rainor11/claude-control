@@ -55,7 +55,10 @@ out="$("$SYSTEMCTL" --user restart "claude-auto@${worker}.service" 2>&1)"; rc=$?
 [ -n "$out" ] && echo "$out"
 [ "$rc" -eq 0 ] || die "systemctl restart claude-auto@${worker}.service завершился ошибкой (rc=$rc)"
 
-# agent_run — best-effort аудит-след (approval_status executed пишет сам раннер/диспетчер)
-"$DL" append --kind agent_run --data "$(jq -nc --arg w "$worker" '{worker:$w, run_kind:"liveness_restart"}')" --actor dispatcher >/dev/null 2>&1 || true
+# agent_run — best-effort аудит-след (approval_status executed пишет сам раннер/диспетчер).
+# ref=approval (event_id заявки) — без него запись неотличима от agent_run других
+# перезапусков ТОГО ЖЕ воркера (несколько liveness_restart на одного worker — обычное
+# дело), тест не мог бы утверждать "для ЭТОЙ заявки запись не появилась" (T2 F3).
+"$DL" append --kind agent_run --data "$(jq -nc --arg w "$worker" --arg ref "$approval" '{worker:$w, run_kind:"liveness_restart", ref:$ref}')" --actor dispatcher >/dev/null 2>&1 || true
 
 echo "liveness-exec complete: $worker перезапущен"

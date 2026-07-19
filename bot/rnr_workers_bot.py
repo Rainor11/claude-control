@@ -939,6 +939,16 @@ async def notify_worker_outcome(bot: Bot, row, approved, ok, detail):
     """Inject the decision outcome into the worker session; mark notified only on a
     successful inject (else it is retried by the loop — notified_at stays NULL)."""
     qid = row["qid"]
+    if row["worker"] == "watchdog":
+        # liveness_restart-карточки: worker/tmux_target зафиксированы буквально как
+        # 'watchdog' (dept-liveness-request) — это systemd-таймер, а не воркер-сессия,
+        # tmux-сессии claude-watchdog не существует и НИКОГДА не появится. run_session_inject
+        # сюда бы неминуемо падал, notified_at так и оставался бы NULL — строка навсегда
+        # занимала бы голову next_actionable() (ORDER BY decided_at ASC) и со временем
+        # голодала бы доставку исходов реальным воркерам. Исход и так виден оператору на
+        # самой карточке (approved/denied текст) — инжектить некому, просто гасим.
+        rnr_db.mark_notified(qid)
+        return
     human = ACTION_LABEL.get(row["action"], row["action"])
     argd = f" ({row.get('arg_kind')}:{row.get('arg_value')})" if row.get("arg_value") else ""
     if not approved:

@@ -94,12 +94,15 @@ gen_qid() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; }
 qid=""
 for _try in 1 2 3 4 5; do
   cand="$(gen_qid)"; [ -n "$cand" ] || die "qid generation failed — заявка $eid открыта в ledger"
-  if python3 "$RNR_DB" insert-approval --qid "$cand" --worker watchdog \
+  # rc захватываем СРАЗУ после команды, а не после `if ...; then ... fi` — bash отдаёт
+  # exit-код самого if-compound'а (0, если ветка then не выполнилась и elif/else нет),
+  # а не exit-код упавшего условия. С захватом после `fi` retry по rc=3 (qid-коллизия)
+  # был мёртв, а die ниже врал "rc=0" на любой реальной ошибке (найдено ревью T2).
+  python3 "$RNR_DB" insert-approval --qid "$cand" --worker watchdog \
       --tmux-target watchdog --chat-id "$OPERATOR_CHAT_ID" --action dept-approval \
-      --arg-kind event_id --arg-value "$eid" --payload "$payload" 2>/dev/null; then
-    qid="$cand"; break
-  fi
+      --arg-kind event_id --arg-value "$eid" --payload "$payload" 2>/dev/null
   rc=$?
+  if [ "$rc" = 0 ]; then qid="$cand"; break; fi
   [ "$rc" = 3 ] && continue
   die "не смог зарегистрировать карточку (db error rc=$rc) — заявка $eid открыта в ledger"
 done
