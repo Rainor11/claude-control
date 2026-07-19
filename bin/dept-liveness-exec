@@ -42,14 +42,14 @@ worker="$(jq -r '.worker // empty' <<<"$request_json")"
 [ -n "$worker" ] || die "request не содержит worker"
 [[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad worker '$worker' в request"
 
-# target из request.worker: существует в реестре, state=active в autonomous.json (plan
-# T2 п.3) — переисполняем ту же проверку, что уже сделал dept-liveness-request на этапе
-# подачи (состояние воркера могло измениться между заявкой и решением оператора).
-role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
-wrole="$(role_of "$worker")"
-[ -n "$wrole" ] || die "воркер '$worker' не найден в реестре — перезапускать нечего"
+# target из request.worker: существует и state=active — ПО autonomous.json (plan T2 п.3) —
+# переисполняем ту же проверку, что уже сделал dept-liveness-request на этапе подачи
+# (состояние воркера могло измениться между заявкой и решением оператора). Членство в
+# реестре ОТДЕЛА не требуем — зеркало dept-liveness-request (/bug 19.07: сторож следит за
+# всем флотом autonomous.json, активные воркеры вне registry.json легитимны).
 wstate="$(jq -r --arg n "$worker" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
-[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=${wstate:-нет в autonomous.json}) — перезапускать нечего"
+[ -n "$wstate" ] || die "воркер '$worker' не найден в autonomous.json — перезапускать нечего"
+[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=$wstate) — перезапускать нечего"
 
 out="$("$SYSTEMCTL" --user restart "claude-auto@${worker}.service" 2>&1)"; rc=$?
 [ -n "$out" ] && echo "$out"

@@ -46,13 +46,15 @@ done
 [[ "$frozen" =~ ^[0-9]{1,5}$ ]] || die "bad --frozen-min '$frozen' (целое число минут)"
 [[ "$transcript" =~ ^[0-9]{1,5}$ ]] || die "bad --transcript-min '$transcript' (целое число минут)"
 
-# воркер существует и active (та же проверка, что dept-sleep-request делает для sleep;
-# роль НЕ ограничиваем — сторож следит за любым зарегистрированным воркером, не только МК)
-role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
-wrole="$(role_of "$worker")"
-[ -n "$wrole" ] || die "воркер '$worker' не найден в реестре отдела"
+# воркер существует и active — ПО autonomous.json (контракт сторожа: claude-auto-liveness
+# следит за ВСЕМ флотом state=active из autonomous.json, а не за реестром отдела). Членство
+# в registry.json НЕ требуем — активный воркер вне реестра легитимен (/bug 19.07:
+# biomerie-portal и sm-app2-core были active без регистрации, и registry-гейт превращал их
+# зависание в вечный «не удалось подать заявку» каждые 5 мин без пути к карточке; plan T2.3
+# требует ровно «существует и active»). Роль тем более не ограничиваем.
 wstate="$(jq -r --arg n "$worker" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
-[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=${wstate:-нет в autonomous.json}) — перезапускать нечего"
+[ -n "$wstate" ] || die "воркер '$worker' не найден в autonomous.json — перезапускать нечего"
+[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=$wstate) — перезапускать нечего"
 
 request_json="$(jq -nc --arg worker "$worker" --arg frozen "$frozen" --arg transcript "$transcript" \
   '{worker:$worker, frozen_min:$frozen, transcript_min:$transcript}')"

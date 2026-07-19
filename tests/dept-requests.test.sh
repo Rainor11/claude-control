@@ -284,10 +284,12 @@ render_bad="$("$DIR/bin/dept-request-render" liveness_restart '{"worker":"w"}' 2
   && fail "рендер liveness_restart не отказал на неполный request"
 echo "$render_bad" | command grep -q 'требует поля' || fail "рендер liveness_restart отказал без пояснения про обязательные поля"
 
-# 8b) dept-liveness-request: несуществующий воркер → отказ, ledger не тронут
+# 8b) dept-liveness-request: несуществующий воркер → отказ, ledger не тронут.
+# Источник истины существования — autonomous.json (контракт сторожа), НЕ реестр отдела
+# (/bug 19.07: registry-гейт ложно отвергал active воркеров вне registry.json).
 out8a="$("$DIR/bin/dept-liveness-request" --worker no-such-worker --frozen-min 5 --transcript-min 5 2>&1)" \
   && fail "dept-liveness-request прошёл для несуществующего воркера"
-echo "$out8a" | command grep -q 'не найден в реестре' || fail "отказ по несуществующему воркеру без пояснения"
+echo "$out8a" | command grep -q 'не найден в autonomous.json' || fail "отказ по несуществующему воркеру без пояснения"
 
 # воркер есть, но не active → отказ
 "$DL" registry-set test-liveness-sleepy --role мк --client тест >/dev/null
@@ -375,6 +377,25 @@ echo "$out10b" | command grep -q 'перезапущен' || fail "нет под
 "$DL" list --kind agent_run --filter "ref=$liv_eid2" \
   | jq -e 'select(.data.run_kind=="liveness_restart" and .data.worker=="test-liveness-w")' >/dev/null \
   || fail "agent_run liveness_restart не записан (или без ref=$liv_eid2 — T2 F3)"
+
+# ---- 10b) /bug 19.07: воркер active в autonomous.json, но НЕ в реестре отдела ------------
+# Легитимный кейс (в проде: biomerie-portal, sm-app2-core) — сторож следит за ВСЕМ флотом
+# state=active из autonomous.json, членство в registry.json для liveness_restart не требуется
+# ни при подаче, ни при исполнении. До фикса request умирал «не найден в реестре отдела» на
+# каждом 5-минутном тике (вечный алерт-цикл «не удалось подать заявку», карточка недостижима),
+# а exec падал бы «не найден в реестре» даже на одобренной заявке.
+mkdir -p "$CLAUDE_CONTROL_DIR/workers/test-liveness-noreg"
+jq '.workers["test-liveness-noreg"] = {state:"active"}' "$CLAUDE_CONTROL_DIR/autonomous.json" > "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" \
+  && mv "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" "$CLAUDE_CONTROL_DIR/autonomous.json"
+out10c="$("$DIR/bin/dept-liveness-request" --worker test-liveness-noreg --frozen-min 6 --transcript-min 6)" \
+  || fail "dept-liveness-request отверг active воркера без регистрации в реестре отдела"
+liv_eid5="$(echo "$out10c" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" approval-resolve "$liv_eid5" --status approved --actor operator >/dev/null
+: > "$FAKE_SYSTEMCTL_LOG"
+out10d="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid5")" \
+  || fail "dept-liveness-exec отверг active воркера без регистрации в реестре отдела: $out10d"
+command grep -q -- '--user restart claude-auto@test-liveness-noreg.service' "$FAKE_SYSTEMCTL_LOG" \
+  || fail "systemctl не вызван для незарегистрированного (но active) воркера"
 
 # ---- 11) exec: systemctl упал → exit 1 с внятным stderr, agent_run НЕ пишется ------------
 out11a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 30 --transcript-min 25)" \
