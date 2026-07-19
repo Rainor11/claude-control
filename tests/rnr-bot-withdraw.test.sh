@@ -106,6 +106,20 @@ actionable = rnr_db.next_actionable(limit=50)
 qids = {r["qid"] for r in actionable}
 check("q5" in qids, "next_actionable не подхватывает status='withdrawn'")
 
+# 6) /bug ф4: reason приходит от воркера без ограничений — claim_withdraw обязан капнуть
+#    result до 400 (зеркало dept-ledger approval-withdraw .slice(0,400)), иначе тег
+#    «Отозвано автором: …» пробивает лимит Telegram-сообщения (4096), правка текста падает,
+#    и карточка остаётся без пометки отзыва (срабатывает только fallback-снятие кнопок).
+row6 = mk_row("q6", "evt_6_ffff", 4646, "ю" * 5000)
+check(len(row6["result"]) <= 400, f"result не капнут: {len(row6['result'])} симв. > 400")
+bot6 = FakeBot()
+asyncio.run(bot_mod.process_approval(bot6, row6))
+check(len(bot6.text_calls) == 1, "карточка с длинной причиной не погашена основным путём")
+if bot6.text_calls:
+    t = bot6.text_calls[0].get("text", "")
+    check(len(t) < 4096, f"текст карточки {len(t)} симв. >= лимита Telegram 4096")
+    check("Отозвано автором" in t, "тег отзыва потерян при длинной причине")
+
 if failures:
     for f in failures:
         print("FAIL:", f)

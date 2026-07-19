@@ -390,13 +390,21 @@ def claim_withdraw(event_id, worker, reason=None):
                     other worker's arg_value collided) — caller must fail-closed and
                     NOT write to the ledger.
     """
+    # Кап 400 — зеркало dept-ledger approval-withdraw (.slice(0,400)): reason приходит от
+    # воркера без ограничений (dept-withdraw пробрасывает argv как есть), а result попадает
+    # в тег «Отозвано автором: …» при редактировании карточки (rnr_workers_bot.process_approval).
+    # Без капа многокилобайтный reason пробивал бы лимит Telegram-сообщения (4096) → правка
+    # текста падала бы, оставляя карточку без пометки отзыва (только fallback-снятие кнопок).
+    reason = _sane_text(reason)
+    if isinstance(reason, str):
+        reason = reason[:400]
     conn = connect()
     try:
         with conn:
             cur = conn.execute(
                 "UPDATE approvals SET status='withdrawn', decided_via='worker', decided_at=?, result=? "
                 "WHERE arg_kind='event_id' AND arg_value=? AND worker=? AND status='open'",
-                (now_iso(), _sane_text(reason), event_id, worker),
+                (now_iso(), reason, event_id, worker),
             )
             if cur.rowcount == 1:
                 return "withdrawn"
