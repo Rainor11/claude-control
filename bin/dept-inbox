@@ -244,7 +244,7 @@ async function collectActivity() {
 // kind_of (outgoing/kb_change/…) сюда намеренно НЕ попадают: их «исполняет» сам воркер без
 // финального статуса в ledger — они висели бы в секции вечно (rotate считает их закрытыми).
 // Синхронно с EXEC_KINDS в bin/dept-dispatcher (пин — dept-dispatcher.test.mjs).
-const EXEC_KINDS_INBOX = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
+const EXEC_KINDS_INBOX = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
 async function collectApprovalsPage() {
   const res = await Promise.all([
     dl(['list', '--kind', 'approval', '--status', 'open']),
@@ -267,12 +267,18 @@ async function collectApprovalsPage() {
   // 'approved_foreign' (багхант 16.07). При ошибке чтения реестра роли неизвестны —
   // не мислейблим (остаёмся на оптимистичном 'approved', баннер readError и так виден).
   const registry = reg.rows[0] || { workers: {} };
-  const dispatcherWill = (from) => reg.error
-    || ((registry.workers || {})[from] || {}).role === 'руководитель' || from === 'operator';
+  // liveness_restart — зеркало watchdog-ветки pickExecutable в bin/dept-dispatcher: диспетчер
+  // возьмёт её ТОЛЬКО от 'watchdog', а не от руководителя/operator (та же узкая ветка, не
+  // общее ослабление). Без этого liveness_restart от watchdog всегда мислейблился бы
+  // 'approved_foreign' — 'watchdog' не значится в реестре руководителем/оператором.
+  const dispatcherWill = (from, kindOf) => {
+    if (kindOf === 'liveness_restart') return from === 'watchdog';
+    return reg.error || ((registry.workers || {})[from] || {}).role === 'руководитель' || from === 'operator';
+  };
   const executingNow = [
     ...executingRes.rows.map((e) => ({ ...e, phase: 'executing' })),
     ...approvedRes.rows.filter((e) => e.data && EXEC_KINDS_INBOX.has(e.data.kind_of))
-      .map((e) => ({ ...e, phase: dispatcherWill(e.data.from) ? 'approved' : 'approved_foreign' })),
+      .map((e) => ({ ...e, phase: dispatcherWill(e.data.from, e.data.kind_of) ? 'approved' : 'approved_foreign' })),
   ];
   return { approvals: approvals.rows.reverse(), incidents: incidents.rows.reverse(), recent: recent.rows.reverse(),
     executed: executed.reverse(), executingNow: executingNow.reverse(),

@@ -28,13 +28,23 @@ const { execFileSync } = require('child_process');
 const crypto = require('crypto');
 const { memoryFreshnessFromTx } = require('./dept-memory-freshness');
 
-const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
+const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
 // Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
 // registry) — approved-строка сама по себе НЕ мандат (ledger-CLI доступен воркерам;
 // /proc-гард в dept-ledger — первый забор, этот фильтр — второй).
+// liveness_restart (T2 сторож-кнопки, plan п.5) — отдельная, СТРОЖЕ ветка: подать
+// её мог только сторож (actor buквально 'watchdog', см. bin/dept-liveness-request
+// header), НЕ руководитель и НЕ operator — у ручного рестарта есть свой прямой путь
+// (systemctl), этот гейт существует только для сторожа. Не расширяет общую ветку —
+// подмешивать liveness_restart в руководитель/operator-правило значило бы разрешить
+// руководителю его тоже подавать, чего plan не просит («минимально, не ослабив
+// существующие»).
 function pickExecutable(rows, roleOf) {
-  return rows.filter((r) => r.data && EXEC_KINDS.has(r.data.kind_of)
-    && (roleOf(r.data.from) === 'руководитель' || r.data.from === 'operator'));
+  return rows.filter((r) => {
+    if (!r.data || !EXEC_KINDS.has(r.data.kind_of)) return false;
+    if (r.data.kind_of === 'liveness_restart') return r.data.from === 'watchdog';
+    return roleOf(r.data.from) === 'руководитель' || r.data.from === 'operator';
+  });
 }
 // Решение оператора №6: авто-сон по неактивности (human-in-the-loop через Руководителя).
 function decideSleep(w, cfg) {
@@ -169,6 +179,7 @@ const SYSTEMD_RUN = process.env.DEPT_SYSTEMD_RUN || 'systemd-run';
 const EXECUTORS = {
   worker_spawn: 'dept-spawn-exec', mission_change: 'dept-mission-exec',
   planerka: 'dept-planerka-exec', sleep: 'dept-sleep-exec',
+  liveness_restart: 'dept-liveness-exec',
 };
 
 // Best-effort лок (см. liveness/rebase-check): ручной прогон параллельно с таймером

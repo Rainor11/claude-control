@@ -12,7 +12,7 @@ const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
 const led = (home, args) => execFileSync(LEDGER, args, { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
 
 test('EXEC_KINDS: только исполняемые диспетчером kind_of', () => {
-  assert.deepEqual([...EXEC_KINDS].sort(), ['mission_change', 'planerka', 'sleep', 'worker_spawn']);
+  assert.deepEqual([...EXEC_KINDS].sort(), ['liveness_restart', 'mission_change', 'planerka', 'sleep', 'worker_spawn']);
 });
 
 test('pickExecutable: только исполняемые kind_of И только от руководителя/оператора', () => {
@@ -27,6 +27,21 @@ test('pickExecutable: только исполняемые kind_of И тольк�
     { event_id: 'e7', data: { kind_of: 'sleep', from: 'dept-head' } },
   ];
   assert.deepEqual(pickExecutable(rows, roleOf).map((r) => r.event_id), ['e1', 'e3', 'e4', 'e7']);
+});
+
+// T2 сторож-кнопки (plan п.5): liveness_restart — ОТДЕЛЬНАЯ, УЖЕ ветка от общего правила
+// выше — исполняется, только если заявку подал буквально 'watchdog'. Ни руководитель
+// (даже с ролью в реестре), ни 'operator', ни любой другой воркер — НЕ проходят, в
+// отличие от worker_spawn/mission_change/planerka/sleep, где руководитель/operator ок.
+test('pickExecutable: liveness_restart исполняется ТОЛЬКО от watchdog', () => {
+  const roleOf = (n) => ({ 'dept-head': 'руководитель' }[n]);
+  const rows = [
+    { event_id: 'lr1', data: { kind_of: 'liveness_restart', from: 'watchdog' } },   // ок
+    { event_id: 'lr2', data: { kind_of: 'liveness_restart', from: 'dept-head' } },  // руководитель — НЕ проходит
+    { event_id: 'lr3', data: { kind_of: 'liveness_restart', from: 'operator' } },   // operator — тоже НЕ проходит
+    { event_id: 'lr4', data: { kind_of: 'liveness_restart', from: 'mk-a' } },       // подставной воркер — нет
+  ];
+  assert.deepEqual(pickExecutable(rows, roleOf).map((r) => r.event_id), ['lr1']);
 });
 
 test('decideSleep: пороги, гарды, дедуп, авто-режим', () => {

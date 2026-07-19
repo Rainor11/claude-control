@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { renderApprovalsPage, renderApproval, renderOffice, renderTimeline, renderActivity, renderIncidents } =
   require('../bin/dept-inbox-render.js');
+const { collectApprovalsPage } = require('../bin/dept-inbox');
 
 const apr = { event_id: 'evt_1_aaaa', ts: new Date().toISOString(), actor: 'mk-prodmash',
   data: { kind_of: 'outgoing', from: 'mk-prodmash', status: 'open',
@@ -87,7 +91,34 @@ test('EXEC_KINDS_INBOX (dept-inbox) синхронен с EXEC_KINDS dispatcher'
   const m = /EXEC_KINDS_INBOX\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(src);
   assert.ok(m, 'EXEC_KINDS_INBOX не найден в bin/dept-inbox — переименовали? обнови тест и сверь 5 копий');
   const kinds = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
-  assert.deepEqual(kinds, ['mission_change', 'planerka', 'sleep', 'worker_spawn']);
+  assert.deepEqual(kinds, ['liveness_restart', 'mission_change', 'planerka', 'sleep', 'worker_spawn']);
+});
+
+// T2 сторож-кнопки: dispatcherWill (внутри collectApprovalsPage) мисклассифицировал бы
+// approved liveness_restart от watchdog как 'approved_foreign' (watchdog не значится
+// руководителем/operator в реестре) — оператор увидел бы «диспетчер НЕ возьмёт» про
+// заявку, которую диспетчер ВОЗЬМЁТ (pickExecutable её как раз ждёт). Интеграционный
+// тест через реальный dept-ledger (зеркало 'pickExecutable через реальный ledger' в
+// dept-dispatcher.test.mjs) — dispatcherWill не экспортируется отдельно.
+test('collectApprovalsPage: liveness_restart от watchdog — фаза approved, не approved_foreign', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-inbox-'));
+  const polDir = mkdtempSync(join(tmpdir(), 'dept-inbox-pol-'));
+  writeFileSync(join(polDir, 'policy-v1.md'), '# правила v1\n');
+  const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
+  const env = { ...process.env, DEPT_HOME: home, DEPT_POLICY_DIR: polDir };
+  const led = (args) => execFileSync(LEDGER, args, { env, encoding: 'utf8' });
+  const a = JSON.parse(led(['approval-open', '--kind-of', 'liveness_restart', '--summary', 's', '--actor', 'watchdog']));
+  led(['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  const prevHome = process.env.DEPT_HOME, prevPol = process.env.DEPT_POLICY_DIR;
+  process.env.DEPT_HOME = home; process.env.DEPT_POLICY_DIR = polDir;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.DEPT_HOME; else process.env.DEPT_HOME = prevHome;
+    if (prevPol === undefined) delete process.env.DEPT_POLICY_DIR; else process.env.DEPT_POLICY_DIR = prevPol;
+  });
+  const page = await collectApprovalsPage();
+  const row = page.executingNow.find((r) => r.event_id === a.event_id);
+  assert.ok(row, 'approved liveness_restart не попал в executingNow (EXEC_KINDS_INBOX разъехался?)');
+  assert.equal(row.phase, 'approved', 'watchdog liveness_restart должен быть approved, не approved_foreign (dispatcherWill разъехался с pickExecutable)');
 });
 
 test('renderApproval показывает detail и историю статусов', () => {

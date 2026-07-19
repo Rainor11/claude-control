@@ -637,7 +637,7 @@ test('EXEC_KINDS_ROT (rotate) синхронен с EXEC_KINDS dispatcher и WHI
   const m = /EXEC_KINDS_ROT\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(src);
   assert.ok(m, 'EXEC_KINDS_ROT не найден в bin/dept-ledger — переименовали? обнови тест и сверь 4 копии');
   const kinds = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
-  assert.deepEqual(kinds, ['mission_change', 'planerka', 'sleep', 'worker_spawn']);
+  assert.deepEqual(kinds, ['liveness_restart', 'mission_change', 'planerka', 'sleep', 'worker_spawn']);
 });
 
 test('die-под-локом: approval-resolve на несуществующий ref не держит лок (Codex-аудит В3)', () => {

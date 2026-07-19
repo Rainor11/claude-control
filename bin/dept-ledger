@@ -725,7 +725,7 @@ function cmdRotate(a) {
     // читает только активный файл и потерял бы заявку.
     // Синхронно с EXEC_KINDS dispatcher (его пинит dept-dispatcher.test.mjs) и
     // WHITELIST dept-exec-runner; эту копию пинит dept-ledger.test.mjs (M-1).
-    const EXEC_KINDS_ROT = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep']);
+    const EXEC_KINDS_ROT = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
     const CLOSED = {
       message: (s) => ['handled', 'dead'].includes(s),
       // Task 11-fix: 'executing' НЕ перечислен здесь ни в одной ветке → всегда считается

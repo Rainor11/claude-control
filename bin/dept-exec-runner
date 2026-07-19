@@ -54,7 +54,7 @@ esac; done
 
 # whitelist: basename ДОЛЖЕН быть одним из известных исполнителей заявок руководителя, И
 # резолвленный каталог ДОЛЖЕН совпадать с каталогом самого раннера (не произвольный путь).
-WHITELIST="dept-spawn-exec dept-mission-exec dept-planerka-exec dept-sleep-exec"
+WHITELIST="dept-spawn-exec dept-mission-exec dept-planerka-exec dept-sleep-exec dept-liveness-exec"
 executor_base="$(basename -- "$executor")"
 ok=false
 for w in $WHITELIST; do [ "$executor_base" = "$w" ] && ok=true && break; done

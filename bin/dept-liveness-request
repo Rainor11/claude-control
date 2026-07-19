@@ -1,0 +1,108 @@
+#!/bin/bash
+# dept-liveness-request — заявка сторожа (watchdog, systemd-таймер) на перезапуск
+# зависшего воркера через гейт отдела (решение оператора 19.07: кнопка вместо
+# авто-рестарта). Args: --worker <name> --frozen-min <N> --transcript-min <M>.
+#
+# НЕ WORKER-ONLY (в отличие от dept-planerka-request/dept-sleep-request — соседей,
+# на которых эта обёртка ЧАСТИЧНО зеркалится): claude-auto-liveness запускается
+# systemd-таймером claude-auto-liveness.timer, его /proc-предки НЕ ведут к
+# claude-сессии (проверено: .config/systemd/user/claude-auto-liveness.{service,timer}
+# запускают node напрямую) — spoof-resistant resolve_name() отсюда никогда бы не
+# резолвился, поэтому её здесь нет вовсе. actor фиксирован буквально как 'watchdog' —
+# тот же приём, что claude-auto-liveness УЖЕ применяет для incident-open --actor
+# watchdog (bin/claude-auto-liveness). Этот label — заявление, не крипто-доказанная
+# идентичность (как и у incident-open): защита от подделки не здесь, а в
+# dept-dispatcher pickExecutable (исполняет liveness_restart ТОЛЬКО если data.from
+# буквально 'watchdog') + в том, что этот бинарь не входит в allow воркеров.
+#
+# Карточка оператору: claude-auto-request (закрытый каталог, action=dept-approval)
+# ТРЕБУЕТ ту же resolve_name-идентичность (worker session) — сторожу недоступен по
+# ТОЙ ЖЕ причине. dept-approve (которым обычно оборачивают approval-open) тоже
+# WORKER-ONLY — не годится. Вместо них: dept-ledger approval-open напрямую (проверено,
+# без /proc-гарда на --actor не привилегированных событий) + прямой вызов
+# bot/rnr_db.py insert-approval — ТОТ ЖЕ приём, что уже применяет bin/dept-withdraw
+# (RNR_DB_BIN-override + fail-closed python3-вызов), а НЕ придуманный заново.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"
+RR="$BINDIR/dept-request-render"
+RNR_DB="${RNR_DB_BIN:-$BINDIR/../bot/rnr_db.py}"
+OPERATOR_ENV="${CLAUDE_AUTO_OPERATOR_ENV:-/home/rainor/server/.env}"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+die() { echo "dept-liveness-request: $*" >&2; exit 1; }
+
+worker="" frozen="" transcript=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --worker) worker="${2:-}"; shift 2 ;;
+    --frozen-min) frozen="${2:-}"; shift 2 ;;
+    --transcript-min) transcript="${2:-}"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+[ -n "$worker" ] && [ -n "$frozen" ] && [ -n "$transcript" ] \
+  || die "usage: dept-liveness-request --worker <w> --frozen-min <N> --transcript-min <M>"
+[[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad --worker '$worker'"
+[[ "$frozen" =~ ^[0-9]{1,5}$ ]] || die "bad --frozen-min '$frozen' (целое число минут)"
+[[ "$transcript" =~ ^[0-9]{1,5}$ ]] || die "bad --transcript-min '$transcript' (целое число минут)"
+
+# воркер существует и active (та же проверка, что dept-sleep-request делает для sleep;
+# роль НЕ ограничиваем — сторож следит за любым зарегистрированным воркером, не только МК)
+role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
+wrole="$(role_of "$worker")"
+[ -n "$wrole" ] || die "воркер '$worker' не найден в реестре отдела"
+wstate="$(jq -r --arg n "$worker" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
+[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=${wstate:-нет в autonomous.json}) — перезапускать нечего"
+
+request_json="$(jq -nc --arg worker "$worker" --arg frozen "$frozen" --arg transcript "$transcript" \
+  '{worker:$worker, frozen_min:$frozen, transcript_min:$transcript}')"
+detail="$("$RR" liveness_restart "$request_json")" || die "не удалось построить detail из request"
+summary="перезапуск зависшего воркера $worker"
+
+out="$("$DL" approval-open --kind-of liveness_restart --summary "$summary" \
+  --detail "$detail" --actor watchdog --request-json "$request_json")" \
+  || die "не удалось открыть заявку в ledger"
+eid="$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(j.event_id){console.log(j.event_id);return}}catch{} process.exit(1)})')" \
+  || die "не удалось прочитать event_id из ответа ledger ($out)"
+[ -n "$eid" ] || die "ledger не вернул event_id"
+
+# Карточка. FAIL-CLOSED (как dept-withdraw, как dept-approve): заявка УЖЕ открыта в
+# ledger на этой точке — если карточку отправить нечем/не удалось, кричим в stderr и
+# возвращаем exit 1, чтобы вызывающий (watchdog) НЕ решил, что заявка доставлена.
+# Заявка не потеряна: попадёт под reminder диспетчера про открытые заявки без решения
+# (staleOpenApprovals), но это часы, не немедленная доставка — оператор должен узнать
+# СРАЗУ, что штатная доставка карточки не сработала.
+[ -f "$RNR_DB" ] || die "не найден $RNR_DB — карточку отправить нечем (заявка $eid открыта в ledger)"
+
+OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
+[ -n "$OPERATOR_CHAT_ID" ] || die "operator chat_id unavailable ($OPERATOR_ENV) — заявка $eid открыта в ledger, карточка не отправлена"
+
+# Приём "не дублировать заголовок" — дословно из claude-auto-request (dept-approval branch):
+# если первая строка detail совпадает с summary, показываем только detail.
+payload="$summary"
+if python3 -c 'import sys
+s, d = sys.argv[1], sys.argv[2]
+sys.exit(0 if d.split("\n", 1)[0].strip().casefold() == s.strip().casefold() else 1)' "$summary" "$detail"; then
+  payload="$detail"
+else
+  payload="$summary
+
+$detail"
+fi
+
+gen_qid() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; }
+qid=""
+for _try in 1 2 3 4 5; do
+  cand="$(gen_qid)"; [ -n "$cand" ] || die "qid generation failed — заявка $eid открыта в ledger"
+  if python3 "$RNR_DB" insert-approval --qid "$cand" --worker watchdog \
+      --tmux-target watchdog --chat-id "$OPERATOR_CHAT_ID" --action dept-approval \
+      --arg-kind event_id --arg-value "$eid" --payload "$payload" 2>/dev/null; then
+    qid="$cand"; break
+  fi
+  rc=$?
+  [ "$rc" = 3 ] && continue
+  die "не смог зарегистрировать карточку (db error rc=$rc) — заявка $eid открыта в ledger"
+done
+[ -n "$qid" ] || die "не смог выделить уникальный qid для карточки — заявка $eid открыта в ledger"
+
+echo "$out"

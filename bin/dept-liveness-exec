@@ -1,0 +1,61 @@
+#!/bin/bash
+# dept-liveness-exec — исполнитель заявки liveness_restart: перезапускает зависшего
+# воркера штатным systemd-юнитом (решение оператора 19.07 — сторож-кнопка вместо
+# авто-рестарта самим сторожем). Запускается ТОЛЬКО dept-dispatcher'ом/dept-exec-runner
+# (--approval <event_id>) — в отличие от dept-sleep-exec, прямых флагов --worker нет
+# намеренно: у liveness_restart нет легитимного "оператор жмёт руками" пути (plan T2),
+# ручной перезапуск — просто `systemctl --user restart claude-auto@<name>`.
+#
+# Anti-forge (как dept-sleep-exec, Codex-аудит К4): detail заявки РЕНДЕРИТСЯ ЗАНОВО
+# из data.request через dept-request-render и сверяется байт-в-байт с data.detail,
+# записанным в ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых
+# побочных эффектов.
+#
+# systemctl зовётся через переопределяемую переменную SYSTEMCTL: прецедента мока
+# systemctl в существующих shell-тестах нет (соседние тесты останавливаются ДО
+# реального вызова systemctl, не мокают его) — здесь happy-path exec реально нужен
+# в тесте (plan T2 п.6), поэтому SYSTEMCTL="${SYSTEMCTL:-systemctl}" по образцу
+# CLAUDE_AUTO_BIN/RNR_DB_BIN/TELEGRAM_NOTIFY-переопределений у соседей.
+set -u
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+die() { echo "dept-liveness-exec: $*" >&2; exit 1; }
+
+approval=""
+while [ $# -gt 0 ]; do case "$1" in
+  --approval) approval="${2:-}"; shift 2 ;;
+  *) die "unknown arg $1" ;;
+esac; done
+[ -n "$approval" ] || die "usage: dept-liveness-exec --approval <event_id>"
+
+row="$("$DL" list --kind approval --event-id "$approval")" || die "аппрув не найден"
+[ -n "$row" ] || die "аппрув не найден: $approval"
+kind_of_row="$(jq -r '.data.kind_of // empty' <<<"$row")"
+[ "$kind_of_row" = "liveness_restart" ] || die "аппрув $approval имеет kind_of=$kind_of_row, ожидался liveness_restart"
+request_json="$(jq -c '.data.request // {}' <<<"$row")"
+ledger_detail="$(jq -r '.data.detail // empty' <<<"$row")"
+rendered_detail="$("$RR" liveness_restart "$request_json")" || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя (рендер не удался)"
+[ "$rendered_detail" = "$ledger_detail" ] || die "detail ≠ request — заявка подделана или повреждена, исполнять нельзя"
+worker="$(jq -r '.worker // empty' <<<"$request_json")"
+[ -n "$worker" ] || die "request не содержит worker"
+[[ "$worker" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad worker '$worker' в request"
+
+# target из request.worker: существует в реестре, state=active в autonomous.json (plan
+# T2 п.3) — переисполняем ту же проверку, что уже сделал dept-liveness-request на этапе
+# подачи (состояние воркера могло измениться между заявкой и решением оператора).
+role_of() { local j; j="$("$DL" registry-get "$1" 2>/dev/null)" || j=""; printf '%s' "$j" | jq -r '.role // empty' 2>/dev/null; }
+wrole="$(role_of "$worker")"
+[ -n "$wrole" ] || die "воркер '$worker' не найден в реестре — перезапускать нечего"
+wstate="$(jq -r --arg n "$worker" '.workers[$n].state // empty' "$CONTROL_DIR/autonomous.json" 2>/dev/null)"
+[ "$wstate" = "active" ] || die "воркер '$worker' не active (state=${wstate:-нет в autonomous.json}) — перезапускать нечего"
+
+out="$("$SYSTEMCTL" --user restart "claude-auto@${worker}.service" 2>&1)"; rc=$?
+[ -n "$out" ] && echo "$out"
+[ "$rc" -eq 0 ] || die "systemctl restart claude-auto@${worker}.service завершился ошибкой (rc=$rc)"
+
+# agent_run — best-effort аудит-след (approval_status executed пишет сам раннер/диспетчер)
+"$DL" append --kind agent_run --data "$(jq -nc --arg w "$worker" '{worker:$w, run_kind:"liveness_restart"}')" --actor dispatcher >/dev/null 2>&1 || true
+
+echo "liveness-exec complete: $worker перезапущен"

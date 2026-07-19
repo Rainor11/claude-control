@@ -248,4 +248,142 @@ long_len="$(DL_PL list --kind message --filter 'to=mk-long-p' --status queued | 
 [ "$long_len" -le 300 ] || fail "reason 400 симв. пробил кап body ($long_len > 300)"
 echo "  planerka-exec: рассылка OK"
 
+# ---- 8) dept-liveness-request / dept-request-render liveness_restart (T2 сторож-кнопки) ---
+# dept-liveness-request НЕ worker-only (сторож — systemd, не сессия) — не нужен
+# DEPT_APPROVE_TEST_ACTOR/SANDBOX-копия, зовём реальный bin/ напрямую. Карточка — мок
+# rnr_db.py (RNR_DB_BIN), той же схемой, что tests/dept-withdraw.test.sh мокает dept-withdraw.
+LIV_ENV_FILE="$(mktemp)"
+printf 'TELEGRAM_CHAT_ID=999999999\n' > "$LIV_ENV_FILE"
+export CLAUDE_AUTO_OPERATOR_ENV="$LIV_ENV_FILE"
+
+export LIV_RNR_LOG="$(mktemp)"
+LIV_RNR_DB="$(mktemp -d)/fake-rnr-db.py"
+cat > "$LIV_RNR_DB" <<'EOF'
+import os, sys
+open(os.environ['LIV_RNR_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\n')
+sys.exit(3 if os.environ.get('LIV_RNR_FAIL') == '1' else 0)
+EOF
+export RNR_DB_BIN="$LIV_RNR_DB"
+
+"$DL" registry-set test-liveness-w --role мк --client тест >/dev/null
+mkdir -p "$CLAUDE_CONTROL_DIR/workers/test-liveness-w"
+jq '.workers["test-liveness-w"] = {state:"active"}' "$CLAUDE_CONTROL_DIR/autonomous.json" > "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" \
+  && mv "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" "$CLAUDE_CONTROL_DIR/autonomous.json"
+
+# 8a) рендер: текст содержит воркера/минуты, без анлицизма "resume" (policy v10 п.3.8)
+liv_req='{"worker":"test-liveness-w","frozen_min":"12","transcript_min":"9"}'
+liv_detail="$("$DIR/bin/dept-request-render" liveness_restart "$liv_req")" || fail "рендер liveness_restart упал"
+echo "$liv_detail" | command grep -q 'test-liveness-w' || fail "рендер liveness_restart не содержит имя воркера"
+echo "$liv_detail" | command grep -q '12 мин' || fail "рендер liveness_restart не содержит frozen_min"
+echo "$liv_detail" | command grep -q '9 мин' || fail "рендер liveness_restart не содержит transcript_min"
+echo "$liv_detail" | command grep -qi 'resume' && fail "рендер liveness_restart содержит англицизм 'resume' (policy v10 п.3.8)"
+
+# отсутствующее поле → die (капчено через переменную, НЕ прямым pipe из падающей команды —
+# pipefail сделал бы exit-код пайпа неотличимым от grep-результата)
+render_bad="$("$DIR/bin/dept-request-render" liveness_restart '{"worker":"w"}' 2>&1)" \
+  && fail "рендер liveness_restart не отказал на неполный request"
+echo "$render_bad" | command grep -q 'требует поля' || fail "рендер liveness_restart отказал без пояснения про обязательные поля"
+
+# 8b) dept-liveness-request: несуществующий воркер → отказ, ledger не тронут
+out8a="$("$DIR/bin/dept-liveness-request" --worker no-such-worker --frozen-min 5 --transcript-min 5 2>&1)" \
+  && fail "dept-liveness-request прошёл для несуществующего воркера"
+echo "$out8a" | command grep -q 'не найден в реестре' || fail "отказ по несуществующему воркеру без пояснения"
+
+# воркер есть, но не active → отказ
+"$DL" registry-set test-liveness-sleepy --role мк --client тест >/dev/null
+mkdir -p "$CLAUDE_CONTROL_DIR/workers/test-liveness-sleepy"
+jq '.workers["test-liveness-sleepy"] = {state:"sleeping"}' "$CLAUDE_CONTROL_DIR/autonomous.json" > "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" \
+  && mv "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" "$CLAUDE_CONTROL_DIR/autonomous.json"
+out8b="$("$DIR/bin/dept-liveness-request" --worker test-liveness-sleepy --frozen-min 5 --transcript-min 5 2>&1)" \
+  && fail "dept-liveness-request прошёл для не-active воркера"
+echo "$out8b" | command grep -q 'не active' || fail "отказ по не-active воркеру без пояснения"
+
+# 8c) happy path: заявка открывается actor=watchdog, карточка "отправляется" (мок rnr_db.py)
+: > "$LIV_RNR_LOG"
+out8c="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 12 --transcript-min 9)" \
+  || fail "dept-liveness-request (валидный воркер) упал"
+liv_eid="$(echo "$out8c" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" list --kind approval --event-id "$liv_eid" \
+  | jq -e '.data.kind_of=="liveness_restart" and .data.from=="watchdog" and .data.request.worker=="test-liveness-w" and .data.request.frozen_min=="12" and .data.request.transcript_min=="9"' >/dev/null \
+  || fail "approval liveness_restart содержит неверные kind_of/from/request"
+command grep -q 'insert-approval' "$LIV_RNR_LOG" || fail "карточка не отправлена через rnr_db.py insert-approval"
+command grep -q -- '--worker watchdog' "$LIV_RNR_LOG" || fail "карточка не помечена worker=watchdog"
+command grep -q -- "--arg-value $liv_eid" "$LIV_RNR_LOG" || fail "карточка не ссылается на event_id заявки"
+
+# карточку отправить нечем (rnr_db.py недоступен) → dept-liveness-request FAIL-CLOSED
+# (заявка в ledger уже открыта — увидит её reminder диспетчера, но вызывающий обязан
+# узнать о провале доставки карточки сразу, exit 1)
+out8d="$(RNR_DB_BIN=/nonexistent/rnr_db.py "$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 3 --transcript-min 3 2>&1)" \
+  && fail "dept-liveness-request прошёл без доступного rnr_db.py"
+echo "$out8d" | command grep -q 'карточку отправить нечем' || fail "нет fail-closed сообщения при недоступном rnr_db.py"
+
+# ---- 9) anti-forge: подмена data.detail → dept-liveness-exec отказывает ДО systemctl ------
+LIV_EID="$liv_eid" node -e '
+const fs = require("fs");
+const file = process.env.DEPT_HOME + "/events.jsonl";
+const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const eid = process.env.LIV_EID;
+let found = false;
+for (const e of lines) if (e.event_id === eid) { e.data.detail = "подделанный detail — не соответствует request"; found = true; }
+if (!found) throw new Error("event не найден для подмены detail");
+fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+'
+"$DL" approval-resolve "$liv_eid" --status approved --actor operator >/dev/null
+FAKE_SYSTEMCTL="$(mktemp -d)/fake-systemctl"
+FAKE_SYSTEMCTL_LOG="$(mktemp)"
+cat > "$FAKE_SYSTEMCTL" <<EOF
+#!/bin/bash
+echo "SYSTEMCTL \$*" >> "$FAKE_SYSTEMCTL_LOG"
+exit 0
+EOF
+chmod +x "$FAKE_SYSTEMCTL"
+out9="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid" 2>&1)" \
+  && fail "dept-liveness-exec исполнил заявку с подделанным detail"
+echo "$out9" | command grep -q 'detail ≠ request' || fail "нет anti-forge сообщения 'detail ≠ request'"
+[ -s "$FAKE_SYSTEMCTL_LOG" ] && fail "systemctl вызван на подделанной заявке — anti-forge не остановил ДО побочных эффектов"
+
+# ---- 10) happy-path exec: мок systemctl получает правильный юнит, agent_run записан ------
+out10a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 20 --transcript-min 15)" \
+  || fail "вторая заявка liveness_restart не прошла"
+liv_eid2="$(echo "$out10a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" approval-resolve "$liv_eid2" --status approved --actor operator >/dev/null
+: > "$FAKE_SYSTEMCTL_LOG"
+out10b="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid2")" \
+  || fail "dept-liveness-exec (happy path) упал: $out10b"
+command grep -q -- '--user restart claude-auto@test-liveness-w.service' "$FAKE_SYSTEMCTL_LOG" \
+  || fail "systemctl вызван не с ожидаемыми аргументами"
+echo "$out10b" | command grep -q 'перезапущен' || fail "нет подтверждения перезапуска в выводе"
+"$DL" list --kind agent_run --filter "worker=test-liveness-w" \
+  | jq -e 'select(.data.run_kind=="liveness_restart")' >/dev/null \
+  || fail "agent_run liveness_restart не записан"
+
+# ---- 11) exec: systemctl упал → exit 1 с внятным stderr, agent_run НЕ пишется ------------
+out11a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 30 --transcript-min 25)" \
+  || fail "третья заявка liveness_restart не прошла"
+liv_eid3="$(echo "$out11a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" approval-resolve "$liv_eid3" --status approved --actor operator >/dev/null
+FAKE_SYSTEMCTL_FAIL="$(mktemp -d)/fake-systemctl-fail"
+cat > "$FAKE_SYSTEMCTL_FAIL" <<'EOF'
+#!/bin/bash
+echo "Unit claude-auto@test-liveness-w.service not found." >&2
+exit 5
+EOF
+chmod +x "$FAKE_SYSTEMCTL_FAIL"
+out11b="$(SYSTEMCTL="$FAKE_SYSTEMCTL_FAIL" "$DIR/bin/dept-liveness-exec" --approval "$liv_eid3" 2>&1)" \
+  && fail "dept-liveness-exec НЕ упал при ошибке systemctl"
+echo "$out11b" | command grep -q 'systemctl restart' || fail "нет внятного сообщения об ошибке systemctl"
+
+# ---- 12) exec: воркер уснул МЕЖДУ подачей заявки и решением оператора → отказ при исполнении --
+out12a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min 8 --transcript-min 6)" \
+  || fail "четвёртая заявка liveness_restart не прошла"
+liv_eid4="$(echo "$out12a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
+"$DL" approval-resolve "$liv_eid4" --status approved --actor operator >/dev/null
+jq '.workers["test-liveness-w"].state = "sleeping"' "$CLAUDE_CONTROL_DIR/autonomous.json" > "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" \
+  && mv "$CLAUDE_CONTROL_DIR/autonomous.json.tmp" "$CLAUDE_CONTROL_DIR/autonomous.json"
+out12b="$("$DIR/bin/dept-liveness-exec" --approval "$liv_eid4" 2>&1)" \
+  && fail "dept-liveness-exec исполнил заявку на не-active воркере"
+echo "$out12b" | command grep -q 'не active' || fail "нет пояснения про не-active воркера при исполнении"
+
+echo "  liveness-restart: OK"
+
 echo PASS

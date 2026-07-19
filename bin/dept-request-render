@@ -59,5 +59,15 @@ case "$kind_of" in
     printf 'Причина: %s\n' "${reason:-не указана}"
     printf '\nКонтур остаётся живым: датчики клиента продолжают опрашиваться диспетчером; новое событие (сообщение/Asana-коммент) автоматически разбудит воркера.\n'
     ;;
-  *) die "неизвестный kind_of: $kind_of (∈ worker_spawn|mission_change|planerka|sleep)" ;;
+  liveness_restart)
+    worker="$(jget worker)"; frozen="$(jget frozen_min)"; transcript="$(jget transcript_min)"
+    [ -n "$worker" ] && [ -n "$frozen" ] && [ -n "$transcript" ] \
+      || die "liveness_restart: request требует поля worker/frozen_min/transcript_min"
+    printf 'Перезапуск зависшего воркера %s\n\n' "$worker"
+    printf 'Экран замер ~%s мин, транскрипт не движется ~%s мин.\n\n' "$frozen" "$transcript"
+    printf 'Перезапуск продолжит ту же сессию (не новую) — память клиента не трогается.\n\n'
+    printf '✅ — диспетчер перезапустит воркера.\n'
+    printf '❌ — оставить как есть (сторож замолчит до изменения экрана).\n'
+    ;;
+  *) die "неизвестный kind_of: $kind_of (∈ worker_spawn|mission_change|planerka|sleep|liveness_restart)" ;;
 esac
