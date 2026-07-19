@@ -1058,6 +1058,9 @@ cmd_rebase() {
 
   local kf="${kickoff_file:-$REPO_DIR/examples/department/rebase-kickoff.md}" ktext
   [ -f "$kf" ] || die "rebase: kickoff-файл не найден: $kf"
+  # p3#10: reason — операторский ввод; литеральный \n рвал sed-подстановку {{REASON}}.
+  # Однострочность контракта kickoff'а теперь обеспечена кодом, а не надеждой.
+  reason="$(printf '%s' "$reason" | tr '\n\r' '  ')"
   ktext="$(sed -e "s/{{REASON}}/$(printf '%s' "$reason" | sed 's/[&/\\]/\\&/g')/g" "$kf")"
   local delivered=false
   for i in $(seq 1 10); do

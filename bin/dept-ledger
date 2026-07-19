@@ -652,6 +652,28 @@ function cmdSnapshot() {
   out(res);
 }
 
+// p3#35: маркеры зависших заявок (exec-stuck-<event_id>, dept-dispatcher:367) и логи
+// раннеров (runner-<event_id>.log, dept-exec-runner:103) не чистил никто — копились
+// вечно и попадали в snapshot-коммиты (в .gitignore DEPT_HOME их нет). Порог — тот же
+// cutoff ротации: гарантирует, что раннер in-flight заявки не лишится своего лога.
+// СТРОГИЕ имена: никаких glob'ов по каталогу, где живут registry.json и стейты юнитов.
+const RUNTIME_JUNK = [/^exec-stuck-evt_[0-9]+_[a-z0-9]{4}$/, /^runner-evt_[0-9]+_[a-z0-9]{4}\.log$/];
+function cleanupRuntimeFiles(cutoffMs) {
+  let removed = 0;
+  const dir = HOME;
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return { removed }; }
+  for (const f of entries) {
+    if (!RUNTIME_JUNK.some((re) => re.test(f))) continue;
+    const p = path.join(dir, f);
+    try {
+      if (fs.statSync(p).mtimeMs >= cutoffMs) continue;
+      fs.unlinkSync(p); removed++;
+    } catch { /* гонка с раннером/удалением — не наше дело, следующий прогон подметёт */ }
+  }
+  return { removed };
+}
+
 function cmdRotate(a) {
   const days = a.days !== undefined ? Number(a.days) : ROTATE_DAYS_DEFAULT_ENV();
   if (!Number.isFinite(days) || days <= 0) die('rotate: --days должен быть положительным числом');
@@ -722,7 +744,9 @@ function cmdRotate(a) {
     fs.renameSync(tmp, LEDGER);
     return { rotated: moveIds.size, kept: keep.length };
   });
-  out(res);
+  // R18: маркеры/логи не относятся к ledger-локу — чистим ВНЕ withLock.
+  const junk = cleanupRuntimeFiles(cutoff);
+  out({ ...res, junk_removed: junk.removed });
 }
 function ROTATE_DAYS_DEFAULT_ENV() {
   const n = Number(process.env.DEPT_ROTATE_DAYS);
@@ -746,7 +770,7 @@ const HANDLERS = {
 // Экспорт чистой функции допуска для unit-тестов (createRequire в dept-ledger.test.mjs) —
 // без этого раннего return require() выполнил бы CLI-хвост файла (argv пуст → usage → exit 1),
 // убивая процесс тестового раннера (образец dept-dispatcher:112-113).
-module.exports = { authorizeWithdraw };
+module.exports = { authorizeWithdraw, cleanupRuntimeFiles };
 if (require.main !== module) return;
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
