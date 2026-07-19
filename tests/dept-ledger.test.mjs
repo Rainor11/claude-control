@@ -229,6 +229,26 @@ test('policy-ack: --actor "чужого" воркера проходит вне 
   assert.ok(r.event_id, 'вне сессии воркера ack за другого (--actor) обязан проходить');
 });
 
+// Финальное ревью фазы 4, N1: гард сравнивал только --actor с реальным вызывающим, а
+// identity, которая реально пишется в событие, резолвится как a.actor||CLAUDE_AUTO_NAME||
+// 'operator' — без --actor, но с CLAUDE_AUTO_NAME=<чужое-имя> guard раньше молчал (env-спуф).
+// Позитивный кейс здесь такой же, как у соседнего теста выше: вызов НЕ из сессии воркера
+// (execFileSync — не claude-бинарь внутри CLAUDE_INSTALL) обязан оставаться свободным —
+// realCaller всегда null, и резолвнутая identity (из CLAUDE_AUTO_NAME) обязана уходить в ack
+// без ложного срабатывания. Негативный кейс (реальная сессия воркера) непроверяем без
+// подделки /proc (R16) — пин факта гарда см. static pin ниже.
+test('policy-ack: без --actor, только CLAUDE_AUTO_NAME=<кто-то> — проходит вне сессии воркера', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const pol = mkdtempSync(join(tmpdir(), 'pol-'));
+  writeFileSync(join(pol, 'policy-v1.md'), '# v1\n');
+  const env = { DEPT_POLICY_DIR: pol, CLAUDE_AUTO_NAME: 'mk-c' };
+  const r = JSON.parse(run(home, ['policy-ack', '--version', 'v1'], undefined, env));
+  assert.ok(r.event_id, 'вне сессии воркера ack, резолвнутый из CLAUDE_AUTO_NAME без --actor, обязан проходить');
+  const acks = run(home, ['list', '--kind', 'policy_ack']).trim().split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(acks[0].data.worker, 'mk-c');
+});
+
 test('кривой DEPT_POLICY_ACK_TTL_HOURS не выключает TTL', () => {
   const home = mkdtempSync(join(tmpdir(), 'dept-'));
   const pol = mkdtempSync(join(tmpdir(), 'pol-'));
@@ -666,6 +686,35 @@ test('policy-ack зовёт callerWorkerName (anti-spoof чужого --actor)',
   const fn = src.slice(src.indexOf('function cmdPolicyAck'), src.indexOf('function cmdPolicyCheck'));
   assert.match(fn, /callerWorkerName/,
     'cmdPolicyAck обязан звать callerWorkerName — иначе воркер гасит ack-drift датчик за другого (Codex-крит 1, канон фазы 4)');
+});
+
+// Финальное ревью фазы 4, N1: старый гард сравнивал только --actor с реальным вызывающим,
+// а identity, которая реально пишется в событие (worker), резолвится ПОСЛЕ (a.actor||
+// CLAUDE_AUTO_NAME||'operator') — env-спуф без --actor гасил гард молча. Пин двух фактов:
+// (а) гард сравнивает именно резолвнутую identity worker, а не сырой --actor; (б) worker
+// резолвится РАНЬШЕ гарда (иначе сравнение бьётся об ReferenceError/undefined).
+test('policy-ack гардит РЕЗОЛВНУТУЮ identity (worker), не сырой --actor', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const fn = src.slice(src.indexOf('function cmdPolicyAck'), src.indexOf('function cmdPolicyCheck'));
+  assert.match(fn, /callerWorkerName/, 'cmdPolicyAck обязан звать callerWorkerName');
+  assert.match(fn, /worker\s*!==\s*realCaller/,
+    'guard обязан сравнивать резолвнутую identity worker с realCaller, а не a.actor — иначе CLAUDE_AUTO_NAME=<чужое-имя> без --actor обходит гард (финальное ревью фазы 4, N1)');
+  const workerResolveIdx = fn.search(/const worker\s*=\s*a\.actor\s*\|\|\s*process\.env\.CLAUDE_AUTO_NAME/);
+  const guardIdx = fn.search(/worker\s*!==\s*realCaller/);
+  assert.ok(workerResolveIdx >= 0 && guardIdx >= 0 && workerResolveIdx < guardIdx,
+    'worker обязан резолвиться ДО гарда, иначе сравнение идёт со старым/неопределённым значением');
+});
+
+// Финальное ревью фазы 4, N2: DEPT_LEDGER_TEST_ALLOW_WORKER=1 давал воркеру снять
+// assertNotWorkerSession со ВСЕХ привилегированных команд одним env-префиксом (append/
+// approval-resolve/approval-exec/registry-set) — шов не использовался ни одним тестом
+// (grep-проверено перед удалением), просто открывал обратно дыру 17.07. Регресс-пин:
+// шов не должен вернуться в assertNotWorkerSession.
+test('assertNotWorkerSession НЕ содержит kill-switch DEPT_LEDGER_TEST_ALLOW_WORKER (регресс-пин N2)', () => {
+  const src = readFileSync(CLI, 'utf8');
+  const fn = src.slice(src.indexOf('function assertNotWorkerSession'), src.indexOf('function parseArgs'));
+  assert.doesNotMatch(fn, /DEPT_LEDGER_TEST_ALLOW_WORKER/,
+    'assertNotWorkerSession не должен содержать env kill-switch — он не используется тестами и открывает воркеру обход всего пояса гардов одним префиксом (финальное ревью фазы 4, N2)');
 });
 
 test('send зовёт callerWorkerName для policy_refresh (only Руководитель + anti-spoof)', () => {
