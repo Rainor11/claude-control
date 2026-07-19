@@ -310,6 +310,25 @@ function cmdSend(a) {
   if (roleOf(from) === 'мк' && roleOf(a.to) === 'мк') {
     die('send: прямое сообщение МК→МК запрещено (policy 3.1) — отправь question руководителю');
   }
+  // Codex-крит (канон фазы 4, находка 2): policy_refresh шлёт только исполнитель планёрки
+  // (systemd-раннер dept-planerka-exec, НЕ сессия воркера) и Руководитель — напоминание
+  // молчунам (policy-v9 п. 3.1/8.5). cmdSend раньше ограничивал только адресата (§5 ниже),
+  // отправителя — никак: любой воркер (архивариус/тп/МК) мог разослать policy_refresh, в
+  // т.ч. подделав --actor dept-head. Тот же /proc-гард, что у policy-ack: если вызов реально
+  // из сессии воркера — (а) отправитель обязан быть Руководителем, (б) --actor, если задан,
+  // обязан совпасть с реальным именем (anti-spoof). Раннер планёрки НЕ воркер-сессия
+  // (callerWorkerName() === null) — его data.from=dept-head продолжает работать без правок.
+  if (a.type === 'policy_refresh') {
+    const realCaller = callerWorkerName();
+    if (realCaller) {
+      if (roleOf(realCaller) !== 'руководитель') {
+        die('send: policy_refresh шлёт исполнитель планёрки или Руководитель (policy 3.1/8.5)');
+      }
+      if (a.actor && a.actor !== realCaller) {
+        die(`send: отправка policy_refresh за другого запрещена — шли от своего имени (ты «${realCaller}»)`);
+      }
+    }
+  }
   // policy_refresh — рассылка планёрки «перечитай policy-vN + ack» (фаза 4): Руководитель
   // перечитывает правила наравне со всеми, поэтому исключён из фильтра §5. Остальные
   // ограничения адресата-руководителя не тронуты.
@@ -596,6 +615,17 @@ function cmdPolicyAck(a) {
   const cur = policyCurrent();
   if (a.version !== cur.version) {
     die(`policy-ack: действующая версия ${cur.version}, ты указал ${a.version} — перечитай ${cur.file} и повтори: dept-ledger policy-ack --version ${cur.version}`);
+  }
+  // Codex-крит (канон фазы 4, находка 1): policy_ack в PRIVILEGED_KINDS закрывает только
+  // generic append (см. cmdAppend), а типизированная policy-ack брала --actor как есть —
+  // воркер мог выполнить `policy-ack --actor <чужое-имя>` и погасить ack-drift датчик за
+  // другого. Тот же /proc-гард, что и у withdraw: если вызов реально из сессии воркера
+  // (callerWorkerName() вернул имя) и --actor указывает на КОГО-ТО ЕЩЁ — запрещаем. Раннер/
+  // оператор/тесты (callerWorkerName() === null) и self-ack (без --actor или --actor ===
+  // себе) остаются свободны.
+  const realCaller = callerWorkerName();
+  if (realCaller && a.actor && a.actor !== realCaller) {
+    die(`policy-ack: ack за другого воркера запрещён — ack пишет тот, кто прочитал правила (ты «${realCaller}»)`);
   }
   const worker = a.actor || process.env.CLAUDE_AUTO_NAME || 'operator';
   out(brief(appendEvent('policy_ack', { worker, policy_version: a.version }, worker)));
