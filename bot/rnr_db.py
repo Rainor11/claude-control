@@ -461,7 +461,7 @@ def next_actionable(limit=20, retry_after_sec=0):
     try:
         rows = conn.execute(
             "SELECT * FROM approvals WHERE notified_at IS NULL "
-            "AND status IN ('approved','executed','denied','sending','failed') "
+            "AND status IN ('approved','executed','denied','sending','failed','withdrawn') "
             "AND (last_attempt_at IS NULL OR last_attempt_at < ?) "
             "ORDER BY decided_at ASC LIMIT ?",
             (cutoff, int(limit)),

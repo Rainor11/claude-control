@@ -966,6 +966,31 @@ async def process_approval(bot: Bot, row):
     qid, worker, status, action = row["qid"], row["worker"], row["status"], row["action"]
     attempts = rnr_db.record_attempt_appr(qid)
 
+    if status == "withdrawn":
+        # Заявка отозвана автором (rnr_db.claim_withdraw, phase 4): гасим карточку и НЕ
+        # инжектим исход воркеру — он сам её отозвал, сообщать ему нечего. Схема approvals
+        # не хранит исходный HTML карточки (нет card_html) — перерисовываем через
+        # render_approval(row), как и присылали изначально в card_sender_loop.
+        # notified_at ставим ВСЕГДА (даже если оба edit ниже упали) — иначе
+        # next_actionable() крутил бы эту строку в exec_loop вечно.
+        tag = "🚫 Отозвано автором"
+        if row.get("result"):
+            tag += f": {esc(_clean(row['result']))}"
+        if row["message_id"]:
+            try:
+                await bot.edit_message_text(
+                    chat_id=row["chat_id"], message_id=row["message_id"],
+                    text=render_approval(row) + f"\n\n{tag}",
+                    parse_mode="HTML", reply_markup=None)
+            except Exception:  # noqa: BLE001
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=row["chat_id"], message_id=row["message_id"], reply_markup=None)
+                except Exception:  # noqa: BLE001
+                    log.warning("withdraw: не смог погасить карточку qid=%s", qid)
+        rnr_db.mark_notified(qid)
+        return
+
     if status == "denied":
         if action == "dept-approval":
             ok, detail = await asyncio.to_thread(exec_dept_resolve, row, False)

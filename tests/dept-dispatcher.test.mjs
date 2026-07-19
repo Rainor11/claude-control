@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval } = createRequire(import.meta.url)('../bin/dept-dispatcher');
+const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval, staleOpenApprovals } = createRequire(import.meta.url)('../bin/dept-dispatcher');
 
 const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
 const led = (home, args) => execFileSync(LEDGER, args, { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
@@ -150,4 +150,24 @@ test('runnerArgv: пустые env-значения не прокидывают�
   const argv = runnerArgv('evt_2_bcde', '/r', '/e', { PATH: '', DEPT_HOME: '/d' });
   const forwarded = argv.filter((_, i) => argv[i - 1] === '--setenv');
   assert.deepEqual(forwarded, ['DEPT_HOME=/d']);
+});
+
+// Task 7: напоминание о заявках, зависших open без решения (кейс 16.07 — rfpf 18ч не
+// всплыла нигде). rows — сырые события ledger (list --kind approval --status open),
+// data.{kind_of,from,summary} лежат ВНУТРИ data (не путать с плоскими row.summary/row.from,
+// которые ждёт humanApproval — уплощение делает caller в dept-dispatcher, не эта функция).
+test('staleOpenApprovals: заявка старше порога — напомнить; свежая — нет', () => {
+  const now = Date.parse('2026-07-17T12:00:00Z');
+  const rows = [
+    { event_id: 'evt_1_aaaa', ts: '2026-07-16T12:00:00Z', data: { kind_of: 'outgoing', from: 'mk-a', summary: 'старая' } },
+    { event_id: 'evt_2_bbbb', ts: '2026-07-17T11:30:00Z', data: { kind_of: 'outgoing', from: 'mk-b', summary: 'свежая' } },
+  ];
+  const stale = staleOpenApprovals(rows, now, 240);
+  assert.equal(stale.length, 1);
+  assert.equal(stale[0].event_id, 'evt_1_aaaa');
+});
+
+test('staleOpenApprovals: битый ts не роняет и не считается зависшим', () => {
+  const now = Date.parse('2026-07-17T12:00:00Z');
+  assert.deepEqual(staleOpenApprovals([{ event_id: 'evt_3_cccc', ts: 'мусор', data: { kind_of: 'outgoing', from: 'mk-a', summary: 'x' } }], now, 240), []);
 });

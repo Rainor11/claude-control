@@ -71,6 +71,18 @@ function stuckExecuting(rows, nowMs, maxMin) {
   const thresholdMs = maxMin * 60_000;
   return rows.filter((r) => r.executing_since && (nowMs - Date.parse(r.executing_since)) > thresholdMs);
 }
+// Task 7: напоминание о заявках, висящих без решения (фаза 4). Кейс 16.07: оператор решил
+// вопрос в чате, аппрув повис open 18ч и не всплыл нигде — карточка ушла вверх по ленте TG.
+// rows — сырые события ledger (list --kind approval --status open); битый/отсутствующий ts
+// не роняет (Date.parse → NaN, Number.isFinite отсекает) и не считается зависшим (fail-safe:
+// лучше пропустить напоминание, чем спамить на мусорных данных).
+function staleOpenApprovals(rows, nowMs, maxMin) {
+  const thresholdMs = maxMin * 60_000;
+  return rows.filter((r) => {
+    const t = Date.parse(r.ts);
+    return Number.isFinite(t) && (nowMs - t) > thresholdMs;
+  });
+}
 // Фидбэк оператора 16.07: алерт «заявка evt_…» нечитаем — не видно, ЧТО за заявка и от кого;
 // алерт должен читаться без похода в ledger. Чистая функция: человеческая метка заявки из
 // {event_id, summary, from} → «<summary> — заявка <from> (<id>)»; summary схлопывается в одну
@@ -109,7 +121,7 @@ function runnerArgv(eventId, runnerBin, executorBin, env) {
   out.push(runnerBin, '--approval', eventId, '--executor', executorBin);
   return out;
 }
-module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval };
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval, staleOpenApprovals };
 if (require.main !== module) return;
 
 // ---- CLI ---------------------------------------------------------------
@@ -146,6 +158,11 @@ const AUTO = process.env.DEPT_SLEEP_AUTO === '1';
 // Дефолты (20 мин = 1200000 ≥ 900000) инвариант держат; при тюнинге env — сохранять соотношение.
 const EXEC_MAX_MIN = numEnv('DEPT_EXEC_MAX_MIN', 20);
 const EXEC_RUNNER = path.join(BIN, 'dept-exec-runner');
+// Task 7: сколько минут заявка (dept-approval) может провести open без решения оператора,
+// прежде чем напомнить (кейс 16.07: rfpf провисела open 18ч, никто не заметил). Дефолт 4ч —
+// заведомо дольше рабочего цикла реакции оператора, но заведомо меньше суток.
+const OPEN_REMIND_MIN = numEnv('DEPT_OPEN_APPROVAL_REMIND_MIN', 240);
+const OPEN_REMIND_STATE_FILE = path.join(DEPT, 'open-approval-reminders.json');
 // Тест-шов: подменить systemd-run заглушкой в тестах/песочнице (DEPT_SYSTEMD_RUN=/bin/true).
 const SYSTEMD_RUN = process.env.DEPT_SYSTEMD_RUN || 'systemd-run';
 
@@ -355,6 +372,33 @@ for (const s of stuck) {
   // эпизод несообщённым, следующий тик (2 мин) повторит попытку.
   if (!notify(`🚨 dispatcher: заявка ${s.kind_of} зависла в executing >${EXEC_MAX_MIN}мин: ${humanApproval(s)} — раннер умер? разберись`)) continue;
   try { fs.writeFileSync(marker, String(now)); } catch (e) { console.error(`dispatcher: не смог записать маркер зависшей заявки ${s.event_id}: ${e.message}`); }
+}
+
+// Напоминание о заявках, зависших open без решения оператора (Task 7, кейс 16.07 — см.
+// staleOpenApprovals). Состояние — JSON-файл с уборкой закрытых эпизодов, НЕ маркер-файлы:
+// урок p3#35 (маркеры exec-stuck-* никто не чистит, они копятся) — не воспроизводить в
+// новом месте. dry-run строго read-only: ни remindState не читаем на запись, ни файл не пишем.
+const remindState = dry ? {} : loadJSON(OPEN_REMIND_STATE_FILE, {});
+const openApprovalRows = dlList(['--kind', 'approval', '--status', 'open']);
+const staleOpen = staleOpenApprovals(openApprovalRows, now, OPEN_REMIND_MIN);
+const openIds = new Set(openApprovalRows.map((r) => r.event_id));
+for (const s of staleOpen) {
+  if (dry) { console.log(`[dry] напоминание о зависшей заявке: ${humanApproval({ event_id: s.event_id, summary: s.data.summary, from: s.data.from })}`); continue; }
+  if (remindState[s.event_id]) continue; // уже напоминали про этот эпизод
+  // humanApproval ждёт ПЛОСКИЕ row.summary/row.from (см. её сигнатуру выше), а openApprovalRows —
+  // сырые события ledger, где эти поля лежат в data. Без уплощения алерт выродился бы в
+  // голый event_id — ровно то, от чего уходили по фидбэку оператора 16.07.
+  const human = humanApproval({ event_id: s.event_id, summary: s.data.summary, from: s.data.from });
+  // p3#33: писать «напомнили» только при ДОСТАВЛЕННОМ алерте — иначе сетевой флап
+  // проглотит напоминание навсегда (следующий тик повторит попытку).
+  if (!notify(`⏳ dispatcher: заявка висит без решения >${OPEN_REMIND_MIN} мин: ${human} — реши кнопкой или попроси автора отозвать (dept-withdraw)`)) continue;
+  remindState[s.event_id] = now;
+}
+if (!dry) {
+  // Уборка стейта: заявка закрыта (решена/отозвана) → эпизод больше не нужен. Без этого
+  // файл рос бы вечно — ровно дефект p3#35, только в JSON, а не в маркер-файлах.
+  for (const id of Object.keys(remindState)) if (!openIds.has(id)) delete remindState[id];
+  saveJSON(OPEN_REMIND_STATE_FILE, remindState);
 }
 
 const approvalRows = dlList(['--kind', 'approval', '--status', 'approved']);
