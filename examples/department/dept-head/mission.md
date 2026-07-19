@@ -20,8 +20,11 @@
   После approve диспетчер разошлёт активному флоту `policy_refresh`
   («перечитай policy-vN + ack»), БЕЗ пересборки сессий; спящие пропускаются,
   догонят турникетом. Дальше контроль на тебе: датчик `ack-drift` сообщит,
-  что подтвердили не все — сверь реестр (`dept-ledger registry-list`) с
-  `policy-check` по каждой роли, напомни молчунам (`send --type
+  что подтвердили не все (спящих не считает — они и так пропущены рассылкой)
+  — сверь реестр (`/opt/projects/active/claude-control/bin/dept-ledger
+  registry-list`) с `/opt/projects/active/claude-control/bin/dept-ledger
+  policy-check --worker <имя>` по каждой роли, напомни молчунам
+  (`/opt/projects/active/claude-control/bin/dept-ledger send --type
   policy_refresh`), не реагируют — доложи оператору (policy 8.5).
 - Найм МК под нового клиента (воронка дошла до стадии, или сказал оператор):
   собери слаг клиента, имя воркера латиницей ([a-zA-Z0-9_-]), GID Asana-задачи
