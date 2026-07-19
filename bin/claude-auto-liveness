@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // claude-auto-liveness — детерминированный watchdog «жив, но не отвечает».
 // hung = busy-маркер на экране + замерший screen-hash + замерший транскрипт
-// дольше HUNG_MIN. Лестница: alert → restart → incident (ТП).
+// дольше HUNG_MIN. Лестница: alert → карточка перезапуска (кнопка оператора) → incident (ТП).
+// Решение оператора 19.07: авто-рестарт отменён навсегда — сторож только подаёт заявку
+// через dept-liveness-request, исполняет диспетчер по ✅ (см. liveness-button-plan.md).
 // Запуск: systemd-таймер каждые 5 минут. Флаг --dry-run: только печать решений.
 'use strict';
 const fs = require('fs');
@@ -24,7 +26,6 @@ const CFG = {
   reincidentMin: numEnv('LIVENESS_REINCIDENT_MIN', 60),
   animMin: numEnv('LIVENESS_ANIM_HUNG_MIN', 90),
 };
-const ENFORCE = process.env.LIVENESS_ENFORCE === '1'; // без него — alert-only (обкатка)
 const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
 const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monitor/telegram_notify.sh';
 
@@ -82,7 +83,41 @@ function nextState(prev, cur, action, notifyOk) {
       throw new Error(`nextState: неизвестное действие "${action}"`);
   }
 }
-module.exports = { decide, nextState };
+
+// Чистая функция T3: следующий шаг по карточке liveness_restart. Вынесена из decide()/
+// nextState() намеренно — её ветвление зависит от ВНЕШНЕГО источника (эффективный
+// approval_status заявки в ledger), а не только от prev/cur, и вызывается циклом из ДВУХ
+// разных мест:
+//  (1) карточки ещё нет (prev.cardEventId пуст) — вызывается ТОЛЬКО когда лестница decide()
+//      хочет action=restart; ledgerView = {existingCardId} — T2-review дедуп-слой б: если в
+//      ledger уже висит НЕрешённая (open/approved/executing) liveness_restart на этого
+//      воркера (например, state потерян между тиками), усыновляем её вместо подачи дубля.
+//      → {op:'adopt', eventId} | {op:'file'}
+//  (2) карточка уже отслеживается (prev.cardEventId жив) — вызывается КАЖДЫЙ тик независимо
+//      от action этого тика (оператор мог решить заявку, пока экран стоит на месте);
+//      ledgerView = {cardStatus, executedAt} — последний approval_status по ref
+//      («последний выигрывает», как effectiveStatus в dept-ledger).
+//      → {op:'close_executed', executedAt} | {op:'wait'} | {op:'silent_denied'} | {op:'clear'}
+// close_executed отдаёт executedAt ИМЕННО из ledgerView (ts события executed в ledger), не
+// cur.ts «сейчас» — от него зависит reincident-детект (decide(): prev.restartedAt свежий).
+function cardStep(prev, cur, ledgerView) {
+  const lv = ledgerView || {};
+  if (prev && prev.cardEventId) {
+    const status = lv.cardStatus;
+    if (status === 'executed') return { op: 'close_executed', executedAt: lv.executedAt != null ? lv.executedAt : cur.ts };
+    if (status === 'denied') {
+      return prev.cardScreenHash === cur.screenHash ? { op: 'silent_denied' } : { op: 'clear' };
+    }
+    if (status === 'open' || status === 'approved' || status === 'executing') return { op: 'wait' };
+    // withdrawn ИЛИ статус не определился (заявка потеряна/чтение не удалось выше по стеку,
+    // сюда попадает только УЖЕ подтверждённый вызывающим факт «статуса нет») — снять карточку,
+    // разрешить переподачу на следующем шаге лестницы.
+    return { op: 'clear' };
+  }
+  return lv.existingCardId ? { op: 'adopt', eventId: lv.existingCardId } : { op: 'file' };
+}
+
+module.exports = { decide, nextState, cardStep };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
@@ -91,6 +126,12 @@ const dry = process.argv.includes('--dry-run');
 // dry-run — превью, не должен алармить: exit код для него всегда 0 (см. конец файла).
 let notifyFailures = 0;
 let readFailures = 0;
+// T3 (Codex-ревью): провал подачи заявки/открытия инцидента — операционный сбой сам по себе,
+// не только сбой ЧТЕНИЯ (readFailures) или ДОСТАВКИ алерта (notifyFailures). Раньше, если
+// notify() об этом сбое ДОСТАВЛЯЛСЯ успешно, exitCode оставался 0 — systemd/cron не видел
+// «сторож не смог подать заявку/открыть инцидент» как провал тика (п.4 плана T3 требует
+// notify + exitCode-механику T1 разом, не только notify).
+let actionFailures = 0;
 
 // Best-effort лок: ручной запуск (напр. --dry-run для отладки) параллельно с таймером иначе
 // делает read-modify-write watchdog-state.json без синхронизации — кто сохранил последним,
@@ -144,6 +185,75 @@ function transcriptMtime(name) {
   }
   return null; // транскрипт не найден — не считать древним (эпохальный tm=0 отключал бы fresh-check)
 }
+const DEPT_LEDGER = path.join(BIN, 'dept-ledger');
+const LIVENESS_REQUEST = path.join(BIN, 'dept-liveness-request');
+
+// dept-ledger list → массив событий (JSONL-парсинг), null при сбое чтения (sh(), тот же 10с
+// таймаут). null ОТЛИЧАЕТСЯ от [] намеренно: вызывающий обязан трактовать сбой чтения как
+// «не смог узнать» (пропустить тик), а не как «карточек/статусов нет» — иначе state-провал/
+// сетевой флап на дедуп-проверке (T2-review) плодил бы дублирующие заявки.
+function dlList(args) {
+  const out = sh(DEPT_LEDGER, ['list', ...args]);
+  if (out === null) return null;
+  const rows = [];
+  for (const l of out.split('\n')) {
+    if (!l.trim()) continue;
+    try { rows.push(JSON.parse(l)); } catch { /* битая строка — пропускаем, не роняем весь запрос */ }
+  }
+  return rows;
+}
+// Эффективный статус заявки liveness_restart по event_id: последний approval_status по ref
+// («последний выигрывает», как effectiveStatus в dept-ledger). Нет approval_status-событий —
+// заявка ещё в исходном 'open' (cmdApprovalOpen пишет data.status='open' по умолчанию) —
+// НО ТОЛЬКО если сам approval ещё жив в активном журнале: dept-ledger list читает ТОЛЬКО
+// активный файл (не archive/), а dept-ledger-snapshot.timer реально гоняет `rotate` каждые
+// ~30 мин с дефолтным 30-дневным cutoff (Codex-ревью T3) — закрытая (denied/withdrawn) цепочка
+// старше cutoff уезжает в архив, и «approval_status не найден» перестаёт значить «ещё open»,
+// начинает значить «событие уехало из вида». Без проверки существования approval денied-
+// карточка, которую watchdog держит в state ГОДАМИ (screen не меняется — silent_denied не
+// освобождает cardEventId), после архивации выглядела бы как свежая 'open' и лестница ждала
+// бы решения оператора вечно. null — сбой чтения ledger (вызывающий обязан пропустить тик,
+// не терять карточку из виду).
+function queryCardStatus(eventId) {
+  const rows = dlList(['--kind', 'approval_status', '--filter', `ref=${eventId}`]);
+  if (rows === null) return null;
+  if (rows.length) {
+    const last = rows[rows.length - 1];
+    return { status: last.data.status, executedAt: last.data.status === 'executed' ? Date.parse(last.ts) : null };
+  }
+  // Нет approval_status — подтверждаем, что сам approval ещё в активном файле (не архиве).
+  const apr = dlList(['--kind', 'approval', '--event-id', eventId]);
+  if (apr === null) return null;
+  if (!apr.length) return { status: undefined, executedAt: null }; // ушёл в архив/потерян — cardStep даст 'clear'
+  return { status: 'open', executedAt: null };
+}
+// T2-review advisory (дедуп-слой б): перед подачей НОВОЙ заявки — нет ли уже нерешённой
+// (open/approved/executing) liveness_restart на этого воркера в ledger? Защита от state-
+// провала (watchdog-state.json потерян/повреждён/не успел сохраниться) — без неё каждый тик
+// после потери state плодил бы дубль заявки поверх ещё нерешённой. {ok:false} — не смогли
+// проверить (сбой чтения) — вызывающий обязан пропустить подачу в этом тике, не рисковать дублем.
+function findExistingCardForWorker(name) {
+  const approvals = dlList(['--kind', 'approval', '--filter', 'kind_of=liveness_restart', '--filter', 'from=watchdog']);
+  if (approvals === null) return { ok: false };
+  const candidates = approvals.filter((e) => e && e.data && e.data.request && e.data.request.worker === name);
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const view = queryCardStatus(candidates[i].event_id);
+    if (view === null) return { ok: false };
+    if (view.status === 'open' || view.status === 'approved' || view.status === 'executing') {
+      return { ok: true, eventId: candidates[i].event_id };
+    }
+  }
+  return { ok: true, eventId: null };
+}
+// Подача заявки на перезапуск через гейт отдела (dept-liveness-request — НЕ worker-only,
+// сторож не сессия воркера, см. заголовок dept-liveness-request). event_id или null при
+// сбое (сеть/ledger/бот — FAIL-CLOSED внутри dept-liveness-request само пишет причину в stderr).
+function fileLivenessRequest(name, frozenMin, transcriptMin) {
+  const out = sh(LIVENESS_REQUEST, ['--worker', name, '--frozen-min', String(frozenMin), '--transcript-min', String(transcriptMin)]);
+  if (out === null) return null;
+  try { const j = JSON.parse(out.trim()); return j.event_id || null; } catch { return null; }
+}
+
 function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
 function saveState(s) {
   fs.mkdirSync(DEPT, { recursive: true });
@@ -191,8 +301,43 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   }
   const cur = { ts: now, busy: BUSY_RE.test(scr), screenHash: crypto.createHash('sha1').update(scr).digest('hex'), transcriptMtime: tm };
   if (dry) console.log(`[dry] ${name}: busy=${cur.busy} hash=${cur.screenHash.slice(0, 8)} transcript_age_min=${Math.round((now - tm) / 60000)}`);
-  const prev = state[name] || null;
+  let prev = state[name] || null;
   const d = decide(prev, cur, CFG);
+
+  // T3: жизненный цикл карточки liveness_restart — КАЖДЫЙ тик, пока она отслеживается,
+  // НЕЗАВИСИМО от action этого тика (оператор мог решить заявку, пока экран стоит на месте
+  // и decide() продолжает отдавать 'restart'). Приоритет над d.reset/остальной лестницей:
+  // executed обязан выставить restartedAt = ts события ИЗ LEDGER, иначе reincident-детект
+  // (decide(): prev.restartedAt свежий) не сработает при повторном зависании.
+  if (prev && prev.cardEventId) {
+    const view = queryCardStatus(prev.cardEventId);
+    if (view === null) {
+      console.log(`liveness: ${name}: не удалось прочитать статус карточки ${prev.cardEventId} — пропуск`);
+      readFailures++;
+      continue;
+    }
+    const step = cardStep(prev, cur, { cardStatus: view.status, executedAt: view.executedAt });
+    if (step.op === 'close_executed') {
+      if (dry) { console.log(`[dry] ${name}: карточка ${prev.cardEventId} исполнена — закрыл бы эпизод (restartedAt=${new Date(step.executedAt).toISOString()})`); continue; }
+      // reincident-детект сохранён (p3#33-паттерн): state пишем по факту исполненной заявки,
+      // независимо от исхода дальнейших notify — эпизод УЖЕ закрыт рестартом в ledger.
+      state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: step.executedAt };
+      continue;
+    }
+    if (step.op === 'wait') {
+      if (dry) console.log(`[dry] ${name}: карточка ${prev.cardEventId} ещё не решена — жду`);
+      continue;
+    }
+    if (step.op === 'silent_denied') {
+      if (dry) console.log(`[dry] ${name}: карточка ${prev.cardEventId} отклонена, экран тот же — не переподаю`);
+      continue;
+    }
+    // step.op === 'clear': withdrawn ИЛИ статус не определился — снять карточку и продолжить
+    // обычную лестницу ниже (reset её и так бы стёр — nextState('reset') не спреадит card-поля).
+    if (dry) { console.log(`[dry] ${name}: карточка ${prev.cardEventId} снята — переподал бы при следующем зависании`); continue; }
+    prev = state[name] = { ...prev, cardEventId: undefined, cardScreenHash: undefined };
+  }
+
   if (d.reset) { state[name] = nextState(prev, cur, 'reset'); continue; }
   if (d.action === 'anim_alert') {
     // p3#33: animAlerted (дедуп anim-эпизода) — только при ДОСТАВЛЕННОМ алерте,
@@ -218,54 +363,58 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (d.action === 'alert') {
     // p3#33: alerted (первая ступень лестницы) — только при доставленном алерте; провал
     // notify оставляет prev как есть, следующий тик снова даст action=alert и повторит.
-    state[name] = nextState(prev, cur, 'alert', notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`));
+    state[name] = nextState(prev, cur, 'alert', notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — заявка на перезапуск оператору.`));
   } else if (d.action === 'restart') {
-    if (ENFORCE) {
-      // dry всегда "успех" (симуляция, systemctl не вызывается); в боевом прогоне —
-      // честно проверяем результат: раньше упавший systemctl restart всё равно слал
-      // «перезапущен» и чистил alerted/firstSeen, из-за чего лестница молча теряла воркера.
-      const restarted = dry || sh('systemctl', ['--user', 'restart', `claude-auto@${name}.service`]) !== null;
-      if (restarted) {
-        // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — рестарт УЖЕ случился,
-        // restartedAt обязан отразить реальность (иначе reincident-детект сломан и лестница
-        // зациклит рестарты); уведомление здесь информационное, не «эпизодный» алерт.
-        notify(`🔄 liveness: воркер ${name} перезапущен (resume той же сессии).`);
-        state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: now };
-      } else {
-        notify(`🚨 liveness: рестарт ${name} НЕ УДАЛСЯ (systemctl error) — вмешайся вручную`);
-        // state НЕ обновляем — prev остаётся alerted, лестница продолжит на следующем тике
-      }
+    // T3 (решение оператора 19.07): вместо авто-рестарта — подача заявки через гейт отдела.
+    // Сюда попадаем только когда карточка ЕЩЁ не отслеживается (живая cardEventId обработана
+    // и continue'нута в блоке жизненного цикла выше — либо wait/silent_denied, либо только что
+    // clear'нута и prev.cardEventId уже пуст).
+    const dedup = findExistingCardForWorker(name);
+    if (!dedup.ok) {
+      console.log(`liveness: ${name}: не удалось проверить дедуп заявок в ledger — пропуск подачи`);
+      readFailures++;
     } else {
-      // p3#33: wouldNotified — только при доставленном алерте (иначе повтор на следующем тике)
-      if (!prev.wouldNotified) {
-        if (notify(`⚠️ liveness [would-restart]: ${name} всё ещё висит. Включи LIVENESS_ENFORCE=1 или перезапусти вручную: systemctl --user restart claude-auto@${name}`)) {
-          state[name] = { ...prev, wouldNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
+      const step = cardStep(prev, cur, { existingCardId: dedup.eventId });
+      if (step.op === 'adopt') {
+        if (dry) console.log(`[dry] ${name}: усыновил бы существующую заявку ${step.eventId} вместо подачи новой`);
+        else state[name] = { ...prev, cardEventId: step.eventId, cardScreenHash: cur.screenHash };
+      } else {
+        // N = минуты с prev.firstSeen (начало эпизода), M = минуты с cur.transcriptMtime.
+        const frozenMin = Math.round((cur.ts - prev.firstSeen) / 60000);
+        const transcriptMin = Math.round((cur.ts - cur.transcriptMtime) / 60000);
+        if (dry) {
+          console.log(`[dry] ${name}: подал бы заявку на перезапуск (завис ${frozenMin} мин, транскрипт не движется ${transcriptMin} мин)`);
+        } else {
+          const eid = fileLivenessRequest(name, frozenMin, transcriptMin);
+          if (eid) {
+            // notify оператору здесь НЕ шлём — карточка сама придёт от бота (dept-liveness-request).
+            state[name] = { ...prev, cardEventId: eid, cardScreenHash: cur.screenHash };
+          } else {
+            notify(`🚨 liveness: не удалось подать заявку на перезапуск ${name} — вмешайся`);
+            actionFailures++; // видимая деградация — не только readFailures/notifyFailures
+            // state НЕ обновляем — повтор на следующем тике
+          }
         }
       }
     }
   } else if (d.action === 'incident') {
-    if (ENFORCE) {
-      // тот же принцип: упавший dept-ledger incident-open раньше всё равно "закрывал"
-      // наблюдение (чистил state), хотя инцидент для ТП фактически не открылся.
-      const opened = dry || sh(path.join(BIN, 'dept-ledger'), ['incident-open', '--about', name, '--severity', 'high',
-        '--summary', 'воркер виснет повторно после рестарта', '--actor', 'watchdog']) !== null;
-      if (opened) {
-        // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — инцидент УЖЕ открыт в
-        // ledger (ТП получил message), повтор на следующем тике открыл бы ВТОРОЙ инцидент;
-        // уведомление информационное, факт эпизода зафиксирован инцидентом.
-        notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
-        state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
-      } else {
-        notify(`🚨 liveness: не удалось открыть incident по ${name} — открой вручную`);
-        // state НЕ обновляем
-      }
+    // reincident = зависание после ИСПОЛНЕННОЙ карточки (prev.restartedAt свежий, ставится в
+    // блоке close_executed выше) — открытие инцидента ТП безусловно (не за флагом, ENFORCE
+    // удалён): это запись+сообщение ТП, не перезапуск. Тот же принцип, что раньше: упавший
+    // dept-ledger incident-open не должен "закрывать" наблюдение (чистить state), хотя
+    // инцидент для ТП фактически не открылся.
+    const opened = dry || sh(DEPT_LEDGER, ['incident-open', '--about', name, '--severity', 'high',
+      '--summary', 'воркер виснет повторно после рестарта', '--actor', 'watchdog']) !== null;
+    if (opened) {
+      // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — инцидент УЖЕ открыт в
+      // ledger (ТП получил message), повтор на следующем тике открыл бы ВТОРОЙ инцидент;
+      // уведомление информационное, факт эпизода зафиксирован инцидентом.
+      notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
+      state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
     } else {
-      // p3#33: wouldIncidentNotified — только при доставленном алерте (иначе повтор)
-      if (!prev.wouldIncidentNotified) {
-        if (notify(`🚨 liveness [would-incident]: ${name} завис повторно после рестарта. Enforce выключен — разберись вручную.`)) {
-          state[name] = { ...prev, wouldIncidentNotified: true }; // не спамить каждые 5 мин, пока висит тот же экран
-        }
-      }
+      notify(`🚨 liveness: не удалось открыть инцидент по ${name} — открой вручную`);
+      actionFailures++; // видимая деградация — не только readFailures/notifyFailures
+      // state НЕ обновляем
     }
   }
 }
@@ -279,6 +428,8 @@ for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
 // regFailed: реестр не прочитан → known пуст → цикл cleanup выше стёр бы весь state — не
 // сохраняем, чтобы битый/временно недоступный autonomous.json не снёс историю наблюдения.
 if (!dry && !regFailed) saveState(state);
-// p3#19: видимая деградация — notify/read/registry failures раньше тонули в логах, exit
-// оставался 0, и systemd/cron не мог отличить «всё ок» от «сторож молча недоглядел».
-if (!dry && (notifyFailures || readFailures || regFailed)) process.exitCode = 1;
+// p3#19 + T3 (Codex-ревью): видимая деградация — notify/read/registry/action failures раньше
+// тонули в логах, exit оставался 0, и systemd/cron не мог отличить «всё ок» от «сторож молча
+// недоглядел». actionFailures — T3: провал подачи заявки/открытия инцидента виден в exitCode
+// даже когда сам алерт о провале доставлен успешно (notifyFailures==0).
+if (!dry && (notifyFailures || readFailures || regFailed || actionFailures)) process.exitCode = 1;
