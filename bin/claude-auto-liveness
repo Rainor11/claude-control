@@ -45,10 +45,52 @@ function decide(prev, cur, cfg) {
   if (!prev.alerted) return { action: 'alert', reset: false };
   return { action: 'restart', reset: false };
 }
-module.exports = { decide };
+
+// Чистая функция: следующий state[name] для веток reset / anim_alert / none-continuation / alert
+// (restart/incident остаются инлайн в цикле — там ветвление по успеху systemctl/ledger, не по
+// hash). notifyOk — результат notify() для действий, где он нужен (anim_alert/alert); для
+// reset/none игнорируется (у них нет своего notify-вызова).
+// Экран считается "ожившим", если hash сменился относительно prev (или prev вовсе нет) — тогда
+// alerted/wouldNotified/wouldIncidentNotified сбрасываем: алерт был про СТАРОЕ замершее состояние
+// экрана, оно больше не актуально. Точное совпадение hash (no-op основной лестницы alert→restart)
+// эти флаги НЕ трогает — иначе дедуп сломается и лестница будет слать alert повторно на каждый тик.
+function nextState(prev, cur, action, notifyOk) {
+  switch (action) {
+    case 'reset':
+      return { screenHash: cur.screenHash, firstSeen: cur.ts, alerted: false, restartedAt: prev?.restartedAt || 0 };
+    case 'anim_alert': {
+      // decide() гарантирует prev.screenHash !== cur.screenHash на входе (или !prev) — экран
+      // сменился by construction, сброс alerted/wouldNotified/wouldIncidentNotified безусловен
+      // (не зависит от notifyOk — устаревший алерт был про предыдущий кадр в любом случае).
+      // p3#33: animAlerted (дедуп anim-эпизода) — по факту доставки ИМЕННО этого алерта.
+      const base = prev || { screenHash: cur.screenHash, firstSeen: cur.ts, alerted: false, restartedAt: 0 };
+      return { ...base, screenHash: cur.screenHash, animAlerted: notifyOk, alerted: false, wouldNotified: false, wouldIncidentNotified: false };
+    }
+    case 'none': {
+      // none && !reset: hash равен prev.screenHash (no-op основной лестницы, дедуп alert→restart
+      // живёт) ИЛИ hash сменился (anim-эпизод продолжается, старый алерт устарел). Различаем —
+      // иначе сброс alerted задел бы no-op основной лестницы (см. её тест в liveness-decide).
+      const moved = !prev || prev.screenHash !== cur.screenHash;
+      if (!moved) return { ...prev, screenHash: cur.screenHash };
+      return { ...prev, screenHash: cur.screenHash, alerted: false, wouldNotified: false, wouldIncidentNotified: false };
+    }
+    case 'alert':
+      // p3#33: alerted (первая ступень лестницы) — только при доставленном алерте; провал
+      // notify оставляет prev как есть (тот же объект), следующий тик повторит попытку.
+      return notifyOk ? { ...prev, alerted: true } : prev;
+    default:
+      throw new Error(`nextState: неизвестное действие "${action}"`);
+  }
+}
+module.exports = { decide, nextState };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
+// p3#19: видимые сбои — раньше notify/read/registry failures молча логировались, exit
+// оставался 0, и systemd/cron не мог отличить «всё ок» от «сторож недоглядел воркера».
+// dry-run — превью, не должен алармить: exit код для него всегда 0 (см. конец файла).
+let notifyFailures = 0;
+let readFailures = 0;
 
 // Best-effort лок: ручной запуск (напр. --dry-run для отладки) параллельно с таймером иначе
 // делает read-modify-write watchdog-state.json без синхронизации — кто сохранил последним,
@@ -116,10 +158,21 @@ function saveState(s) {
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
   try { execFileSync(NOTIFY, [msg], { encoding: 'utf8', timeout: 45_000 }); return true; }
-  catch { console.log('liveness: notify FAILED:', msg); return false; }
+  catch { console.log('liveness: notify FAILED:', msg); notifyFailures++; return false; }
 }
 
-const reg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
+// p3#19: раньше непойманное исключение здесь роняло процесс голым stack trace'ом (exit код уже
+// был ненулевым, но диагностика — нечитаемая). regFailed учитывается в итоговом exitCode внизу
+// заодно с notify/read failures; при провале реестр считаем пустым — цикл ниже просто не найдёт
+// воркеров (Object.entries({}) === []), а не упадёт повторно.
+let regFailed = false;
+let reg = {};
+try {
+  reg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8'));
+} catch (e) {
+  console.log('liveness: не удалось прочитать реестр autonomous.json — пропуск тика:', e.message);
+  regFailed = true;
+}
 const state = loadState();
 const now = Date.now();
 for (const [name, meta] of Object.entries(reg.workers || reg)) {
@@ -131,7 +184,7 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     continue;
   }
   let tm;
-  try { tm = transcriptMtime(name); } catch { console.log(`liveness: ${name}: ошибка чтения spec/транскрипта — пропуск`); continue; }
+  try { tm = transcriptMtime(name); } catch { console.log(`liveness: ${name}: ошибка чтения spec/транскрипта — пропуск`); readFailures++; continue; }
   if (tm === null) {
     console.log(`liveness: ${name}: транскрипт не найден — пропуск (проверь spec.json session_id)`);
     continue;
@@ -140,12 +193,14 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (dry) console.log(`[dry] ${name}: busy=${cur.busy} hash=${cur.screenHash.slice(0, 8)} transcript_age_min=${Math.round((now - tm) / 60000)}`);
   const prev = state[name] || null;
   const d = decide(prev, cur, CFG);
-  if (d.reset) { state[name] = { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: prev?.restartedAt || 0 }; continue; }
+  if (d.reset) { state[name] = nextState(prev, cur, 'reset'); continue; }
   if (d.action === 'anim_alert') {
     // p3#33: animAlerted (дедуп anim-эпизода) — только при ДОСТАВЛЕННОМ алерте,
     // иначе следующий тик повторит попытку (алерт не теряется на сетевом флапе).
     const animOk = notify(`⚠️ liveness [anim]: воркер ${name} — экран активен, но транскрипт не движется ${Math.round((now - tm) / 60000)} мин. Возможно «анимированное зависание» (лимиты подписки/сеть). Проверь: tmux -L claude-${name} attach -t claude-${name}`);
-    state[name] = { ...(prev || { screenHash: cur.screenHash, firstSeen: now, alerted: false, restartedAt: 0 }), animAlerted: animOk };
+    // nextState пишет СВЕЖИЙ cur.screenHash (не устаревший prev.screenHash) и безусловно
+    // сбрасывает alerted/wouldNotified/wouldIncidentNotified — экран сменился by construction.
+    state[name] = nextState(prev, cur, 'anim_alert', animOk);
     continue;
   }
   if (d.action === 'none') {
@@ -154,16 +209,16 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     // тик: реально замерший после анимации экран на следующем тике совпадёт с prev.screenHash
     // и уйдёт в основную лестницу (иначе старый докадровый hash глушил бы её навсегда).
     // firstSeen сохраняется как якорь начала эпизода — переход anim→freeze эскалирует сразу
-    // (воркер уже давно болен), это намеренно.
-    state[name] = { ...prev, screenHash: cur.screenHash };
+    // (воркер уже давно болен), это намеренно. Если экран при этом СМЕНИЛСЯ (anim продолжается) —
+    // nextState() сбрасывает alerted/wouldNotified/wouldIncidentNotified (старый алерт устарел);
+    // на no-op (hash равен) она эти флаги не трогает — дедуп основной лестницы не задет.
+    state[name] = nextState(prev, cur, 'none');
     continue;
   }
   if (d.action === 'alert') {
     // p3#33: alerted (первая ступень лестницы) — только при доставленном алерте; провал
     // notify оставляет prev как есть, следующий тик снова даст action=alert и повторит.
-    if (notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`)) {
-      state[name] = { ...prev, alerted: true };
-    }
+    state[name] = nextState(prev, cur, 'alert', notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — рестарт${ENFORCE ? '' : ' (enforce выключен — только алерты)'}.`));
   } else if (d.action === 'restart') {
     if (ENFORCE) {
       // dry всегда "успех" (симуляция, systemctl не вызывается); в боевом прогоне —
@@ -221,4 +276,9 @@ for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
 // dry-run обязан быть чисто read-only (см. docs/department.md): раньше saveState() писал
 // БЕЗУСЛОВНО, и alerted:true из превью-прогона "съедал" ступень лестницы у следующего
 // боевого прогона — watchdog прыгал сразу к restart, ни разу не послав настоящий alert.
-if (!dry) saveState(state);
+// regFailed: реестр не прочитан → known пуст → цикл cleanup выше стёр бы весь state — не
+// сохраняем, чтобы битый/временно недоступный autonomous.json не снёс историю наблюдения.
+if (!dry && !regFailed) saveState(state);
+// p3#19: видимая деградация — notify/read/registry failures раньше тонули в логах, exit
+// оставался 0, и systemd/cron не мог отличить «всё ок» от «сторож молча недоглядел».
+if (!dry && (notifyFailures || readFailures || regFailed)) process.exitCode = 1;
