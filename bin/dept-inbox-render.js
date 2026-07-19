@@ -390,7 +390,7 @@ function renderActivity(rows, readError) {
   const body = `${errBanner(readError)}
 <h1>Активность</h1>
 <p class="proxy-note">⚠️ Расход токенов подписка не отдаёт — это активность-прокси (события/компакции/wake·rebase·spawn
-за 7 дней, sparkline — события по дням за 14 дней). Честные бюджеты — фаза 4.</p>
+за 7 дней, sparkline — события по дням за 14 дней). Честные бюджеты (парсинг расхода из транскриптов) — в бэклоге, Asana Server support.</p>
 <div class="tablewrap"><table><tr><th>воркер</th><th>событий/7д</th><th>компакций</th><th>wake</th><th>rebase</th><th>спавнов</th>
 <th>14д</th></tr>${items}</table></div>`;
   return page('Отдел — активность', body, 'activity');
