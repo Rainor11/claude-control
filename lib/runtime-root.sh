@@ -114,9 +114,16 @@ _runtime_root_resolve_test_marker() {
     return 1
   fi
 
+  # HOME обязан резолвиться — в отличие от prod-дефолтов ниже (которые в чистом
+  # dev-окружении легитимно ещё не существуют), $HOME отсутствующим быть не должно; если
+  # он всё же не резолвится, fail-closed: не можем поручиться, что test root с ним не
+  # совпадает, значит не рискуем и отказываем, а не тихо пропускаем проверку.
   local canon_home
-  canon_home="$(realpath -e "$HOME" 2>/dev/null)" || canon_home=""
-  if [ -n "$canon_home" ] && [ "$canon_root" = "$canon_home" ]; then
+  canon_home="$(realpath -e "$HOME" 2>/dev/null)" || {
+    echo "resolve_runtime_root: HOME='$HOME' не резолвится — не могу проверить, что CLAUDE_CONTROL_TEST_ROOT не совпадает с домашним каталогом" >&2
+    return 1
+  }
+  if [ "$canon_root" = "$canon_home" ]; then
     echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT не может совпадать с домашним каталогом ($canon_home) — слишком широкий охват для тестового корня" >&2
     return 1
   fi
@@ -131,7 +138,7 @@ _runtime_root_resolve_test_marker() {
   local canon_hardcoded_prod
   canon_hardcoded_prod="$(realpath -e "$_RUNTIME_ROOT_HARDCODED_PROD" 2>/dev/null)" || canon_hardcoded_prod=""
   if [ -n "$canon_hardcoded_prod" ] && [ "$canon_root" = "$canon_hardcoded_prod" ]; then
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT совпадает с захардкоженным боевым корнем ($_RUNTIME_ROOT_HARDCODED_PROD) — тестам сюда нельзя" >&2
+    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT совпадает с захардкоженным боевым корнем ($_RUNTIME_ROOT_HARDCODED_PROD) — тестам сюда нельзя, укажите отдельный временный каталог" >&2
     return 1
   fi
 

@@ -151,6 +151,12 @@ out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$home1")" \
   && fail "маркер = HOME обязан отказывать: $out"
 echo "$out" | command grep -qi "домашн" || fail "маркер = HOME: сообщение не объясняет причину: $out"
 
+# несуществующий (dangling) $HOME — отказ, а не тихий пропуск проверки на совпадение
+root_dangling="$(new_root)"; mark_sentinel "$root_dangling"
+out="$(resolve control_only "HOME=/no/such/home/at/all" "CLAUDE_CONTROL_TEST_ROOT=$root_dangling")" \
+  && fail "dangling HOME обязан отказывать: $out"
+echo "$out" | command grep -q "HOME" || fail "dangling HOME: сообщение не упоминает HOME: $out"
+
 # маркер = боевой $HOME/.claude-control
 home_prod="$(new_home)"; mkdir -p "$home_prod/.claude-control"
 out="$(resolve control_only "HOME=$home_prod" "CLAUDE_CONTROL_TEST_ROOT=$home_prod/.claude-control")" \
