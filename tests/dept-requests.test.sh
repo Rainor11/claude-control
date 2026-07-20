@@ -248,6 +248,41 @@ long_len="$(DL_PL list --kind message --filter 'to=mk-long-p' --status queued | 
 [ "$long_len" -le 300 ] || fail "reason 400 симв. пробил кап body ($long_len > 300)"
 echo "  planerka-exec: рассылка OK"
 
+# M3: reason_short капает ТОЛЬКО reason, не pfile/DL/pver — если путь к policy-каталогу
+# (переезд/рефактор) вырастет настолько, что body > 300, адаптер шины молча срежет хвост
+# (команду ack). Runtime-гард обязан поймать это ДО отправки: die, ни одно сообщение не уходит
+# (частичная/подмененная рассылка — не лучше полного отказа, см. "частичная рассылка — НЕ успех").
+PL_POL_LONG="$(mktemp -d)/$(printf 'a%.0s' $(seq 1 200))/$(printf 'b%.0s' $(seq 1 200))"
+mkdir -p "$PL_POL_LONG"
+printf '# правила v9\n' > "$PL_POL_LONG/policy-v9.md"
+m3_before="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
+out_m3="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_LONG" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+  TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason 'смок гарда M3' 2>&1)" \
+  && fail "dept-planerka-exec прошёл при body > 300 (длинный policy-путь) — M3-гард не сработал"
+echo "$out_m3" | command grep -q -- '> 300' || fail "M3: die не объясняет причину (нет '> 300'): $out_m3"
+m3_after="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
+[ "$m3_before" = "$m3_after" ] \
+  || fail "M3: гард сработал ПОСЛЕ отправки хотя бы одному воркеру (queued до=$m3_before, после=$m3_after — ожидался die ДО первого send)"
+echo "  planerka-exec: M3 (body-гард > 300 симв. — die до отправки) OK"
+
+# M2: --approval / --reason как ПОСЛЕДНИЙ аргумент без значения — die, не hang и не
+# "unbound variable". Регрессия: "${2:-}" сама по себе не спасает — "shift 2" при $#=1
+# молча проваливается (не двигает $1), и while крутится навечно вместо die.
+m2err="$(mktemp)"
+if timeout 5 "$DIR/bin/dept-planerka-exec" --approval 2>"$m2err"; then
+  fail "dept-planerka-exec прошёл с --approval без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-planerka-exec завис на --approval без значения (regression M2)"
+command grep -q -- '--approval требует значения' "$m2err" || fail "нет внятного die на --approval без значения: $(cat "$m2err")"
+if timeout 5 "$DIR/bin/dept-planerka-exec" --reason 2>"$m2err"; then
+  fail "dept-planerka-exec прошёл с --reason без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-planerka-exec завис на --reason без значения (regression M2)"
+command grep -q -- '--reason требует значения' "$m2err" || fail "нет внятного die на --reason без значения: $(cat "$m2err")"
+echo "  planerka-exec: M2 (arg без значения — die, не hang) OK"
+
 # ---- 8) dept-liveness-request / dept-request-render liveness_restart (T2 сторож-кнопки) ---
 # dept-liveness-request НЕ worker-only (сторож — systemd, не сессия) — не нужен
 # DEPT_APPROVE_TEST_ACTOR/SANDBOX-копия, зовём реальный bin/ напрямую. Карточка — мок
@@ -451,6 +486,22 @@ out13b="$(SYSTEMCTL="$FAKE_SYSTEMCTL" "$DIR/bin/dept-liveness-exec" --approval "
   && fail "dept-liveness-exec исполнил заявку в статусе open (диспетчер её ещё не забрал)"
 echo "$out13b" | command grep -q 'не в статусе executing' || fail "нет пояснения про статус-гейт executing на open-заявке"
 [ -s "$FAKE_SYSTEMCTL_LOG" ] && fail "systemctl вызван на open-заявке — статус-гейт не остановил ДО побочных эффектов"
+
+# M2: то же для dept-liveness-request / dept-liveness-exec (соседи из брифа) — die на
+# флаге без значения, не hang.
+if timeout 5 "$DIR/bin/dept-liveness-request" --worker 2>"$m2err"; then
+  fail "dept-liveness-request прошёл с --worker без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-liveness-request завис на --worker без значения (regression M2)"
+command grep -q 'usage: dept-liveness-request' "$m2err" || fail "нет внятного die на --worker без значения: $(cat "$m2err")"
+if timeout 5 "$DIR/bin/dept-liveness-exec" --approval 2>"$m2err"; then
+  fail "dept-liveness-exec прошёл с --approval без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-liveness-exec завис на --approval без значения (regression M2)"
+command grep -q 'usage: dept-liveness-exec' "$m2err" || fail "нет внятного die на --approval без значения: $(cat "$m2err")"
+rm -f "$m2err"
 
 echo "  liveness-restart: OK"
 

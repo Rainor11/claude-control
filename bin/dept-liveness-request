@@ -36,9 +36,12 @@ die() { echo "dept-liveness-request: $*" >&2; exit 1; }
 worker="" frozen="" transcript=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worker) worker="${2:-}"; shift 2 ;;
-    --frozen-min) frozen="${2:-}"; shift 2 ;;
-    --transcript-min) transcript="${2:-}"; shift 2 ;;
+    # M2: "${2:-}" одна не спасает от зависания — если флаг последний аргумент, "shift 2"
+    # при $#=1 молча проваливается (не двигает $1) и while крутится навечно вместо штатного
+    # die на пустое значение ниже. "shift 2 || shift" даёт гарантию прогресса.
+    --worker) worker="${2:-}"; shift 2 || shift ;;
+    --frozen-min) frozen="${2:-}"; shift 2 || shift ;;
+    --transcript-min) transcript="${2:-}"; shift 2 || shift ;;
     *) die "unknown arg: $1" ;;
   esac
 done

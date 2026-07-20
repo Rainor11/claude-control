@@ -27,7 +27,10 @@ die() { echo "dept-liveness-exec: $*" >&2; exit 1; }
 
 approval=""
 while [ $# -gt 0 ]; do case "$1" in
-  --approval) approval="${2:-}"; shift 2 ;;
+  # M2: "${2:-}" одна не спасает от зависания — если --approval последний аргумент,
+  # "shift 2" при $#=1 молча проваливается (не двигает $1) и while крутится навечно
+  # вместо штатного die на пустое значение ниже. "shift 2 || shift" даёт гарантию прогресса.
+  --approval) approval="${2:-}"; shift 2 || shift ;;
   *) die "unknown arg $1" ;;
 esac; done
 [ -n "$approval" ] || die "usage: dept-liveness-exec --approval <event_id>"

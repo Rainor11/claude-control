@@ -40,8 +40,13 @@ resolve_name() {
 event_id="" reason=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --event-id) event_id="$2"; shift 2 ;;
-    --reason) reason="$2"; shift 2 ;;
+    # M2: bare "$2" под set -u падает уродливым "unbound variable" на флаге без значения.
+    # "${2:-}" один не спасает: если флаг — последний аргумент, "shift 2" при $#=1 молча
+    # проваливается (не двигает $1), а без явной проверки while зациклится навечно вместо
+    # штатного die ниже. "shift 2 || shift" гарантирует прогресс — die на пустое значение
+    # (строки ниже) остаётся единственным источником сообщения, дублировать не нужно.
+    --event-id) event_id="${2:-}"; shift 2 || shift ;;
+    --reason) reason="${2:-}"; shift 2 || shift ;;
     *) die "unknown arg: $1" ;;
   esac
 done

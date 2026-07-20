@@ -68,4 +68,22 @@ if RNR_DB_BIN=/nonexistent/rnr_db.py DEPT_APPROVE_TEST_ACTOR=mk-a \
 fi
 command grep -q "LEDGER" "$MOCK_LOG" && fail "ledger вызван при недоступном rnr_db.py"
 
+# 6) M2: --event-id / --reason как ПОСЛЕДНИЙ аргумент без значения — die, не hang и не
+# "unbound variable". Регрессия: "${2:-}" сама по себе не спасает — "shift 2" при $#=1
+# молча проваливается и while крутится навечно без явного "shift 2 || shift".
+m2err="$SANDBOX/m2-err"
+if timeout 5 "$SANDBOX/dept-withdraw" --event-id 2>"$m2err"; then
+  fail "dept-withdraw прошёл с --event-id без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-withdraw завис на --event-id без значения (regression M2)"
+command grep -q 'usage: dept-withdraw' "$m2err" || fail "нет внятного usage-die на --event-id без значения: $(cat "$m2err")"
+
+if timeout 5 "$SANDBOX/dept-withdraw" --event-id "$eid" --reason 2>"$m2err"; then
+  fail "dept-withdraw прошёл с --reason без значения"
+fi
+rc=$?
+[ "$rc" -ne 124 ] || fail "dept-withdraw завис на --reason без значения (regression M2)"
+command grep -q -- '--reason обязателен' "$m2err" || fail "нет внятного die на --reason без значения: $(cat "$m2err")"
+
 echo PASS

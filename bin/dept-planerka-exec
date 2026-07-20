@@ -26,8 +26,11 @@ die() { echo "dept-planerka-exec: $*" >&2; exit 1; }
 approval="" reason=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --approval) approval="$2"; shift 2 ;;
-    --reason) reason="$2"; shift 2 ;;
+    # M2: bare "$2" под set -u падает уродливым "unbound variable" на флаге без значения;
+    # "${2:-}" один не спасает — если проверку на пусто НЕ сделать до shift 2, shift 2 при
+    # $#=1 молча провалится (не сдвинет $1) и while зациклится навечно. Проверка ДО shift.
+    --approval) approval="${2:-}"; [ -n "$approval" ] || die "--approval требует значения"; shift 2 ;;
+    --reason) reason="${2:-}"; [ -n "$reason" ] || die "--reason требует значения"; shift 2 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
@@ -69,6 +72,15 @@ reason_short="$(printf '%s' "$reason" | jq -Rsr '.[0:80]')"
 subject="Планёрка: перечитай правила $pver и подтверди"
 # Абсолютный путь к dept-ledger (не bare-имя) — policy 3.0: bare-имени нет в PATH воркера.
 body="Причина: ${reason_short}. Перечитай ${pfile} и выполни: ${DL} policy-ack --version ${pver}"
+
+# M3: reason_short капает ТОЛЬКО reason — ${pfile}/${DL}/${pver} капа не имеют. При переезде
+# путей (длиннее сегодняшних $DL/pfile) итоговый body может перевалить за 300 и хвост
+# (команда ack) молча срежется адаптером шины (channels/event-bridge/adapters/ledger-messages
+# .slice(0,300)) — воркер получит инструкцию без команды, которую выполнить. Runtime-гард
+# ловит это ДО отправки, а не после того как ack не пришёл ни от кого.
+body_len="$(printf '%s' "$body" | jq -Rs 'length')"
+[ "$body_len" -le 300 ] \
+  || die "body планёрки $body_len симв. > 300 — адаптер шины молча обрежет команду ack; сократи путь policy-файла или dept-ledger ($pfile / $DL)"
 
 sent=(); sleeping_list=(); failed=()
 while IFS= read -r w; do
