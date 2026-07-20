@@ -27,6 +27,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
 const { memoryFreshnessFromTx } = require('./dept-memory-freshness');
+// T4: guard процесс-контроля (lib/process-control.js, задача T2). '../lib' работает и в
+// repo-layout, и в install-layout (lib/ ставится рядом с bin/), в т.ч. через symlink —
+// node резолвит __dirname по realpath модуля.
+const processControl = require('../lib/process-control.js');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
 // Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
@@ -182,7 +186,10 @@ const EXEC_RUNNER = path.join(BIN, 'dept-exec-runner');
 const OPEN_REMIND_MIN = numEnv('DEPT_OPEN_APPROVAL_REMIND_MIN', 240);
 const OPEN_REMIND_STATE_FILE = path.join(DEPT, 'open-approval-reminders.json');
 // Тест-шов: подменить systemd-run заглушкой в тестах/песочнице (DEPT_SYSTEMD_RUN=/bin/true).
-const SYSTEMD_RUN = process.env.DEPT_SYSTEMD_RUN || 'systemd-run';
+// T4: сам бинарь резолвит guard (processControl.systemdRunArgv → e.DEPT_SYSTEMD_RUN ||
+// 'systemd-run') — тот же шов и тот же дефолт, но читается в момент ВЫЗОВА, а не на
+// module-load (конвенция репозитория, ср. execTimeoutMs в bin/dept-inbox). Отдельная
+// module-level константа стала бы вторым источником правды о том же шве — убрана.
 
 const EXECUTORS = {
   worker_spawn: 'dept-spawn-exec', mission_change: 'dept-mission-exec',
@@ -445,6 +452,19 @@ for (const row of executable) {
     console.log(`dispatcher: заявка ${kindOf} ${id} отложена — по воркеру «${target}» уже исполняется другая заявка (следующий тик возьмёт)`);
     continue;
   }
+  // Шаг 0 (T4): preflight systemd-run СТРОГО ДО пометки executing. Пометка — необратимая
+  // мутация леджера: заявка, помеченная executing без реально стартовавшего раннера, зависает
+  // до recovery-бэкстопа (EXEC_MAX_MIN) и требует ручного разбора. Поэтому под тестовым
+  // маркером CLAUDE_CONTROL_TEST_ROOT отказ (шов DEPT_SYSTEMD_RUN не подставлен заглушкой
+  // внутри test root) обязан произойти ЗДЕСЬ, до побочного эффекта, а не на execFileSync
+  // ниже. БЕЗ маркера preflight не проверяет ничего и не может бросить — поведение
+  // диспетчера побитово прежнее.
+  try {
+    processControl.preflight('systemd_run');
+  } catch (e) {
+    console.error(`dispatcher: guard процесс-контроля не пропустил запуск раннера для заявки ${kindOf} ${id}: ${e.message} — заявка НЕ помечена executing, следующий тик повторит попытку`);
+    continue;
+  }
   // Шаг 1: пометить executing. Это САМА защита от повторного запуска (явная — поверх
   // неявной защиты list --status approved, которая эту заявку уже не выбрала бы на
   // следующем тике, но между "прочитали approved" и "пометили executing" возможна гонка
@@ -464,7 +484,17 @@ for (const row of executable) {
   // имя юнита при живом раннере той же заявки) — алерт; заявка остаётся executing,
   // recovery-бэкстоп (EXEC_MAX_MIN) штатный.
   try {
-    execFileSync(SYSTEMD_RUN, runnerArgv(id, EXEC_RUNNER, path.join(BIN, executor), process.env),
+    // T4: argv собирает guard (systemdRunArgv) — он же ПРЕПЕНДИТ `--setenv
+    // CLAUDE_CONTROL_TEST_ROOT=<root>` под маркером. Это обязательно: systemd-run НЕ наследует
+    // env клиента, и без явной прокидки вложенная цепочка (dept-exec-runner → исполнитель →
+    // claude-auto) потеряла бы маркер и осталась БЕЗ защиты — вызвала бы настоящие
+    // systemctl/tmux уже ничем не прикрытая. Сборка через guard, а не дописывание маркера в
+    // whitelist runnerArgv, потому что решение «какой маркер и с каким значением» принадлежит
+    // T2 (systemdRunSetenvArgv) — второй копии этой логики быть не должно.
+    // БЕЗ маркера setenv-часть пуста, argv побитово равен прежнему runnerArgv(...).
+    const { bin: sdRunBin, argv: sdRunArgv } = processControl.systemdRunArgv(
+      runnerArgv(id, EXEC_RUNNER, path.join(BIN, executor), process.env), process.env);
+    execFileSync(sdRunBin, sdRunArgv,
       { encoding: 'utf8', timeout: 15_000 });
     execStartedCount++;
     if (target) busyTargets.add(target); // сериализация в рамках тика (Codex H-2)
