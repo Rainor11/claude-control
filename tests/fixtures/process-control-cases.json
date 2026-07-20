@@ -1,0 +1,44 @@
+[
+  {
+    "name": "unit-dir-no-marker",
+    "fn": "unit_dir_decision",
+    "args": { "testRoot": "", "home": "/home/rr-fixture-user" },
+    "expect": "/home/rr-fixture-user/.config/systemd/user"
+  },
+  {
+    "name": "unit-dir-marker",
+    "fn": "unit_dir_decision",
+    "args": { "testRoot": "/tmp/rr-fixture-root-1", "home": "/home/rr-fixture-user" },
+    "expect": "/tmp/rr-fixture-root-1/systemd-user"
+  },
+  {
+    "name": "tmux-socket-no-marker",
+    "fn": "tmux_socket_argv",
+    "args": { "name": "workerA", "testRoot": "" },
+    "expect": ["-L", "claude-workerA"]
+  },
+  {
+    "name": "tmux-socket-marker",
+    "fn": "tmux_socket_argv",
+    "args": { "name": "workerA", "testRoot": "/tmp/rr-fixture-root-1" },
+    "expect": ["-S", "/tmp/rr-fixture-root-1/tmux.sock"]
+  },
+  {
+    "name": "tmux-socket-marker-name-irrelevant",
+    "fn": "tmux_socket_argv",
+    "args": { "name": "another-worker", "testRoot": "/tmp/rr-fixture-root-1" },
+    "expect": ["-S", "/tmp/rr-fixture-root-1/tmux.sock"]
+  },
+  {
+    "name": "systemd-run-setenv-no-marker",
+    "fn": "systemd_run_setenv_argv",
+    "args": { "testRoot": "" },
+    "expect": []
+  },
+  {
+    "name": "systemd-run-setenv-marker",
+    "fn": "systemd_run_setenv_argv",
+    "args": { "testRoot": "/tmp/rr-fixture-root-1" },
+    "expect": ["--setenv", "CLAUDE_CONTROL_TEST_ROOT=/tmp/rr-fixture-root-1"]
+  }
+]

@@ -35,4 +35,6 @@ jobs:
             install.sh \
             uninstall.sh \
             lib/runtime-root.sh \
-            tests/runtime-root.test.sh
+            tests/runtime-root.test.sh \
+            lib/process-control.sh \
+            tests/process-control.test.sh

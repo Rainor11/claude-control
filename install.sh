@@ -226,7 +226,7 @@ install_lib() {
   fi
 }
 
-for libfile in runtime-root.sh runtime-root.js; do
+for libfile in runtime-root.sh runtime-root.js process-control.sh process-control.js; do
   install_lib "$libfile"
 done
 

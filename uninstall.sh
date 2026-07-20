@@ -120,8 +120,8 @@ for script in claude-rc claude-control-run claude-control-logrotate \
   fi
 done
 
-# lib/ files installed by install.sh (T1) — same copy/link symmetry as bin/ scripts above.
-for libfile in runtime-root.sh runtime-root.js; do
+# lib/ files installed by install.sh (T1, T2) — same copy/link symmetry as bin/ scripts above.
+for libfile in runtime-root.sh runtime-root.js process-control.sh process-control.js; do
   target="$LIB_DIR/$libfile"
   if [[ -e "$target" || -L "$target" ]]; then
     say "Remove $target"
