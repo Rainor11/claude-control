@@ -9,6 +9,11 @@ const http = require('http');
 const path = require('path');
 const { execFile } = require('child_process');
 const render = require('./dept-inbox-render.js');
+// T4: guard процесс-контроля (lib/process-control.js, задача T2). Путь '../lib' работает и в
+// repo-layout, и в install-layout (install.sh кладёт lib/ рядом с bin/) — node резолвит
+// __dirname по realpath модуля, поэтому и через symlink путь верный (тот же принцип, что
+// `readlink -f` в bash-обёртках, bin/claude-auto:46).
+const processControl = require('../lib/process-control.js');
 
 const PORT = Number(process.env.DEPT_INBOX_PORT || 8377);
 const DEFAULT_DL_BIN = path.join(__dirname, 'dept-ledger');
@@ -59,8 +64,23 @@ function dl(args) {
 function systemctlIsActiveMany(names) {
   if (!names.length) return Promise.resolve(new Map());
   const units = names.map((n) => `claude-auto@${n}.service`);
+  // T4: preflight ДО execFile — под маркером CLAUDE_CONTROL_TEST_ROOT отказ происходит ДО
+  // побочного эффекта, а не «вызвали настоящий systemctl и потом пожаловались». БЕЗ маркера
+  // preflight не проверяет ничего (checkBinarySeam выходит сразу при testRoot === null), а
+  // SYSTEMCTL в боевых юнитах не выставлен — bin === 'systemctl', argv тот же побитово.
+  // Провал preflight — НЕ исключение наружу: дашборд read-only и деградирует так же, как при
+  // недоступном systemctl (все воркеры «не active» + запись в journald), но настоящего
+  // бинаря при этом не касается вовсе — это и есть fail-closed для status-запроса.
+  let bin;
+  try {
+    processControl.preflight('systemctl');
+    bin = process.env.SYSTEMCTL || 'systemctl';
+  } catch (e) {
+    console.error('dept-inbox: guard процесс-контроля отказал в systemctl is-active:', e.message);
+    return Promise.resolve(new Map(names.map((n) => [n, false])));
+  }
   return new Promise((resolve) => {
-    execFile('systemctl', ['--user', 'is-active', ...units], { encoding: 'utf8', timeout: execTimeoutMs() },
+    execFile(bin, ['--user', 'is-active', ...units], { encoding: 'utf8', timeout: execTimeoutMs() },
       (err, stdout) => {
         if (err && !stdout) console.error('dept-inbox: systemctl is-active недоступен:', err.message);
         const lines = String(stdout || '').trim().split('\n');
