@@ -46,11 +46,21 @@ set -u
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 REPO_DIR="$(cd "$BIN_DIR/.." && pwd)"
+# T4: guard процесс-контроля (lib/process-control.sh, задача T2) — оборачивает ВСЕ вызовы
+# systemctl/tmux и запись systemd user unit-файлов ниже. Путь через $BIN_DIR/../lib работает
+# и в repo-layout, и в install-layout (install.sh кладёт lib/ рядом с bin/), в т.ч. через
+# symlink — $BIN_DIR уже разрешён readlink -f выше.
+# shellcheck disable=SC1091
+. "$BIN_DIR/../lib/process-control.sh"
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 WORKERS_DIR="$CONTROL_DIR/workers"
 REGISTRY="$CONTROL_DIR/autonomous.json"
 EB_DIR="$REPO_DIR/channels/event-bridge"
-SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+# T4: SYSTEMD_USER_DIR больше НЕ глобальная константа — каталог unit-файлов резолвит guard
+# (process_control_unit_dir, marker-aware) точечно внутри cmd_install_units, где он и
+# используется. Причина: eager-резолв на module-load печатал бы ошибку резолвера на КАЖДОМ
+# вызове claude-auto под невалидным маркером (даже для `sleep`, которому каталог не нужен).
+# Без маркера значение то же самое ($HOME/.config/systemd/user).
 
 die() { echo "claude-auto: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -213,17 +223,36 @@ reg_update() {
 
 # ---- install-units ---------------------------------------------------------
 cmd_install_units() {
+  # T4: каталог unit-файлов — через guard (marker-aware). Без маркера возвращает
+  # $HOME/.config/systemd/user (побитово как прежняя константа SYSTEMD_USER_DIR); под
+  # маркером — <test-root>/systemd-user (инцидент 20.07: тестовый прогон писал шаблон прямо
+  # в боевой $HOME/.config/systemd/user). Резолвер может отказать (маркер задан, но невалиден)
+  # — тогда die ДО mkdir/render, а не запись мимо test root.
+  local SYSTEMD_USER_DIR
+  SYSTEMD_USER_DIR="$(process_control_unit_dir)" \
+    || die "install-units: guard не смог определить каталог systemd user unit-файлов (тестовый маркер CLAUDE_CONTROL_TEST_ROOT задан, но невалиден?)"
   mkdir -p "$SYSTEMD_USER_DIR"
   render() { sed -e "s#__BIN_DIR__#$BIN_DIR#g" -e "s#__CONTROL_DIR__#$CONTROL_DIR#g" "$1" > "$2"; }
   render "$REPO_DIR/systemd/claude-auto@.service.tmpl"            "$SYSTEMD_USER_DIR/claude-auto@.service"
   render "$REPO_DIR/systemd/claude-auto-reconciler.service.tmpl"  "$SYSTEMD_USER_DIR/claude-auto-reconciler.service"
   render "$REPO_DIR/systemd/claude-auto-reconciler.timer.tmpl"    "$SYSTEMD_USER_DIR/claude-auto-reconciler.timer"
-  systemctl --user daemon-reload
-  systemctl --user enable --now claude-auto-reconciler.timer >/dev/null 2>&1 || true
+  process_control_systemctl --user daemon-reload
+  process_control_systemctl --user enable --now claude-auto-reconciler.timer >/dev/null 2>&1 || true
   echo "units installed in $SYSTEMD_USER_DIR; reconciler timer enabled"
-  if ! loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
-    echo "WARNING: linger is OFF — workers will NOT survive reboot/logout."
-    echo "  enable once with: loginctl enable-linger $USER"
+  # T4: линджер-проверку (read-only loginctl show-user) выполняем ТОЛЬКО когда точно НЕ под
+  # тестовым маркером — под маркером даже read-only loginctl запрещён (бриф T4), а линджер
+  # юнитов в фейковом test-root каталоге ничего не значит. У loginctl нет собственного шва в
+  # T2 (guard покрывает systemctl/systemd-run/tmux/unit-dir), поэтому гейтим тем же резолвером
+  # маркера, что и весь guard, не дублируя его логику: пустой stdout при успехе = маркера нет
+  # (боевой путь, зовём loginctl как раньше); непустой = валидный маркер (пропускаем); отказ
+  # резолвера (rc≠0, маркер невалиден) = fail-closed, тоже пропускаем.
+  local _test_root _resolver_ok=1
+  _test_root="$(_process_control_test_root)" || _resolver_ok=0
+  if [ "$_resolver_ok" = 1 ] && [ -z "$_test_root" ]; then
+    if ! loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+      echo "WARNING: linger is OFF — workers will NOT survive reboot/logout."
+      echo "  enable once with: loginctl enable-linger $USER"
+    fi
   fi
 }
 
@@ -595,7 +624,7 @@ cmd_adopt() {
     --arg n "$name" --arg c "$cwd" --arg t "$(ts)" --arg bp "$brain_path" --arg br "$brain_rel"
 
   cmd_install_units >/dev/null
-  systemctl --user enable --now "claude-auto@$name.service" \
+  process_control_systemctl --user enable --now "claude-auto@$name.service" \
     || die "failed to start unit claude-auto@$name.service (see: journalctl --user -u claude-auto@$name)"
 
   local rc_line=""
@@ -661,7 +690,7 @@ cmd_spawn() {
     if [ ! -s "$home/spec.json" ] || ! jq -e . "$home/spec.json" >/dev/null 2>&1; then
       [ -f "$home/.spawn-marker" ] || die "spawn: '$name' существует с битым spec и БЕЗ spawn-маркера — чужой, не трогаю"
       echo "spawn: '$name' — незавершённый прошлый spawn (маркер есть, spec нет/бит) — чистый откат и пересоздание"
-      systemctl --user disable --now "claude-auto@$name.service" 2>/dev/null || true
+      process_control_systemctl --user disable --now "claude-auto@$name.service" 2>/dev/null || true
       rm -rf "${WORKERS_DIR:?}/$name"
     else
       [ "$(jq -r '.spawned // false' "$home/spec.json" 2>/dev/null)" = "true" ] || die "spawn: воркер '$name' существует и создан НЕ spawn'ом — не трогаю"
@@ -670,7 +699,7 @@ cmd_spawn() {
       ensure_registry
       reg_update '.workers[$n].state="active"' --arg n "$name"
       cmd_install_units >/dev/null
-      systemctl --user enable --now "claude-auto@$name.service" || die "spawn: unit failed"
+      process_control_systemctl --user enable --now "claude-auto@$name.service" || die "spawn: unit failed"
       echo "worker '$name' достроен"
       return 0
     fi
@@ -731,10 +760,10 @@ cmd_spawn() {
     --arg n "$name" --arg c "$cwd" --arg t "$(ts)" --arg bp "$brain_path" --arg br "$brain_rel"
 
   cmd_install_units >/dev/null
-  systemctl --user enable --now "claude-auto@$name.service" || die "spawn: unit failed to start"
+  process_control_systemctl --user enable --now "claude-auto@$name.service" || die "spawn: unit failed to start"
 
   local i up=false
-  for i in $(seq 1 60); do tmux -L "claude-$name" has-session -t "claude-$name" 2>/dev/null && { up=true; break; }; sleep 2; done
+  for i in $(seq 1 60); do process_control_tmux "$name" has-session -t "claude-$name" 2>/dev/null && { up=true; break; }; sleep 2; done
   [ "$up" = true ] || die "spawn: воркер не поднялся за 120с (journalctl --user -u claude-auto@$name); повторный запуск spawn достроит"
 
   local kf="${kickoff_file:-$REPO_DIR/examples/department/spawn-kickoff.md}" delivered=false
@@ -796,8 +825,8 @@ worker_busy() {
   local sess="claude-$1" pane tailn
   # Per-worker tmux socket (-L "$sess"): each worker's session is on its own dedicated
   # socket (named after the session) — see claude-auto-run. Address it with -L everywhere.
-  tmux -L "$sess" has-session -t "$sess" 2>/dev/null || return 1
-  pane="$(tmux -L "$sess" capture-pane -pt "$sess" 2>/dev/null)" || return 0   # capture failed ⇒ assume busy (safer)
+  process_control_tmux "$1" has-session -t "$sess" 2>/dev/null || return 1
+  pane="$(process_control_tmux "$1" capture-pane -pt "$sess" 2>/dev/null)" || return 0   # capture failed ⇒ assume busy (safer)
   # Turn running, an approval/elicitation dialog, or a startup modal anywhere on screen.
   printf '%s' "$pane" | grep -qiE 'esc to interrupt|Do you want to|Allow .* to (run|use|edit|create|read)|trust (this )?(folder|directory)|new MCP server|resume .*session|Continue\?' && return 0
   # Unsent operator input: a live prompt line "❯ <text>" near the bottom (check only the
@@ -814,7 +843,7 @@ cmd_list() {
   jq -r '.workers // {} | to_entries[] | "\(.key)\t\(.value.state)\t\(.value.cwd)\t\(.value.brain_rel // "")"' "$REGISTRY" 2>/dev/null |
   while IFS=$'\t' read -r n st c br; do
     local active deal="—"
-    systemctl --user is-active --quiet "claude-auto@$n.service" && active="running" || active="down"
+    process_control_systemctl --user is-active --quiet "claude-auto@$n.service" && active="running" || active="down"
     [ -n "$br" ] && deal="$br"
     printf '%-18s %-9s %-8s %-30s %s\n' "$n" "$st" "$active" "$deal" "$c"
   done
@@ -833,7 +862,7 @@ cmd_overview() {
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     local dot unit ctx="n/a" probes="(нет)" cj cfg
-    if systemctl --user is-active --quiet "claude-auto@$n.service"; then dot="●"; unit="up"; else dot="○"; unit="down"; fi
+    if process_control_systemctl --user is-active --quiet "claude-auto@$n.service"; then dot="●"; unit="up"; else dot="○"; unit="down"; fi
     cj="$WORKERS_DIR/$n/state/context.json"
     [ -f "$cj" ] && ctx="$(jq -r 'if (.ctx_tokens!=null and .threshold!=null) then "\((.ctx_tokens/1000)|floor)k/\((.threshold/1000)|floor)k" else "n/a" end' "$cj" 2>/dev/null)"
     [ -n "$ctx" ] || ctx="n/a"
@@ -885,16 +914,16 @@ cmd_status() {
   local name="${1:?usage: status <name>}"
   worker_exists "$name" || die "no worker '$name'"
   echo "=== spec ==="; jq . "$WORKERS_DIR/$name/spec.json"
-  echo "=== unit ==="; systemctl --user --no-pager status "claude-auto@$name.service" 2>&1 | head -12
-  echo "=== tmux ==="; tmux -L "claude-$name" has-session -t "claude-$name" 2>/dev/null && echo "tmux session claude-$name: UP" || echo "tmux session claude-$name: down"
+  echo "=== unit ==="; process_control_systemctl --user --no-pager status "claude-auto@$name.service" 2>&1 | head -12
+  echo "=== tmux ==="; process_control_tmux "$name" has-session -t "claude-$name" 2>/dev/null && echo "tmux session claude-$name: UP" || echo "tmux session claude-$name: down"
   echo "=== memory ==="; status_memory "$name"
 }
 
 cmd_stop() {
   local name="${1:?usage: stop <name>}"
   worker_exists "$name" || die "no worker '$name'"
-  systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
-  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  process_control_systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
+  process_control_tmux "$name" kill-session -t "claude-$name" 2>/dev/null || true
   reg_update '.workers[$n].state="stopped"' --arg n "$name"
   echo "worker '$name' stopped + disabled (files kept; 'start' to resume, 'remove' to delete)"
 }
@@ -972,8 +1001,8 @@ probe_has_baseline() {
 cmd_sleep() {
   local name="${1:?usage: sleep <name>}"
   worker_exists "$name" || die "no worker '$name'"
-  systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
-  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  process_control_systemctl --user disable --now "claude-auto@$name.service" 2>&1 | sed 's/^/  /' || true
+  process_control_tmux "$name" kill-session -t "claude-$name" 2>/dev/null || true
   reg_update '.workers[$n].state="sleeping"' --arg n "$name"
   # Codex-аудит В5: stateful-адаптер (gmail/tg/asana) без прогретого baseline при первом
   # прогоне создаёт baseline МОЛЧА — событие до прогрева потерялось бы. Предупреждаем.
@@ -995,7 +1024,7 @@ cmd_start() {
   worker_exists "$name" || die "no worker '$name'"
   reg_update '.workers[$n].state="active"' --arg n "$name"
   cmd_install_units >/dev/null
-  systemctl --user enable --now "claude-auto@$name.service" && echo "worker '$name' started"
+  process_control_systemctl --user enable --now "claude-auto@$name.service" && echo "worker '$name' started"
 }
 
 # rebase <name> — пересборка сессии от файлов: новый session_id (seeded=false,
@@ -1058,13 +1087,13 @@ cmd_rebase() {
   spec_rmw "$name" '.session_id=$w | .seeded=false | .origin_id=null | .rebased_at=$t | .rebase_of=$o' \
     --arg w "$new_sid" --arg t "$(ts)" --arg o "$old_sid"
   rm -f "$home/state/compactions" "$home/state/compact_requested"
-  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  process_control_tmux "$name" kill-session -t "claude-$name" 2>/dev/null || true
   # Restart=always поднимет юнит с новым спеком (fresh-ветка); если юнит был down — поднять явно
-  systemctl --user is-active --quiet "claude-auto@$name.service" || systemctl --user start "claude-auto@$name.service"
+  process_control_systemctl --user is-active --quiet "claude-auto@$name.service" || process_control_systemctl --user start "claude-auto@$name.service"
 
   local i up=false
   for i in $(seq 1 60); do
-    tmux -L "claude-$name" has-session -t "claude-$name" 2>/dev/null && { up=true; break; }
+    process_control_tmux "$name" has-session -t "claude-$name" 2>/dev/null && { up=true; break; }
     sleep 2
   done
   [ "$up" = true ] || die "rebase: воркер не поднялся за 120с (journalctl --user -u claude-auto@$name)"
@@ -1166,8 +1195,8 @@ cmd_mission_update() {
 cmd_remove() {
   local name="${1:?usage: remove <name>}"
   worker_exists "$name" || die "no worker '$name'"
-  systemctl --user disable --now "claude-auto@$name.service" 2>/dev/null || true
-  tmux -L "claude-$name" kill-session -t "claude-$name" 2>/dev/null || true
+  process_control_systemctl --user disable --now "claude-auto@$name.service" 2>/dev/null || true
+  process_control_tmux "$name" kill-session -t "claude-$name" 2>/dev/null || true
   reg_update 'del(.workers[$n])' --arg n "$name"
   rm -rf "${WORKERS_DIR:?}/$name"
   echo "worker '$name' removed"
@@ -1295,7 +1324,7 @@ cmd_set_probes() {
 
   local count; count="$(jq '.probes | length' "$cfg")"
   echo "set-probes: '$name' now has $count probe(s); event-bridge-watch reloads within ~5s (no restart)."
-  systemctl --user is-active --quiet "claude-auto@$name.service" \
+  process_control_systemctl --user is-active --quiet "claude-auto@$name.service" \
     || echo "  note: worker is not running — the new config applies on next start."
 
   # --- B: clean state for probes removed by THIS change (after the atomic mv, under
@@ -1796,7 +1825,7 @@ cmd_upgrade() {
   # Verify the restart actually came up — cmd_start marks the registry active before
   # `systemctl enable --now`, so don't claim success blindly (Codex). A failed start
   # leaves the worker DOWN; surface it instead of falsely reporting done.
-  if ! cmd_start "$name" >/dev/null 2>&1 || ! systemctl --user is-active --quiet "claude-auto@$name.service"; then
+  if ! cmd_start "$name" >/dev/null 2>&1 || ! process_control_systemctl --user is-active --quiet "claude-auto@$name.service"; then
     echo "upgrade: '$name' ERROR — files patched but the worker did NOT come back up. It may be DOWN." >&2
     echo "         Check: journalctl --user -u claude-auto@$name -n 50" >&2
     return 1
