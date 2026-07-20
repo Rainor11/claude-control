@@ -37,4 +37,9 @@ jobs:
             lib/runtime-root.sh \
             tests/runtime-root.test.sh \
             lib/process-control.sh \
-            tests/process-control.test.sh
+            tests/process-control.test.sh \
+            tests/run \
+            tests/lib/bootstrap.sh \
+            tests/bootstrap.test.sh \
+            tests/run.test.sh \
+            tests/lint-bootstrap.test.sh

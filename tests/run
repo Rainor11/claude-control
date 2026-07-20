@@ -1,0 +1,329 @@
+#!/bin/bash
+# tests/run — ЕДИНСТВЕННЫЙ санкционированный способ запускать tests/*.test.sh и
+# tests/*.test.mjs (T3 изоляции тестов от боевого рантайма, см.
+# .superpowers/sdd/iso-t3-brief.md). До этого файла защита T1 (lib/runtime-root.sh) и T2
+# (lib/process-control.sh) работала ТОЛЬКО для теста, который сам не забыл выставить маркер
+# CLAUDE_CONTROL_TEST_ROOT — резолвер под отсутствующим маркером законно применяет боевой
+# дефолт, и добровольный пролог механической границей не является (см. brief). Этот раннер —
+# рубеж 1 из двух: он ГОТОВИТ песочницу (маркер + sentinel + заглушки процесс-контроля) ДО
+# старта каждого теста; рубеж 2 (tests/lib/bootstrap.sh / .mjs) отказывает, если тест
+# запущен НЕ через этот раннер.
+#
+# set -u ЗДЕСЬ уместен (это исполняемый скрипт, не source-able библиотека — тот же
+# конвенционный выбор, что у install.sh/uninstall.sh, см. .superpowers/sdd/iso-t3-brief.md
+# «Конвенции репозитория»).
+set -u
+
+_RUN_TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_RUN_REPO_DIR="$(cd "$_RUN_TESTS_DIR/.." && pwd)"
+
+# Тестируемость (используется ТОЛЬКО tests/run.test.sh): TESTS_RUN_DIR_OVERRIDE заставляет
+# раннер сканировать/исполнять тесты из ДРУГОГО каталога (игрушечные fixture-тесты во
+# временной директории) вместо реального tests/ — так механику раннера (discovery/песочница/
+# карантин/PASS-FAIL/уборка) можно проверить, ни разу не запустив ни один настоящий тест
+# из боевого набора. _RUN_REPO_DIR (откуда берутся lib/runtime-root.sh и
+# lib/process-control.sh) вычислен ВЫШЕ, ДО этой проверки, — override его не трогает, иначе
+# сломался бы поиск библиотек. Без переменной поведение НЕ меняется вовсе.
+if [ -n "${TESTS_RUN_DIR_OVERRIDE:-}" ]; then
+  _RUN_TESTS_DIR="$TESTS_RUN_DIR_OVERRIDE"
+fi
+
+# Переиспользуем T1 ИСКЛЮЧИТЕЛЬНО за именем sentinel-файла (_RUNTIME_ROOT_SENTINEL_NAME) —
+# бриф прямо требует "имя sentinel уже определено в T1 — возьми оттуда, не выдумывай своё".
+# Раннер — единственное место, которое ЭТОТ файл СОЗДАЁТ; резолв/containment/проверку
+# заглушек мы здесь не делаем вовсе (это работа T1/T2 внутри самих тестов через bootstrap) —
+# раннер только строит песочницу и передаёт готовые пути через env.
+# shellcheck disable=SC1091
+. "$_RUN_REPO_DIR/lib/runtime-root.sh"
+SENTINEL_NAME="$_RUNTIME_ROOT_SENTINEL_NAME"
+
+# -----------------------------------------------------------------------------------------
+# КАРАНТИН — явный deny-list с причиной (проектное решение, см. отчёт iso-t3-report.md).
+#
+# Почему deny-list, а не что-то "умнее": guard процесс-контроля (T2) существует и покрыт
+# тестами, но пока НЕ подключён ни к одному файлу в bin/, bot/, channels/ — это T4. Значит
+# ЛЮБОЙ тест, который вызывает bin/* код, реально дёргающий systemctl/systemd-run/tmux ПО
+# БАРОЙ КОМАНДЕ (а не через переопределяемый seam), долетает до настоящего бинаря
+# НЕЗАВИСИМО от того, что раннер выставил маркер и заглушки — bin/* их сегодня не
+# консультирует. Песочница (маркер+sentinel+заглушки+HOME) — необходимое, но НЕ достаточное
+# условие безопасности ДО T4. Единственный СЕГОДНЯ подтверждённый чтением кода такой тест —
+# tests/asana-project-integration.test.sh (см. .superpowers/sdd/isolation-plan.md, находка
+# №1): `claude-auto sleep testw` → bin/claude-auto:975-976 делает настоящий
+# `systemctl --user disable --now` + `tmux -L claude-testw kill-session`, оба вызова —
+# ГОЛЫЕ имена команд, guard их не видит и не может увидеть до T4.
+#
+# Карантин проверяется ПЕРВЫМ, ДО построения списка на выполнение — filter_quarantine()
+# вызывается на любом источнике кандидатов (auto-discovery ИЛИ явный аргумент командной
+# строки) и ПОБЕЖДАЕТ даже явное указание файла по имени: раннер спроектирован так, чтобы
+# карантинный файл было ФИЗИЧЕСКИ НЕВОЗМОЖНО запустить через него, а не просто "по
+# умолчанию пропускается, если не попросить иначе". Единственный способ снять карантин —
+# отредактировать этот массив (T4, после подключения guard к cmd_sleep).
+#
+# Это НЕ исчерпывающий аудит всех 23 существующих тестов (см. iso-t3-report.md — статический
+# grep-аудит на systemctl/tmux/install.sh/uninstall.sh не нашёл других файлов, вызывающих
+# реальные бинарные side-effects без собственного мока) — если позже обнаружится ещё один
+# такой файл, он добавляется сюда ТЕМ ЖЕ способом.
+declare -A QUARANTINE=(
+  [tests/asana-project-integration.test.sh]="claude-auto sleep testw → bin/claude-auto cmd_sleep делает настоящий 'systemctl --user disable --now' + 'tmux -L claude-testw kill-session' (голые имена команд, guard T2 к bin/* ещё не подключён — это T4). Снимается в T4 после подключения guard к cmd_sleep/cmd_stop."
+)
+
+usage() {
+  cat <<'EOF'
+Использование: tests/run [--list] [файл ...]
+
+Без аргументов — запускает ВСЕ обнаруженные tests/*.test.sh и tests/*.test.mjs (кроме
+карантина, см. ниже) в свежей песочнице на каждый файл.
+
+С аргументами — запускает только явно перечисленные файлы (относительный путь вида
+"tests/foo.test.sh" ИЛИ голое имя "foo.test.sh") — карантин ПОБЕЖДАЕТ даже явное указание,
+физически невозможно запустить карантинный файл через этот раннер.
+
+  --list    только показать обнаруженные тесты + карантин (с причиной), ничего не запускать
+  --help    эта справка
+EOF
+}
+
+# discover(): печатает относительные пути (tests/xxx) всех *.test.sh и *.test.mjs
+# НЕПОСРЕДСТВЕННО в tests/ (без рекурсии — сегодня все тесты плоские), отсортированные —
+# автоматически, НЕ жёстким списком (бриф: "жёсткий список сам станет местом, где забудут").
+discover() {
+  local f
+  shopt -s nullglob
+  local files=("$_RUN_TESTS_DIR"/*.test.sh "$_RUN_TESTS_DIR"/*.test.mjs)
+  shopt -u nullglob
+  for f in "${files[@]}"; do
+    printf 'tests/%s\n' "$(basename "$f")"
+  done | sort
+}
+
+# is_quarantined <rel>: 0, если файл в deny-list.
+is_quarantined() {
+  [ -n "${QUARANTINE[$1]+set}" ]
+}
+
+# make_stub <path>: исполняемая заглушка процесс-контроля — логирует свой вызов (argv0 +
+# аргументы, TAB-разделено) в $STUB_LOG (если задан) и завершается успешно. Дефолт "тихого
+# успеха" достаточен для большинства тестов; тесты, которым нужно конкретное поведение
+# (эмуляция ошибки, конкретный stdout), продолжают подставлять СВОЙ мок через тот же env var
+# (прецедент — tests/dept-requests.test.sh FAKE_SYSTEMCTL) — заглушка раннера лишь
+# базовая страховка "не долетело до настоящего бинаря", не более.
+make_stub() {
+  local path="$1"
+  cat > "$path" <<'STUB'
+#!/bin/bash
+# Заглушка процесс-контроля, созданная tests/run (НЕ настоящий бинарь). См.
+# tests/run::make_stub — логирует argv в $STUB_LOG и завершается успешно.
+if [ -n "${STUB_LOG:-}" ]; then
+  { printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+fi
+exit 0
+STUB
+  chmod +x "$path"
+}
+
+# uses_bootstrap <abs>: 0, если файл уже подключает tests/lib/bootstrap.{sh,mjs} — тот же
+# признак "тест мигрирован", что использует tests/lint-bootstrap.test.sh. Решает, обязан ли
+# раннер ПРИНУДИТЕЛЬНО экспортировать SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN: их консультирует
+# ТОЛЬКО bootstrap-preflight (T2) — НЕ мигрированные (allow-list, T6) тесты строят СВОИ
+# собственные моки этих же переменных внутри себя И явно тестируют сценарий "переменная НЕ
+# задана — резолв через PATH" (прецедент, найденный ЭМПИРИЧЕСКИ при верификации раннера:
+# tests/process-control.test.sh, сценарий «process_control_systemctl без маркера: прокси на
+# настоящий бинарь, проверяем фейковым бинарём в PATH» — принудительный SYSTEMCTL от раннера
+# ломает именно этот сценарий, подменяя собой ожидаемый PATH-fallback). Раннер не навязывает
+# ещё не принятый тестом контракт — sentinel/маркер/HOME/TELEGRAM_NOTIFY/RNR_ASKS_DB/PATH-
+# shadow остаются БЕЗ УСЛОВИЙ (ни один существующий тест не тестирует ИХ отсутствие).
+uses_bootstrap() {
+  command grep -qE 'lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
+}
+
+# run_one <rel>: свежая песочница → выполнить → уборка. Возвращает 0/1/2
+# (0=PASS, 1=FAIL, 2=QUARANTINED) через RUN_ONE_STATUS (не через return — нужен ещё и текст).
+run_one() {
+  # abs строится от _RUN_TESTS_DIR (не от _RUN_REPO_DIR/rel напрямую) — важно под
+  # TESTS_RUN_DIR_OVERRIDE (см. выше): "rel" ВСЕГДА ярлык вида "tests/<basename>" (для
+  # единообразия с QUARANTINE/discover), а физическое расположение файла зависит от того,
+  # сканируем ли реальный tests/ или fixture-override.
+  local rel="$1" abs="$_RUN_TESTS_DIR/${1#tests/}"
+
+  if is_quarantined "$rel"; then
+    echo "QUARANTINE: $rel"
+    echo "  причина: ${QUARANTINE[$rel]}"
+    RUN_ONE_STATUS=2
+    return 0
+  fi
+
+  if [ ! -f "$abs" ]; then
+    echo "FAIL: $rel — файл не найден ($abs)"
+    RUN_ONE_STATUS=1
+    return 0
+  fi
+
+  local sandbox canon_sandbox
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/claude-control-test.XXXXXX")" || {
+    echo "FAIL: $rel — mktemp -d не смог создать песочницу"
+    RUN_ONE_STATUS=1
+    return 0
+  }
+  canon_sandbox="$(realpath -e "$sandbox")" || {
+    echo "FAIL: $rel — realpath не смог канонизировать песочницу $sandbox"
+    rm -rf "$sandbox"
+    RUN_ONE_STATUS=1
+    return 0
+  }
+
+  # --- контракт песочницы (см. brief «Контракт песочницы») ------------------------------
+  : > "$canon_sandbox/$SENTINEL_NAME"
+
+  local stub_dir="$canon_sandbox/stubs"
+  mkdir -p "$stub_dir"
+  make_stub "$stub_dir/systemctl"
+  make_stub "$stub_dir/systemd-run"
+  make_stub "$stub_dir/tmux"
+  make_stub "$stub_dir/telegram-notify.sh"
+
+  local home_dir="$canon_sandbox/home"
+  mkdir -p "$home_dir"
+  local rnr_db_dir="$canon_sandbox/rnr-db"
+  mkdir -p "$rnr_db_dir"
+
+  local rc out
+  # `{ ...; } 2>&1` ВНУТРИ command substitution — сливает stderr в stdout ДЛЯ ВСЕГО блока
+  # (включая exec bash/node ниже, которые заменяют образ процесса, но наследуют уже
+  # перенаправленные fd) — без этой группы stderr теста утекал бы мимо `out=`, минуя лог.
+  out="$(
+    {
+      # Легаси-переменные + сам маркер + все 3 seam-переменные ГАРАНТИРОВАННО unset ДО
+      # экспорта наших значений — даже если оператор (или ВНЕШНИЙ, обёртывающий вызов
+      # tests/run — regression-тест, найденный эмпирически: tests/run.test.sh гоняет
+      # НЕСТИРОВАННЫЙ tests/run уже ПОД bootstrap-песочницей самого себя, и SYSTEMCTL от
+      # ВНЕШНЕГО раннера иначе утёк бы через inheritance во ВНУТРЕННИЙ прогон, обходя
+      # uses_bootstrap для тестов, которые его не заслужили) уже унаследовал
+      # SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN откуда-то ещё — без explicit unset здесь
+      # unconditional-ветка `if uses_bootstrap` ниже не помогла бы: она лишь РЕШАЕТ,
+      # экспортировать ли НАШЕ значение, но не убирает УЖЕ унаследованное чужое.
+      unset CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME CLAUDE_CONTROL_TEST_ROOT \
+            SYSTEMCTL DEPT_SYSTEMD_RUN TMUX_BIN
+
+      export CLAUDE_CONTROL_TEST_ROOT="$canon_sandbox"
+      export HOME="$home_dir"
+      # SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN — ТОЛЬКО для тестов, уже подключивших bootstrap
+      # (см. uses_bootstrap выше) — bootstrap.preflight ИМЕННО их и требует. Не мигрированные
+      # тесты не ждут эти переменные от окружения и МОГУТ явно тестировать их отсутствие.
+      if uses_bootstrap "$abs"; then
+        export SYSTEMCTL="$stub_dir/systemctl"
+        export DEPT_SYSTEMD_RUN="$stub_dir/systemd-run"
+        export TMUX_BIN="$stub_dir/tmux"
+      fi
+      export TELEGRAM_NOTIFY="$stub_dir/telegram-notify.sh"
+      # CLAUDE_CONTROL_TG / CLAUDE_AUTO_TG — ДРУГИЕ имена ТОГО ЖЕ телеграм-notify-seam'а в
+      # нескольких bin/* файлах (bin/claude-auto-url-notify, bin/claude-auto-notify,
+      # bin/event-bridge-watch — сверено grep'ом, см. iso-t3-report.md). Бриф явно требует
+      # только TELEGRAM_NOTIFY, но цель ("тест не написал живым людям в Telegram") шире
+      # одного имени переменной — дублируем ту же заглушку под остальными известными
+      # именами, это дёшево и ничего не ломает (переменная, которую код не читает, просто
+      # игнорируется).
+      export CLAUDE_CONTROL_TG="$stub_dir/telegram-notify.sh"
+      export CLAUDE_AUTO_TG="$stub_dir/telegram-notify.sh"
+      export RNR_ASKS_DB="$rnr_db_dir/asks.db"
+      export STUB_LOG="$canon_sandbox/stub-calls.log"
+
+      # Defense-in-depth ПОВЕРХ обязательных seam-переменных (не замена им): stub_dir
+      # ПЕРЕД остальным PATH — код, который (как СЕГОДНЯШНИЙ bin/claude-auto, см.
+      # iso-t3-report.md) вызывает `systemctl`/`tmux`/`systemd-run` ГОЛЫМ именем команды, а
+      # не через переопределяемую переменную, тоже находит нашу заглушку через PATH lookup,
+      # а не настоящий бинарь. Не полагаемся на это как на единственную защиту (карантин
+      # выше — всё равно обязателен для известного случая), но для ЕЩЁ НЕ обнаруженных
+      # похожих случаев это дополнительный рубеж, который ничего не стоит.
+      export PATH="$stub_dir:$PATH"
+
+      case "$rel" in
+        *.test.sh) exec bash "$abs" ;;
+        *.test.mjs) exec node --test "$abs" ;;
+        *) echo "tests/run: неизвестное расширение теста: $rel" >&2; exit 1 ;;
+      esac
+    } 2>&1
+  )"
+  rc=$?
+
+  # shellcheck disable=SC2001  # префикс КАЖДОЙ строки многострочного $out — не одиночная
+  # замена, `${var//search/replace}` (предложение SC2001) не расставит префикс на КАЖДОЙ
+  # строке без отдельного цикла построчного чтения; sed здесь проще и надёжнее.
+  echo "$out" | sed "s|^|[$rel] |"
+  rm -rf "$canon_sandbox"
+
+  if [ "$rc" -eq 0 ]; then
+    echo "PASS: $rel"
+    RUN_ONE_STATUS=0
+  else
+    echo "FAIL: $rel (rc=$rc)"
+    RUN_ONE_STATUS=1
+  fi
+}
+
+# -----------------------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------------------
+list_only=false
+declare -a selected=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h) usage; exit 0 ;;
+    --list) list_only=true ;;
+    tests/*) selected+=("$arg") ;;
+    *) selected+=("tests/$arg") ;;
+  esac
+done
+
+declare -a all_tests=()
+while IFS= read -r line; do
+  [ -n "$line" ] && all_tests+=("$line")
+done < <(discover)
+
+if [ "${#selected[@]}" -eq 0 ]; then
+  declare -a candidates=("${all_tests[@]}")
+else
+  declare -a candidates=()
+  for rel in "${selected[@]}"; do
+    found=false
+    for known in "${all_tests[@]}"; do
+      [ "$known" = "$rel" ] && { found=true; break; }
+    done
+    if [ "$found" = false ]; then
+      echo "tests/run: '$rel' не найден среди tests/*.test.sh|*.test.mjs (см. tests/run --list)" >&2
+      exit 1
+    fi
+    candidates+=("$rel")
+  done
+fi
+
+if [ "$list_only" = true ]; then
+  echo "Обнаружено (${#all_tests[@]}):"
+  for rel in "${all_tests[@]}"; do
+    if is_quarantined "$rel"; then
+      echo "  [КАРАНТИН] $rel — ${QUARANTINE[$rel]}"
+    else
+      echo "  $rel"
+    fi
+  done
+  exit 0
+fi
+
+declare -a passed=() failed=() quarantined=()
+for rel in "${candidates[@]}"; do
+  echo "=== $rel ==="
+  RUN_ONE_STATUS=1
+  run_one "$rel"
+  case "$RUN_ONE_STATUS" in
+    0) passed+=("$rel") ;;
+    2) quarantined+=("$rel") ;;
+    *) failed+=("$rel") ;;
+  esac
+done
+
+echo "-----------------------------------------------------------------"
+echo "Итог: ${#passed[@]} passed, ${#failed[@]} failed, ${#quarantined[@]} quarantined из ${#candidates[@]}"
+[ "${#failed[@]}" -eq 0 ] || { printf 'FAILED: %s\n' "${failed[@]}"; }
+[ "${#quarantined[@]}" -eq 0 ] || { printf 'QUARANTINED: %s\n' "${quarantined[@]}"; }
+
+[ "${#failed[@]}" -eq 0 ]

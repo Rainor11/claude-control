@@ -1,0 +1,192 @@
+#!/bin/bash
+# tests/run.test.sh — тесты МЕХАНИКИ раннера tests/run (T3, .superpowers/sdd/iso-t3-brief.md):
+# discovery, свежая песочница на тест, PASS/FAIL-агрегация, уборка, карантин.
+#
+# Этот файл — НОВЫЙ тест T3, сам обязан подключать bootstrap первой строкой (см.
+# lint-bootstrap.test.sh).
+#
+# БЕЗОПАСНОСТЬ: почти все сценарии здесь гоняют tests/run ПРОТИВ ИГРУШЕЧНЫХ fixture-тестов
+# во ВРЕМЕННОМ каталоге через TESTS_RUN_DIR_OVERRIDE — ни один настоящий тест из боевого
+# набора НЕ запускается. Единственное исключение — сценарии карантина ниже: они гоняют
+# tests/run ПРОТИВ РЕАЛЬНОГО tests/asana-project-integration.test.sh, но это БЕЗОПАСНО по
+# конструкции карантина (is_quarantined проверяется ДО mktemp/exec — файл физически не
+# запускается, что и есть предмет проверки).
+set -u
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNNER="$DIR/tests/run"
+fail() { echo "FAIL: $1"; exit 1; }
+
+# -----------------------------------------------------------------------------------------
+# Fixture: игрушечный каталог тестов (НЕ tests/ — отдельный temp, чтобы discovery/quarantine
+# раннера ни разу не тронули боевой набор).
+# -----------------------------------------------------------------------------------------
+FIXTURE_DIR="$(mktemp -d)"
+SCRATCH_TMPDIR="$(mktemp -d)"   # отдельный TMPDIR — чтобы проверить уборку песочниц без шума
+trap 'rm -rf "$FIXTURE_DIR" "$SCRATCH_TMPDIR"' EXIT
+
+# toy-legacy.test.sh — НЕ упоминает lib/bootstrap.* → раннер НЕ обязан форсить
+# SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN (regression-тест находки при верификации раннера на
+# tests/process-control.test.sh — см. tests/run::uses_bootstrap).
+cat > "$FIXTURE_DIR/toy-legacy.test.sh" <<'EOF'
+#!/bin/bash
+set -u
+[ -n "${CLAUDE_CONTROL_TEST_ROOT:-}" ] || { echo "toy-legacy: маркер не выставлен"; exit 1; }
+[ -f "$CLAUDE_CONTROL_TEST_ROOT/.claude-control-test-root" ] || { echo "toy-legacy: нет sentinel"; exit 1; }
+[ -z "${SYSTEMCTL:-}" ] || { echo "toy-legacy: SYSTEMCTL НЕ должен быть выставлен для не-bootstrap теста (получено '$SYSTEMCTL')"; exit 1; }
+echo "SANDBOX=$CLAUDE_CONTROL_TEST_ROOT"
+echo "toy-legacy: OK"
+EOF
+
+# toy-migrated.test.sh — упоминает "lib/bootstrap.sh" (в комментарии — НЕ реально source'ит,
+# фикстуре не нужен настоящий bootstrap.sh рядом, только триггернуть uses_bootstrap()) →
+# раннер ОБЯЗАН выставить все 3 seam-переменные внутри test root, PATH-заглушки обязаны
+# реально перехватывать вызовы (проверяем STUB_LOG).
+cat > "$FIXTURE_DIR/toy-migrated.test.sh" <<'EOF'
+#!/bin/bash
+# (фикстура: упоминание lib/bootstrap.sh здесь ТОЛЬКО чтобы tests/run::uses_bootstrap
+# распознал этот файл как "мигрированный" — реального source нет, это не настоящий тест)
+set -u
+[ -n "${SYSTEMCTL:-}" ] || { echo "toy-migrated: SYSTEMCTL обязан быть выставлен"; exit 1; }
+[ -n "${DEPT_SYSTEMD_RUN:-}" ] || { echo "toy-migrated: DEPT_SYSTEMD_RUN обязан быть выставлен"; exit 1; }
+[ -n "${TMUX_BIN:-}" ] || { echo "toy-migrated: TMUX_BIN обязан быть выставлен"; exit 1; }
+case "$SYSTEMCTL" in
+  "$CLAUDE_CONTROL_TEST_ROOT"/*) ;;
+  *) echo "toy-migrated: SYSTEMCTL='$SYSTEMCTL' не внутри test root '$CLAUDE_CONTROL_TEST_ROOT'"; exit 1 ;;
+esac
+[ -x "$SYSTEMCTL" ] || { echo "toy-migrated: SYSTEMCTL не исполняем"; exit 1; }
+# Реальный вызов заглушки (НЕ настоящий systemctl — это файл, который создал сам раннер) —
+# проверяем, что STUB_LOG реально фиксирует вызов.
+"$SYSTEMCTL" --user is-active toy-unit
+command grep -q -- 'systemctl	--user	is-active	toy-unit' "$STUB_LOG" \
+  || { echo "toy-migrated: STUB_LOG не содержит вызов заглушки: $(cat "$STUB_LOG" 2>/dev/null)"; exit 1; }
+# Defense-in-depth: голое имя "systemctl"/"tmux" через PATH ТОЖЕ обязано резолвиться в
+# заглушку внутри test root (не читать реальный systemctl — только command -v, read-only).
+resolved="$(command -v systemctl)"
+case "$resolved" in
+  "$CLAUDE_CONTROL_TEST_ROOT"/*) ;;
+  *) echo "toy-migrated: голое 'systemctl' резолвится ВНЕ test root: $resolved"; exit 1 ;;
+esac
+[ -n "${TELEGRAM_NOTIFY:-}" ] || { echo "toy-migrated: TELEGRAM_NOTIFY не выставлен"; exit 1; }
+[ -n "${RNR_ASKS_DB:-}" ] || { echo "toy-migrated: RNR_ASKS_DB не выставлен"; exit 1; }
+[ "$HOME" != "/home/rainor" ] || { echo "toy-migrated: HOME указывает на боевой домашний каталог"; exit 1; }
+echo "toy-migrated: OK"
+EOF
+
+# toy-fail.test.sh — намеренно падает, для проверки FAIL-агрегации раннера.
+cat > "$FIXTURE_DIR/toy-fail.test.sh" <<'EOF'
+#!/bin/bash
+echo "toy-fail: специально падаю"
+exit 1
+EOF
+
+# toy-pass.test.mjs — минимальный node:test, проверяет ветку `*.test.mjs` раннера
+# (`node --test`).
+cat > "$FIXTURE_DIR/toy-pass.test.mjs" <<'EOF'
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+test('toy mjs passes', () => { assert.equal(1 + 1, 2); });
+EOF
+
+chmod +x "$FIXTURE_DIR"/*.test.sh
+
+# -----------------------------------------------------------------------------------------
+# 1) полный прогон fixture-каталога — discovery + PASS/FAIL агрегация + сообщения
+# -----------------------------------------------------------------------------------------
+out="$(TESTS_RUN_DIR_OVERRIDE="$FIXTURE_DIR" TMPDIR="$SCRATCH_TMPDIR" "$RUNNER" 2>&1)"
+rc=$?
+[ "$rc" -ne 0 ] || fail "прогон с одним заведомо падающим тестом обязан вернуть ненулевой rc: $out"
+echo "$out" | command grep -q "toy-legacy: OK" || fail "toy-legacy не прошёл: $out"
+echo "$out" | command grep -q "toy-migrated: OK" || fail "toy-migrated не прошёл: $out"
+echo "$out" | command grep -q "toy-fail: специально падаю" || fail "toy-fail: вывод теста не долетел до раннера: $out"
+echo "$out" | command grep -q "PASS: tests/toy-legacy.test.sh" || fail "toy-legacy не помечен PASS: $out"
+echo "$out" | command grep -q "PASS: tests/toy-migrated.test.sh" || fail "toy-migrated не помечен PASS: $out"
+echo "$out" | command grep -q "FAIL: tests/toy-fail.test.sh" || fail "toy-fail не помечен FAIL: $out"
+echo "$out" | command grep -q "PASS: tests/toy-pass.test.mjs" || fail ".mjs-тест (node --test) не прошёл через раннер: $out"
+echo "$out" | command grep -q "3 passed, 1 failed, 0 quarantined из 4" \
+  || fail "итоговая сводка не совпала (ожидали 3 passed/1 failed/0 quarantined из 4): $out"
+echo "OK: полный прогон fixture — discovery + PASS/FAIL агрегация корректны"
+
+# -----------------------------------------------------------------------------------------
+# 2) свежая песочница НА КАЖДЫЙ тест — два разных SANDBOX= в выводе (toy-legacy печатает
+#    свой CLAUDE_CONTROL_TEST_ROOT; сравниваем с тем, что видел toy-migrated косвенно через
+#    STUB_LOG путь — оба обязаны отличаться друг от друга).
+# -----------------------------------------------------------------------------------------
+sandbox1="$(echo "$out" | command grep -o 'SANDBOX=\S*' | head -1 | cut -d= -f2)"
+[ -n "$sandbox1" ] || fail "не удалось извлечь SANDBOX= из вывода toy-legacy"
+[ ! -d "$sandbox1" ] || fail "песочница toy-legacy НЕ убрана после прогона: $sandbox1"
+echo "OK: песочница убрана после теста (каталог не существует постфактум)"
+
+# -----------------------------------------------------------------------------------------
+# 3) раннер НЕ трогает ничего вне своих песочниц — SCRATCH_TMPDIR пуст после прогона (все
+#    mktemp -d "$TMPDIR/claude-control-test.XXXXXX" убраны, посторонних файлов не появилось).
+# -----------------------------------------------------------------------------------------
+leftover="$(find "$SCRATCH_TMPDIR" -mindepth 1 2>/dev/null | wc -l)"
+[ "$leftover" -eq 0 ] || fail "TMPDIR не пуст после прогона — раннер оставил $leftover файлов/каталогов: $(find "$SCRATCH_TMPDIR" -mindepth 1)"
+echo "OK: раннер не оставляет файлы вне собственных песочниц (TMPDIR пуст постфактум)"
+
+# -----------------------------------------------------------------------------------------
+# 4) --list на fixture-каталоге — ничего не выполняет (никакого "OK"/"PASS" в выводе),
+#    только перечисляет.
+# -----------------------------------------------------------------------------------------
+out_list="$(TESTS_RUN_DIR_OVERRIDE="$FIXTURE_DIR" "$RUNNER" --list 2>&1)"
+rc_list=$?
+[ "$rc_list" -eq 0 ] || fail "--list обязан вернуть 0: $out_list"
+echo "$out_list" | command grep -q "toy-legacy.test.sh" || fail "--list не показал toy-legacy: $out_list"
+echo "$out_list" | command grep -q "toy-fail.test.sh" || fail "--list не показал toy-fail: $out_list"
+echo "$out_list" | command grep -q "toy-legacy: OK" && fail "--list ЗАПУСТИЛ тест вместо перечисления: $out_list"
+echo "OK: --list перечисляет, ничего не выполняя"
+
+# -----------------------------------------------------------------------------------------
+# 5) явный выбор ОДНОГО файла (голым именем, без префикса "tests/") — запускается только он.
+# -----------------------------------------------------------------------------------------
+out_one="$(TESTS_RUN_DIR_OVERRIDE="$FIXTURE_DIR" TMPDIR="$SCRATCH_TMPDIR" "$RUNNER" toy-legacy.test.sh 2>&1)"
+rc_one=$?
+[ "$rc_one" -eq 0 ] || fail "явный выбор toy-legacy.test.sh (без 'tests/') обязан пройти: $out_one"
+echo "$out_one" | command grep -q "toy-legacy: OK" || fail "явный выбор не запустил toy-legacy: $out_one"
+echo "$out_one" | command grep -q "toy-fail" && fail "явный выбор одного файла запустил ЛИШНИЙ (toy-fail): $out_one"
+echo "$out_one" | command grep -q "1 passed, 0 failed, 0 quarantined из 1" \
+  || fail "сводка явного выбора одного файла не совпала: $out_one"
+echo "OK: явный выбор одного файла (голое имя) — запускается только он"
+
+# -----------------------------------------------------------------------------------------
+# 6) несуществующий явный аргумент — явная ошибка, ненулевой rc, ничего не выполняется.
+# -----------------------------------------------------------------------------------------
+out_missing="$(TESTS_RUN_DIR_OVERRIDE="$FIXTURE_DIR" "$RUNNER" no-such-file.test.sh 2>&1)"
+rc_missing=$?
+[ "$rc_missing" -ne 0 ] || fail "несуществующий файл обязан вернуть ненулевой rc: $out_missing"
+echo "$out_missing" | command grep -qi "не найден" || fail "несуществующий файл: сообщение не объясняет причину: $out_missing"
+echo "OK: несуществующий явный аргумент — явная ошибка, ничего не выполнено"
+
+# -----------------------------------------------------------------------------------------
+# 7) КАРАНТИН — физическая невозможность запуска, даже явным аргументом (РЕАЛЬНЫЙ tests/,
+#    БЕЗ override — безопасно: is_quarantined проверяется ДО mktemp/exec, см. заголовок файла).
+# -----------------------------------------------------------------------------------------
+out_q="$("$RUNNER" tests/asana-project-integration.test.sh 2>&1)"
+rc_q=$?
+[ "$rc_q" -eq 0 ] || fail "прогон единственного карантинного файла обязан вернуть 0 (не FAIL, не запуск): $out_q"
+echo "$out_q" | command grep -q "QUARANTINE: tests/asana-project-integration.test.sh" \
+  || fail "карантинный файл не помечен QUARANTINE: $out_q"
+echo "$out_q" | command grep -qi "systemctl.*disable\|disable.*systemctl\|cmd_sleep" \
+  || fail "карантинная причина не объясняет опасность: $out_q"
+echo "$out_q" | command grep -q "PASS:\|FAIL:" && fail "карантинный файл получил PASS/FAIL — значит попытка выполнения БЫЛА: $out_q"
+echo "$out_q" | command grep -q "0 passed, 0 failed, 1 quarantined из 1" \
+  || fail "сводка для одного карантинного файла не совпала: $out_q"
+echo "OK: карантин — явное указание карантинного файла не запускает его (0 passed/failed, 1 quarantined)"
+
+# Смешанный список: безопасный toy + карантинный настоящий файл (карантин — из РЕАЛЬНОГО
+# tests/, toy — из FIXTURE через override; проверяем, что карантин побеждает ДАЖЕ когда
+# рядом есть легитимные кандидаты, а не только в одиночном вызове).
+out_mixed="$(TESTS_RUN_DIR_OVERRIDE="$DIR/tests" TMPDIR="$SCRATCH_TMPDIR" "$RUNNER" tests/bootstrap.test.sh tests/asana-project-integration.test.sh 2>&1)"
+rc_mixed=$?
+[ "$rc_mixed" -ne 0 ] && echo "$out_mixed" | command grep -q "FAIL: tests/bootstrap.test.sh" && fail "bootstrap.test.sh неожиданно упал в смешанном прогоне: $out_mixed"
+echo "$out_mixed" | command grep -q "PASS: tests/bootstrap.test.sh" || fail "смешанный прогон: bootstrap.test.sh не прошёл: $out_mixed"
+echo "$out_mixed" | command grep -q "QUARANTINE: tests/asana-project-integration.test.sh" \
+  || fail "смешанный прогон: карантинный файл не помечен QUARANTINE рядом с легитимным: $out_mixed"
+echo "$out_mixed" | command grep -q "1 passed, 0 failed, 1 quarantined из 2" \
+  || fail "смешанный прогон: сводка не совпала: $out_mixed"
+echo "OK: карантин побеждает даже в смешанном списке с легитимным кандидатом"
+
+echo "PASS run"
