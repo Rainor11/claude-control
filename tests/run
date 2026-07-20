@@ -132,8 +132,14 @@ STUB
 # ломает именно этот сценарий, подменяя собой ожидаемый PATH-fallback). Раннер не навязывает
 # ещё не принятый тестом контракт — sentinel/маркер/HOME/TELEGRAM_NOTIFY/RNR_ASKS_DB/PATH-
 # shadow остаются БЕЗ УСЛОВИЙ (ни один существующий тест не тестирует ИХ отсутствие).
+#
+# Паттерн ЯКОРНЫЙ (строка обязана НАЧИНАТЬСЯ с `.`+пробел ИЛИ `import`+граница слова), не
+# голый substring — самокритика при ревью: substring совпал бы и с комментарием, ПРОСТО
+# УПОМИНАЮЩИМ "lib/bootstrap.sh" без реального source/import (ложное срабатывание), а для
+# lint-bootstrap.test.sh (тот же паттерн, см. её has_bootstrap) это значило бы "тест
+# посчитан защищённым рубежом 2, хотя реально не подключил bootstrap ни разу".
 uses_bootstrap() {
-  command grep -qE 'lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
+  command grep -qE '^[[:space:]]*(\.[[:space:]]|import\>).*lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
 }
 
 # run_one <rel>: свежая песочница → выполнить → уборка. Возвращает 0/1/2

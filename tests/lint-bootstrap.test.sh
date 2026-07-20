@@ -56,9 +56,11 @@ declare -A LEGACY_ALLOWLIST=(
 # has_bootstrap <abs>: тот же паттерн детекции, что tests/run::uses_bootstrap (НАМЕРЕННО
 # зеркалится, не выносится в общую библиотеку — это ОДНА строка тривиального grep, не логика
 # T1/T2, которую бриф просит не дублировать; если паттерн когда-нибудь изменится, оба места
-# видны в одном grep по репо).
+# видны в одном grep по репо). Паттерн ЯКОРНЫЙ (строка обязана начинаться с `.`+пробел ИЛИ
+# `import`+граница слова) — голый substring засчитал бы файл "защищённым", даже если он
+# просто УПОМИНАЕТ "lib/bootstrap.sh" в комментарии, реально не подключая его.
 has_bootstrap() {
-  command grep -qE 'lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
+  command grep -qE '^[[:space:]]*(\.[[:space:]]|import\>).*lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
 }
 
 shopt -s nullglob

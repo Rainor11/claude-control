@@ -40,14 +40,19 @@ echo "SANDBOX=$CLAUDE_CONTROL_TEST_ROOT"
 echo "toy-legacy: OK"
 EOF
 
-# toy-migrated.test.sh — упоминает "lib/bootstrap.sh" (в комментарии — НЕ реально source'ит,
-# фикстуре не нужен настоящий bootstrap.sh рядом, только триггернуть uses_bootstrap()) →
-# раннер ОБЯЗАН выставить все 3 seam-переменные внутри test root, PATH-заглушки обязаны
+# toy-migrated.test.sh — содержит СТРОКУ, синтаксически похожую на реальный source
+# bootstrap.sh (нужно, чтобы tests/run::uses_bootstrap — якорный паттерн "начинается с `.`+
+# пробел ... lib/bootstrap.sh", НЕ голый substring, см. правку после самопроверки диффа —
+# распознал файл как "мигрированный"), но обёрнутую в `: <<'MARKER' ... MARKER` (heredoc —
+# данные для no-op `:`, НЕ исполняемая команда) — фикстуре не нужен настоящий bootstrap.sh
+# рядом, а реальный `.` на несуществующий путь уронил бы этот toy-тест раньше времени.
+# Раннер ОБЯЗАН выставить все 3 seam-переменные внутри test root, PATH-заглушки обязаны
 # реально перехватывать вызовы (проверяем STUB_LOG).
 cat > "$FIXTURE_DIR/toy-migrated.test.sh" <<'EOF'
 #!/bin/bash
-# (фикстура: упоминание lib/bootstrap.sh здесь ТОЛЬКО чтобы tests/run::uses_bootstrap
-# распознал этот файл как "мигрированный" — реального source нет, это не настоящий тест)
+: <<'BOOTSTRAP_MARKER'
+. "$(dirname "$0")/lib/bootstrap.sh"
+BOOTSTRAP_MARKER
 set -u
 [ -n "${SYSTEMCTL:-}" ] || { echo "toy-migrated: SYSTEMCTL обязан быть выставлен"; exit 1; }
 [ -n "${DEPT_SYSTEMD_RUN:-}" ] || { echo "toy-migrated: DEPT_SYSTEMD_RUN обязан быть выставлен"; exit 1; }
