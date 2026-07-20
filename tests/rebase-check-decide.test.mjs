@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-const { decide, pruneState } = createRequire(import.meta.url)('../bin/dept-rebase-check');
+const { decide, pruneState, staleAlertMessage } = createRequire(import.meta.url)('../bin/dept-rebase-check');
 
 const cfg = { maxAgeDays: 14, maxCompactions: 3 };
 const now = Date.now();
@@ -20,7 +20,7 @@ test('компакции за порогом — rebase', () => {
   assert.equal(d.action, 'rebase');
   assert.match(d.reason, /компакц/);
 });
-test('STALE побеждает: только stale_alert, даже при возрасте за порогом', () => {
+test('порог + STALE → stale_alert (STALE — модификатор порога, не «победитель»)', () => {
   const d = decide({ ...base, ageMs: 20 * 86400_000, stale: true }, cfg);
   assert.equal(d.action, 'stale_alert');
 });
@@ -95,4 +95,22 @@ test('stale_alert с alreadyAlerted не повторяется — просьб
   const second = decide({ ...base, ageMs: 15 * 86400_000, stale: true, alreadyAlerted: true }, cfg);
   assert.equal(first.action, 'stale_alert');
   assert.equal(second.action, 'none');
+});
+
+// M1: dry-превью не должно врать про доставку (bus в dry всегда false, т.к. ветка
+// отправки по шине целиком пропускается — не путать с реальным сбоем).
+test('staleAlertMessage: dry — честная формулировка, без 🔴-маркера ошибки', () => {
+  const msg = staleAlertMessage({ dry: true, bus: false, name: 'w1', reason: 'возраст сессии ≥ 14 дн' });
+  assert.match(msg, /\[dry\]/);
+  assert.doesNotMatch(msg, /🔴/);
+  assert.doesNotMatch(msg, /НЕ отправлена/);
+});
+test('staleAlertMessage: боевой прогон, доставка удалась — «отправлена»', () => {
+  const msg = staleAlertMessage({ dry: false, bus: true, name: 'w1', reason: 'возраст сессии ≥ 14 дн' });
+  assert.match(msg, /воркеру отправлена просьба/);
+  assert.doesNotMatch(msg, /🔴/);
+});
+test('staleAlertMessage: боевой прогон, доставка провалилась — 🔴 НЕ отправлена (поведение не менялось)', () => {
+  const msg = staleAlertMessage({ dry: false, bus: false, name: 'w1', reason: 'возраст сессии ≥ 14 дн' });
+  assert.match(msg, /🔴 НЕ отправлена/);
 });

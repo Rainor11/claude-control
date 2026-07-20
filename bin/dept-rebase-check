@@ -62,7 +62,16 @@ function pruneState(state, deptWorkers, autoWorkers) {
   }
   return state;
 }
-module.exports = { decide, pruneState };
+// M1: сообщение про доставку просьбы о курации (чистая, тестируется отдельно).
+// dry всегда идёт с bus=false (ветка отправки по шине пропускается целиком) — нельзя
+// подставлять его в тот же ${bus ? ... : '🔴 НЕ отправлена'}, иначе dry-превью врёт про
+// провал доставки на каждом прогоне, хотя в боевом режиме просьба реально ушла бы.
+function staleAlertMessage({ dry, bus, name, reason }) {
+  return dry
+    ? `⚠️ [dry] rebase-check: ${name} — ${reason}. Автопорог сработал бы; отправил бы воркеру просьбу докурировать.`
+    : `⚠️ rebase-check: ${name} — ${reason}. Автопорог сработал, но rebase запрещён до курации; воркеру ${bus ? 'отправлена' : '🔴 НЕ отправлена'} просьба докурировать.`;
+}
+module.exports = { decide, pruneState, staleAlertMessage };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
@@ -209,7 +218,7 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
     } else {
       console.log(`[dry] просьба о курации ${name} по шине: ${d.reason}`);
     }
-    const tg = notify(`⚠️ rebase-check: ${name} — ${d.reason}. Автопорог сработал, но rebase запрещён до курации; воркеру ${bus ? 'отправлена' : '🔴 НЕ отправлена'} просьба докурировать.`);
+    const tg = notify(staleAlertMessage({ dry, bus, name, reason: d.reason }));
     // Эпизод помечаем только если ОБА канала сработали; иначе следующий тик повторит.
     if (bus && tg) state[name] = { phase: 'stale_alerted' };
     continue;
