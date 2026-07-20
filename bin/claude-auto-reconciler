@@ -9,6 +9,15 @@
 # explicit via `claude-auto stop`.
 set -u
 
+# T4: guard процесс-контроля (lib/process-control.sh, задача T2) — оборачивает оба вызова
+# systemctl ниже. Резолв через readlink -f: reconciler запускается таймером по своему пути,
+# но может быть и симлинкнут; библиотека лежит в REPO_DIR/lib и в repo-, и в install-layout
+# (install.sh кладёт lib/ рядом с bin/) — тот же принцип, что bin/claude-auto:46.
+_RECONCILER_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_RECONCILER_BIN_DIR="$(cd "$(dirname "$_RECONCILER_SELF")" && pwd)"
+# shellcheck disable=SC1091
+. "$_RECONCILER_BIN_DIR/../lib/process-control.sh"
+
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 REGISTRY="$CONTROL_DIR/autonomous.json"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -24,11 +33,16 @@ mapfile -t actives < <(jq -r '.workers // {} | to_entries[] | select(.value.stat
 for name in "${actives[@]}"; do
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { say "skip bad name '$name'"; continue; }
   unit="claude-auto@$name.service"
-  if systemctl --user is-active --quiet "$unit"; then
+  # T4: оба systemctl через guard. БЕЗ маркера preflight — no-op, шов SYSTEMCTL в бою не
+  # выставлен → `"${SYSTEMCTL:-systemctl}" "$@"` = буквально `systemctl "$@"`, exit-код
+  # пробрасывается как раньше (важно: is-active используется как булево условие). Под
+  # маркером guard отказал бы ДО касания реального systemctl — reconciler боевой флот бы
+  # не поднимал (что и нужно в тесте).
+  if process_control_systemctl --user is-active --quiet "$unit"; then
     continue
   fi
   say "worker '$name' active in registry but unit not running — enable --now"
-  systemctl --user enable --now "$unit" 2>&1 | sed "s/^/$(ts) reconciler[$name]: /" || \
+  process_control_systemctl --user enable --now "$unit" 2>&1 | sed "s/^/$(ts) reconciler[$name]: /" || \
     say "failed to start $unit"
 done
 
