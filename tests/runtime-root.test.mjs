@@ -7,108 +7,91 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, symlinkSync, writeFileSync, realpathSync, mkdirSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import {
+  mkdtempSync, symlinkSync, writeFileSync, readFileSync, realpathSync, mkdirSync, unlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const { resolveRuntimeRoot, PROFILES, SENTINEL_NAME, HARDCODED_PROD_CONTROL_DIR } =
   createRequire(import.meta.url)('../lib/runtime-root.js');
 
+const LIB_SH = fileURLToPath(new URL('../lib/runtime-root.sh', import.meta.url));
+const FIXTURE_CASES = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./fixtures/runtime-root-cases.json', import.meta.url)), 'utf8'),
+);
+
 const fakeHome = () => mkdtempSync(join(tmpdir(), 'rr-home-'));
 const fakeRoot = () => mkdtempSync(join(tmpdir(), 'rr-root-'));
 const sentinel = (root) => writeFileSync(join(root, SENTINEL_NAME), '');
 
+// resolveViaBash(profile, env): гоняет bash-реализацию (lib/runtime-root.sh) подпроцессом с
+// ИЗОЛИРОВАННЫМ окружением (env option child_process ПОЛНОСТЬЮ заменяет environment, не
+// мёржит) — только PATH (чтобы bash/realpath нашлись) + явно перечисленные переменные
+// кейса. Используется кросс-реализационной проверкой ниже (В2 ревью T1).
+function resolveViaBash(profile, env) {
+  const childEnv = { PATH: process.env.PATH || '/usr/bin:/bin', ...env };
+  try {
+    const out = execFileSync(
+      'bash',
+      ['-c', 'set -u; . "$1"; resolve_runtime_root "$2"', 'bash', LIB_SH, profile],
+      { env: childEnv, encoding: 'utf8' },
+    );
+    return { ok: true, value: out.replace(/\n$/, '') };
+  } catch (e) {
+    return { ok: false, message: `${e.stdout || ''}${e.stderr || ''}` };
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Паритет с сегодняшним кодом (БЕЗ маркера) — построчно по таблице профилей брифа.
-// Каждое ожидаемое значение процитировано с точным file:line, сверенным grep'ом
-// перед написанием этого теста (не с таблицы брифа на слово — она сама предупреждает,
-// что первоисточник это код).
+// B2 (ревью T1, находка): таблица легаси-паритета (профиль + env + ожидание) больше НЕ
+// дублируется руками параллельно в .mjs и .sh — общий tests/fixtures/runtime-root-cases.json
+// гоняется ОБОИМИ раннерами (см. tests/runtime-root.test.sh), а здесь для каждого кейса ещё
+// и дёргается bash-реализация подпроцессом и сравнивается С JS — именно этого не хватало,
+// чтобы механически поймать В1 (bash/js разошлись на path.join-нормализации): раньше таблицы
+// были независимыми копипастами и ни один тест не сравнивал bash-результат с js-результатом
+// на одном и том же входе.
 // ---------------------------------------------------------------------------
 
-test('control_only паритет: CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}" (bin/claude-auto:49, bin/claude-auto-run:21, +15 др.)', () => {
-  const home = fakeHome();
-  // без CLAUDE_CONTROL_DIR — дефолт $HOME/.claude-control
-  assert.equal(
-    resolveRuntimeRoot('control_only', { HOME: home }),
-    join(home, '.claude-control'),
-  );
-  // с CLAUDE_CONTROL_DIR — он и побеждает
-  assert.equal(
-    resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_DIR: '/custom/dir' }),
-    '/custom/dir',
-  );
-});
+for (const c of FIXTURE_CASES) {
+  test(`fixture-паритет: ${c.name}`, () => {
+    let jsResult;
+    try {
+      jsResult = { ok: true, value: resolveRuntimeRoot(c.profile, c.env) };
+    } catch (e) {
+      jsResult = { ok: false, message: e.message };
+    }
+    const bashResult = resolveViaBash(c.profile, c.env);
 
-test('control_only: пустая строка CLAUDE_CONTROL_DIR="" — bash ${VAR:-default} считает это "не задано", резолвер обязан повторить', () => {
-  const home = fakeHome();
-  assert.equal(
-    resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_DIR: '' }),
-    join(home, '.claude-control'),
-  );
-});
+    if (c.expect.ok) {
+      assert.equal(jsResult.ok, true, `js обязан принять '${c.name}': ${jsResult.message}`);
+      assert.equal(jsResult.value, c.expect.value, `js значение для '${c.name}'`);
+      assert.equal(bashResult.ok, true, `bash обязан принять '${c.name}': ${bashResult.message}`);
+      assert.equal(bashResult.value, c.expect.value, `bash значение для '${c.name}'`);
+    } else {
+      assert.equal(jsResult.ok, false, `js обязан отказать для '${c.name}'`);
+      assert.match(jsResult.message, new RegExp(c.expect.errorPattern, 'i'));
+      assert.equal(bashResult.ok, false, `bash обязан отказать для '${c.name}'`);
+      assert.match(bashResult.message, new RegExp(c.expect.errorPattern, 'i'));
+    }
 
-test('auto_then_control паритет: CONTROL_DIR="${CLAUDE_AUTO_HOME:-${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}}" (bin/dept-liveness-exec:24, bin/dept-liveness-request:33)', () => {
-  const home = fakeHome();
-  assert.equal(
-    resolveRuntimeRoot('auto_then_control', { HOME: home }),
-    join(home, '.claude-control'),
-  );
-  assert.equal(
-    resolveRuntimeRoot('auto_then_control', { HOME: home, CLAUDE_CONTROL_DIR: '/custom/dir' }),
-    '/custom/dir',
-  );
-  // CLAUDE_AUTO_HOME побеждает CLAUDE_CONTROL_DIR — в отличие от control_only, тут есть
-  // более высокий приоритет
-  assert.equal(
-    resolveRuntimeRoot('auto_then_control', {
-      HOME: home, CLAUDE_CONTROL_DIR: '/custom/dir', CLAUDE_AUTO_HOME: '/auto/dir',
-    }),
-    '/auto/dir',
-  );
-});
+    // Кросс-проверка bash/js МЕЖДУ СОБОЙ независимо от фикстуры — это и есть механическая
+    // граница против В1-класса регрессий (расхождение поймается, даже если оба случайно
+    // сойдутся на неверном с точки зрения фикстуры значении).
+    assert.equal(jsResult.ok, bashResult.ok, `js/bash разошлись по accept/reject для '${c.name}'`);
+    if (jsResult.ok) {
+      assert.equal(jsResult.value, bashResult.value, `js/bash разошлись по значению для '${c.name}'`);
+    }
+  });
+}
 
-test('auto_then_hardcoded паритет: const CC_HOME = process.env.CLAUDE_AUTO_HOME || \'/home/rainor/.claude-control\' (bin/claude-auto-liveness:14, bin/dept-inbox:16, bin/dept-rebase-check:16, bin/dept-dispatcher:153)', () => {
-  const home = fakeHome();
-  // без CLAUDE_AUTO_HOME — ЛИТЕРАЛЬНЫЙ хардкод, НЕ $HOME-based (даже если HOME другой)
-  assert.equal(resolveRuntimeRoot('auto_then_hardcoded', { HOME: home }), HARDCODED_PROD_CONTROL_DIR);
-  assert.equal(HARDCODED_PROD_CONTROL_DIR, '/home/rainor/.claude-control');
-  // CLAUDE_CONTROL_DIR ИГНОРИРУЕТСЯ этим профилем — ключевое отличие от auto_then_control
-  assert.equal(
-    resolveRuntimeRoot('auto_then_hardcoded', { HOME: home, CLAUDE_CONTROL_DIR: '/custom/dir' }),
-    HARDCODED_PROD_CONTROL_DIR,
+test('все 4 профиля объявлены в PROFILES', () => {
+  assert.deepEqual(
+    [...PROFILES].sort(),
+    ['auto_then_control', 'auto_then_hardcoded', 'control_only', 'dept_only'].sort(),
   );
-  assert.equal(
-    resolveRuntimeRoot('auto_then_hardcoded', { HOME: home, CLAUDE_AUTO_HOME: '/auto/dir' }),
-    '/auto/dir',
-  );
-});
-
-test('dept_only паритет: DEPT="${DEPT_HOME:-$HOME/.claude-control/department}" (bin/dept-mission-exec:20, bin/dept-exec-runner:28, bin/dept-spawn-exec:17)', () => {
-  const home = fakeHome();
-  assert.equal(
-    resolveRuntimeRoot('dept_only', { HOME: home }),
-    join(home, '.claude-control', 'department'),
-  );
-  assert.equal(
-    resolveRuntimeRoot('dept_only', { HOME: home, DEPT_HOME: '/custom/dept' }),
-    '/custom/dept',
-  );
-  // dept_only ИГНОРИРУЕТ CLAUDE_AUTO_HOME/CLAUDE_CONTROL_DIR целиком — реальный код этих
-  // трёх файлов не читает ни ту, ни другую переменную при вычислении DEPT
-  assert.equal(
-    resolveRuntimeRoot('dept_only', {
-      HOME: home, CLAUDE_AUTO_HOME: '/auto/dir', CLAUDE_CONTROL_DIR: '/custom/dir',
-    }),
-    join(home, '.claude-control', 'department'),
-  );
-});
-
-test('неизвестный профиль — отказ с понятным текстом', () => {
-  assert.throws(() => resolveRuntimeRoot('bogus', { HOME: fakeHome() }), /профил/i);
-});
-
-test('без HOME — отказ (резолвер не может вычислить боевой дефолт)', () => {
-  assert.throws(() => resolveRuntimeRoot('control_only', {}), /HOME/);
 });
 
 // ---------------------------------------------------------------------------
@@ -153,11 +136,14 @@ test('маркер: путь через symlink канонизируется (re
   }
 });
 
-test('маркер: пустая строка CLAUDE_CONTROL_TEST_ROOT="" — как будто маркер не задан (легаси-путь)', () => {
+test('маркер: пустая строка CLAUDE_CONTROL_TEST_ROOT="" ЗАДАНА (не unset) — обязан отказать, не тихо уйти в легаси (В3 ревью T1)', () => {
+  // Раньше пустая строка трактовалась как "маркер не задан" → молчаливый фолбэк на боевой
+  // резолв. Реалистичный сценарий: раннер пишет CLAUDE_CONTROL_TEST_ROOT="$SOME_VAR", а
+  // переменная не выставлена — весь прогон уходил бы в боевой контур, выглядя нормальным.
   const home = fakeHome();
-  assert.equal(
-    resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: '' }),
-    join(home, '.claude-control'),
+  assert.throws(
+    () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: '' }),
+    /абсолютн/,
   );
 });
 
@@ -168,6 +154,16 @@ test('маркер: пустая строка CLAUDE_CONTROL_TEST_ROOT="" — к
 test('маркер без sentinel-файла — отказ', () => {
   const home = fakeHome();
   const root = fakeRoot(); // БЕЗ sentinel
+  assert.throws(
+    () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: root }),
+    /sentinel/,
+  );
+});
+
+test('М1 (ревью T1): sentinel-КАТАЛОГ не принимается как валидный sentinel — нужен обычный файл', () => {
+  const home = fakeHome();
+  const root = fakeRoot();
+  mkdirSync(join(root, SENTINEL_NAME)); // sentinel как ПОДКАТАЛОГ, не файл
   assert.throws(
     () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: root }),
     /sentinel/,
@@ -227,11 +223,72 @@ test('маркер = боевой $HOME/.claude-control — отказ', () => {
 
 test('маркер = захардкоженный боевой корень /home/rainor/.claude-control — отказ (только realpath, без записи)', () => {
   // ЖИВОЙ каталог на этом сервере — резолвер обязан заблокировать буквальный литерал
-  // auto_then_hardcoded профиля, даже если HOME указывает на другое место. Только
+  // auto_then_hardcoded-профиля, даже если HOME указывает на другое место. Только
   // fs.realpathSync (read-only stat), никакой записи/чтения содержимого.
   const home = fakeHome();
   assert.throws(
     () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: HARDCODED_PROD_CONTROL_DIR }),
+    /боев/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// К1 (ревью T1, КРИТИЧНОЕ): containment боевого корня — обе стороны вложенности, для
+// обоих боевых корней. Голая equality-проверка пропускала test root ВНУТРИ боевого дерева
+// (раннер сам кладёт туда sentinel — рабочий обход fail-closed) и test root, СОДЕРЖАЩИЙ
+// боевой корень целиком.
+// ---------------------------------------------------------------------------
+
+test('К1: test root ВНУТРИ $HOME-боевого дерева ($HOME/.claude-control/inner) — отказ, а не accept', () => {
+  const home = fakeHome();
+  const prodDir = join(home, '.claude-control');
+  mkdirSync(prodDir);
+  const inner = join(prodDir, 'inner');
+  mkdirSync(inner);
+  sentinel(inner); // раннер сам кладёт sentinel — голая проверка это не поймает
+  assert.throws(
+    () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: inner }),
+    /боев/,
+  );
+});
+
+test('К1: symlink на test root ВНУТРИ $HOME-боевого дерева — отказ после разыменования', () => {
+  const home = fakeHome();
+  const prodDir = join(home, '.claude-control');
+  mkdirSync(prodDir);
+  const inner = join(prodDir, 'inner');
+  mkdirSync(inner);
+  sentinel(inner);
+  const link = join(tmpdir(), `rr-link-inner-${process.pid}-${Date.now()}`);
+  symlinkSync(inner, link);
+  try {
+    assert.throws(
+      () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: link }),
+      /боев/,
+    );
+  } finally {
+    unlinkSync(link);
+  }
+});
+
+test('К1: test root, СОДЕРЖАЩИЙ $HOME-боевой корень целиком (base — родитель $HOME/.claude-control) — отказ', () => {
+  const base = fakeRoot();
+  const home = join(base, 'home');
+  mkdirSync(home);
+  mkdirSync(join(home, '.claude-control'));
+  // base != home (проверка равенства с HOME её не поймает), но base СОДЕРЖИТ prodDefault
+  assert.throws(
+    () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: base }),
+    /боев/,
+  );
+});
+
+test('К1: test root, СОДЕРЖАЩИЙ захардкоженный боевой корень (/home содержит /home/rainor/.claude-control) — отказ (read-only realpath)', () => {
+  // /home — стандартная точка монтирования, гарантированно существует; никакой записи или
+  // чтения содержимого /home/rainor/.claude-control, только fs.realpathSync (read-only stat).
+  const home = fakeHome();
+  assert.throws(
+    () => resolveRuntimeRoot('control_only', { HOME: home, CLAUDE_CONTROL_TEST_ROOT: '/home' }),
     /боев/,
   );
 });
@@ -305,12 +362,5 @@ test('маркер + недостижимая легаси-переменная 
       HOME: home, CLAUDE_CONTROL_TEST_ROOT: root, CLAUDE_AUTO_HOME: '/no/such/leftover/path',
     }),
     /CLAUDE_AUTO_HOME/,
-  );
-});
-
-test('все 4 профиля объявлены в PROFILES', () => {
-  assert.deepEqual(
-    [...PROFILES].sort(),
-    ['auto_then_control', 'auto_then_hardcoded', 'control_only', 'dept_only'].sort(),
   );
 });

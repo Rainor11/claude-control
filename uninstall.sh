@@ -54,6 +54,10 @@ LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 
 BIN_DIR="$PREFIX/bin"
+# LIB_DIR sibling of BIN_DIR — зеркалит install.sh (T1: .superpowers/sdd/iso-t1-brief.md),
+# симметричный removal lib/runtime-root.{sh,js} (ревью T1, находка М2: без этого после
+# деинсталляции остаются осиротевшие файлы, в --link-режиме — висячие symlink'и).
+LIB_DIR="$PREFIX/lib"
 CONTROL_DIR="$HOME/.claude-control"
 ENV_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-control"
 if [[ "$OS_KIND" == "darwin" ]]; then
@@ -110,6 +114,15 @@ fi
 for script in claude-rc claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog; do
   target="$BIN_DIR/$script"
+  if [[ -e "$target" || -L "$target" ]]; then
+    say "Remove $target"
+    rm -f "$target"
+  fi
+done
+
+# lib/ files installed by install.sh (T1) — same copy/link symmetry as bin/ scripts above.
+for libfile in runtime-root.sh runtime-root.js; do
+  target="$LIB_DIR/$libfile"
   if [[ -e "$target" || -L "$target" ]]; then
     say "Remove $target"
     rm -f "$target"

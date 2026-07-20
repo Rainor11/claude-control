@@ -10,7 +10,10 @@
 set -u
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$DIR/lib/runtime-root.sh"
+FIXTURE="$DIR/tests/fixtures/runtime-root-cases.json"
 fail() { echo "FAIL: $1"; exit 1; }
+
+command -v jq >/dev/null 2>&1 || fail "jq не найден — нужен для чтения tests/fixtures/runtime-root-cases.json"
 
 SENTINEL=".claude-control-test-root"
 
@@ -38,62 +41,45 @@ new_root() { mktemp -d; }
 mark_sentinel() { : > "$1/$SENTINEL"; }
 
 # ---------------------------------------------------------------------------
-# Паритет с сегодняшним кодом (БЕЗ маркера) — построчно по таблице профилей брифа,
-# сверено grep'ом по реальным файлам перед написанием теста.
+# B2 (ревью T1, находка): таблица легаси-паритета (профиль + env + ожидание) больше НЕ
+# дублируется руками параллельно в .sh и .mjs — общая tests/fixtures/runtime-root-cases.json
+# гоняется ОБОИМИ раннерами (js-сторона дополнительно сравнивает bash-результат с js
+# подпроцессом — см. tests/runtime-root.test.mjs). Здесь просто прогоняем таблицу через
+# bash-реализацию и сверяем с ожиданием фикстуры.
 # ---------------------------------------------------------------------------
 
-# control_only: CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}" (bin/claude-auto:49 и 16 др.)
-home1="$(new_home)"
-out="$(resolve control_only "HOME=$home1")" || fail "control_only без переменной упал: $out"
-[ "$out" = "$home1/.claude-control" ] || fail "control_only дефолт: получили '$out', ожидали '$home1/.claude-control'"
-out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_DIR=/custom/dir")" || fail "control_only с переменной упал: $out"
-[ "$out" = "/custom/dir" ] || fail "control_only override: получили '$out'"
-# bash ${VAR:-default}: пустая строка = "не задано"
-out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_DIR=")" || fail "control_only с пустой переменной упал: $out"
-[ "$out" = "$home1/.claude-control" ] || fail "control_only пустая CLAUDE_CONTROL_DIR должна вести себя как unset: получили '$out'"
+case_count="$(jq 'length' "$FIXTURE")"
+i=0
+while [ "$i" -lt "$case_count" ]; do
+  name="$(jq -r ".[$i].name" "$FIXTURE")"
+  profile="$(jq -r ".[$i].profile" "$FIXTURE")"
+  ok="$(jq -r ".[$i].expect.ok" "$FIXTURE")"
+  kvs=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && kvs+=("$line")
+  done < <(jq -r ".[$i].env | to_entries[] | \"\(.key)=\(.value)\"" "$FIXTURE")
 
-# auto_then_control: CONTROL_DIR="${CLAUDE_AUTO_HOME:-${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}}" (bin/dept-liveness-exec:24, bin/dept-liveness-request:33)
-out="$(resolve auto_then_control "HOME=$home1")" || fail "auto_then_control без переменных упал: $out"
-[ "$out" = "$home1/.claude-control" ] || fail "auto_then_control дефолт: получили '$out'"
-out="$(resolve auto_then_control "HOME=$home1" "CLAUDE_CONTROL_DIR=/custom/dir")" || fail "auto_then_control CLAUDE_CONTROL_DIR упал: $out"
-[ "$out" = "/custom/dir" ] || fail "auto_then_control CLAUDE_CONTROL_DIR: получили '$out'"
-out="$(resolve auto_then_control "HOME=$home1" "CLAUDE_CONTROL_DIR=/custom/dir" "CLAUDE_AUTO_HOME=/auto/dir")" || fail "auto_then_control приоритет упал: $out"
-[ "$out" = "/auto/dir" ] || fail "auto_then_control: CLAUDE_AUTO_HOME обязан побеждать CLAUDE_CONTROL_DIR, получили '$out'"
+  out="$(resolve "$profile" "${kvs[@]}")"
+  rc=$?
+  if [ "$ok" = "true" ]; then
+    value="$(jq -r ".[$i].expect.value" "$FIXTURE")"
+    [ "$rc" -eq 0 ] || fail "fixture '$name': ожидали успех, получили отказ: $out"
+    [ "$out" = "$value" ] || fail "fixture '$name': получили '$out', ожидали '$value'"
+  else
+    errpattern="$(jq -r ".[$i].expect.errorPattern" "$FIXTURE")"
+    [ "$rc" -ne 0 ] || fail "fixture '$name': ожидали отказ, получили успех: $out"
+    echo "$out" | command grep -qi "$errpattern" || fail "fixture '$name': сообщение не содержит '$errpattern': $out"
+  fi
+  i=$((i + 1))
+done
 
-# auto_then_hardcoded: CC_HOME = CLAUDE_AUTO_HOME || '/home/rainor/.claude-control' (bin/claude-auto-liveness:14, dept-inbox:16, dept-rebase-check:16, dept-dispatcher:153) — ИГНОРИРУЕТ CLAUDE_CONTROL_DIR
-out="$(resolve auto_then_hardcoded "HOME=$home1")" || fail "auto_then_hardcoded без переменных упал: $out"
-[ "$out" = "/home/rainor/.claude-control" ] || fail "auto_then_hardcoded дефолт: получили '$out', ожидали литерал /home/rainor/.claude-control"
-out="$(resolve auto_then_hardcoded "HOME=$home1" "CLAUDE_CONTROL_DIR=/custom/dir")" || fail "auto_then_hardcoded с CLAUDE_CONTROL_DIR упал: $out"
-[ "$out" = "/home/rainor/.claude-control" ] || fail "auto_then_hardcoded ОБЯЗАН игнорировать CLAUDE_CONTROL_DIR, получили '$out'"
-out="$(resolve auto_then_hardcoded "HOME=$home1" "CLAUDE_AUTO_HOME=/auto/dir")" || fail "auto_then_hardcoded с CLAUDE_AUTO_HOME упал: $out"
-[ "$out" = "/auto/dir" ] || fail "auto_then_hardcoded CLAUDE_AUTO_HOME: получили '$out'"
-
-# dept_only: DEPT="${DEPT_HOME:-$HOME/.claude-control/department}" (bin/dept-mission-exec:20, dept-exec-runner:28, dept-spawn-exec:17) — ИГНОРИРУЕТ CLAUDE_AUTO_HOME/CLAUDE_CONTROL_DIR
-out="$(resolve dept_only "HOME=$home1")" || fail "dept_only без переменных упал: $out"
-[ "$out" = "$home1/.claude-control/department" ] || fail "dept_only дефолт: получили '$out'"
-out="$(resolve dept_only "HOME=$home1" "DEPT_HOME=/custom/dept")" || fail "dept_only override упал: $out"
-[ "$out" = "/custom/dept" ] || fail "dept_only override: получили '$out'"
-out="$(resolve dept_only "HOME=$home1" "CLAUDE_AUTO_HOME=/auto/dir" "CLAUDE_CONTROL_DIR=/custom/dir")" || fail "dept_only с чужими переменными упал: $out"
-[ "$out" = "$home1/.claude-control/department" ] || fail "dept_only ОБЯЗАН игнорировать CLAUDE_AUTO_HOME/CLAUDE_CONTROL_DIR, получили '$out'"
-
-echo "OK: паритет с легаси-кодом (control_only/auto_then_control/auto_then_hardcoded/dept_only)"
-
-# ---------------------------------------------------------------------------
-# Общие негативы
-# ---------------------------------------------------------------------------
-
-out="$(resolve bogus_profile "HOME=$home1")" && fail "неизвестный профиль обязан отказывать: $out"
-echo "$out" | command grep -qi "профил" || fail "неизвестный профиль: сообщение не объясняет причину: $out"
-
-out="$(resolve control_only)" && fail "без HOME обязан отказывать: $out"
-echo "$out" | command grep -q "HOME" || fail "без HOME: сообщение не упоминает HOME: $out"
-
-echo "OK: общие негативы (профиль/HOME)"
+echo "OK: fixture-таблица tests/fixtures/runtime-root-cases.json — $case_count кейсов"
 
 # ---------------------------------------------------------------------------
 # Маркер CLAUDE_CONTROL_TEST_ROOT — happy path
 # ---------------------------------------------------------------------------
 
+home1="$(new_home)"
 root1="$(new_root)"; mark_sentinel "$root1"
 canon_root1="$(realpath -e "$root1")"
 for profile in control_only auto_then_control auto_then_hardcoded; do
@@ -114,22 +100,30 @@ out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$link1")" \
 [ "$out" = "$canon_root1" ] || { rm -f "$link1"; fail "маркер через symlink: получили '$out', ожидали канонический '$canon_root1'"; }
 rm -f "$link1"
 
-# пустая строка = маркер не задан
-out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=")" \
-  || fail "пустой маркер обязан вести себя как unset (легаси-путь), а упал: $out"
-[ "$out" = "$home1/.claude-control" ] || fail "пустой маркер: получили '$out', ожидали легаси-дефолт"
-
-echo "OK: маркер — happy path (все профили, symlink, пустая строка)"
+echo "OK: маркер — happy path (все профили, symlink)"
 
 # ---------------------------------------------------------------------------
 # Маркер — негативные кейсы (ядро задачи: fail-closed)
 # ---------------------------------------------------------------------------
+
+# В3 (ревью T1): пустая строка ЗАДАНА (не unset) — обязан отказать, НЕ вести себя как unset.
+# Раньше `${CLAUDE_CONTROL_TEST_ROOT:-}` считал "" тем же, что "не задано" → молчаливый
+# фолбэк на боевой резолв (раннер мог подставить невыставленную переменную).
+out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=")" \
+  && fail "пустой (но заданный) маркер обязан отказывать, а прошёл: $out"
+echo "$out" | command grep -qi "абсолютн" || fail "пустой маркер: сообщение не объясняет причину: $out"
 
 # без sentinel
 root_no_sentinel="$(new_root)"
 out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$root_no_sentinel")" \
   && fail "маркер без sentinel обязан отказывать: $out"
 echo "$out" | command grep -qi "sentinel" || fail "маркер без sentinel: сообщение не объясняет причину: $out"
+
+# М1 (ревью T1): sentinel-КАТАЛОГ не должен приниматься как валидный sentinel
+root_sentinel_dir="$(new_root)"; mkdir -p "$root_sentinel_dir/$SENTINEL"
+out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$root_sentinel_dir")" \
+  && fail "sentinel-каталог обязан отказывать: $out"
+echo "$out" | command grep -qi "sentinel" || fail "sentinel-каталог: сообщение не объясняет причину: $out"
 
 # относительный путь
 out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=relative/path")" \
@@ -169,7 +163,44 @@ out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=/home/rainor
   && fail "маркер = хардкод /home/rainor/.claude-control обязан отказывать: $out"
 echo "$out" | command grep -qi "боев" || fail "маркер = хардкод боевого корня: сообщение не объясняет причину: $out"
 
-echo "OK: маркер — базовые негативы (sentinel/относительный/несуществующий/'/'/HOME/боевые корни)"
+echo "OK: маркер — базовые негативы (пустой/sentinel/каталог-sentinel/относительный/несуществующий/'/'/HOME/боевые корни)"
+
+# ---------------------------------------------------------------------------
+# К1 (ревью T1, КРИТИЧНОЕ): containment боевого корня — обе стороны вложенности, для обоих
+# боевых корней. Голая equality-проверка (было изначально) пропускала test root ВНУТРИ
+# боевого дерева (раннер сам кладёт туда sentinel — рабочий обход fail-closed) и test root,
+# СОДЕРЖАЩИЙ боевой корень целиком.
+# ---------------------------------------------------------------------------
+
+# test root ВНУТРИ $HOME-боевого дерева ($HOME/.claude-control/inner)
+home_k1="$(new_home)"; mkdir -p "$home_k1/.claude-control/inner"; mark_sentinel "$home_k1/.claude-control/inner"
+out="$(resolve control_only "HOME=$home_k1" "CLAUDE_CONTROL_TEST_ROOT=$home_k1/.claude-control/inner")" \
+  && fail "test root внутри \$HOME/.claude-control обязан отказывать: $out"
+echo "$out" | command grep -qi "боев" || fail "test root внутри боевого дерева: сообщение не объясняет причину: $out"
+
+# symlink на test root ВНУТРИ $HOME-боевого дерева — отказ после разыменования
+link_k1="$(mktemp -u)"
+ln -s "$home_k1/.claude-control/inner" "$link_k1"
+out="$(resolve control_only "HOME=$home_k1" "CLAUDE_CONTROL_TEST_ROOT=$link_k1")"
+rc_k1=$?
+if [ $rc_k1 -eq 0 ]; then rm -f "$link_k1"; fail "symlink на test root внутри боевого дерева обязан отказывать: $out"; fi
+echo "$out" | command grep -qi "боев" || { rm -f "$link_k1"; fail "symlink внутри боевого дерева: сообщение не объясняет причину: $out"; }
+rm -f "$link_k1"
+
+# test root, СОДЕРЖАЩИЙ $HOME-боевой корень целиком (base — родитель $HOME/.claude-control)
+base_k1="$(new_root)"
+home_k1b="$base_k1/home"; mkdir -p "$home_k1b/.claude-control"
+out="$(resolve control_only "HOME=$home_k1b" "CLAUDE_CONTROL_TEST_ROOT=$base_k1")" \
+  && fail "test root, содержащий \$HOME-боевой корень, обязан отказывать: $out"
+echo "$out" | command grep -qi "боев" || fail "test root содержит боевой корень: сообщение не объясняет причину: $out"
+
+# test root, СОДЕРЖАЩИЙ захардкоженный боевой корень (/home содержит /home/rainor/.claude-control)
+# — read-only realpath, никакой записи/чтения содержимого /home/rainor/.claude-control.
+out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=/home")" \
+  && fail "test root=/home (содержит захардкоженный боевой корень) обязан отказывать: $out"
+echo "$out" | command grep -qi "боев" || fail "test root=/home: сообщение не объясняет причину: $out"
+
+echo "OK: К1 — containment боевого корня (обе стороны, оба корня)"
 
 # легаси-переменная наружу test root
 root2="$(new_root)"; mark_sentinel "$root2"

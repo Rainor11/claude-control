@@ -1,0 +1,104 @@
+[
+  {
+    "name": "control_only-default",
+    "profile": "control_only",
+    "env": { "HOME": "/home/rr-fixture-home" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/.claude-control" }
+  },
+  {
+    "name": "control_only-override",
+    "profile": "control_only",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_CONTROL_DIR": "/custom/dir" },
+    "expect": { "ok": true, "value": "/custom/dir" }
+  },
+  {
+    "name": "control_only-empty-var-parity",
+    "profile": "control_only",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_CONTROL_DIR": "" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/.claude-control" }
+  },
+  {
+    "name": "auto_then_control-default",
+    "profile": "auto_then_control",
+    "env": { "HOME": "/home/rr-fixture-home" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/.claude-control" }
+  },
+  {
+    "name": "auto_then_control-control-dir-override",
+    "profile": "auto_then_control",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_CONTROL_DIR": "/custom/dir" },
+    "expect": { "ok": true, "value": "/custom/dir" }
+  },
+  {
+    "name": "auto_then_control-auto-home-priority",
+    "profile": "auto_then_control",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_CONTROL_DIR": "/custom/dir", "CLAUDE_AUTO_HOME": "/auto/dir" },
+    "expect": { "ok": true, "value": "/auto/dir" }
+  },
+  {
+    "name": "auto_then_hardcoded-default",
+    "profile": "auto_then_hardcoded",
+    "env": { "HOME": "/home/rr-fixture-home" },
+    "expect": { "ok": true, "value": "/home/rainor/.claude-control" }
+  },
+  {
+    "name": "auto_then_hardcoded-ignores-control-dir",
+    "profile": "auto_then_hardcoded",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_CONTROL_DIR": "/custom/dir" },
+    "expect": { "ok": true, "value": "/home/rainor/.claude-control" }
+  },
+  {
+    "name": "auto_then_hardcoded-auto-home-override",
+    "profile": "auto_then_hardcoded",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_AUTO_HOME": "/auto/dir" },
+    "expect": { "ok": true, "value": "/auto/dir" }
+  },
+  {
+    "name": "dept_only-default",
+    "profile": "dept_only",
+    "env": { "HOME": "/home/rr-fixture-home" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/.claude-control/department" }
+  },
+  {
+    "name": "dept_only-override",
+    "profile": "dept_only",
+    "env": { "HOME": "/home/rr-fixture-home", "DEPT_HOME": "/custom/dept" },
+    "expect": { "ok": true, "value": "/custom/dept" }
+  },
+  {
+    "name": "dept_only-ignores-others",
+    "profile": "dept_only",
+    "env": { "HOME": "/home/rr-fixture-home", "CLAUDE_AUTO_HOME": "/auto/dir", "CLAUDE_CONTROL_DIR": "/custom/dir" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/.claude-control/department" }
+  },
+  {
+    "name": "unknown-profile",
+    "profile": "bogus",
+    "env": { "HOME": "/home/rr-fixture-home" },
+    "expect": { "ok": false, "errorPattern": "профил" }
+  },
+  {
+    "name": "missing-home",
+    "profile": "control_only",
+    "env": {},
+    "expect": { "ok": false, "errorPattern": "HOME" }
+  },
+  {
+    "name": "home-trailing-slash-b1-parity",
+    "profile": "control_only",
+    "env": { "HOME": "/home/rr-fixture-home/" },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home//.claude-control" }
+  },
+  {
+    "name": "home-dotdot-b1-parity",
+    "profile": "control_only",
+    "env": { "HOME": "/home/rr-fixture-home/.." },
+    "expect": { "ok": true, "value": "/home/rr-fixture-home/../.claude-control" }
+  },
+  {
+    "name": "home-root-b1-parity",
+    "profile": "control_only",
+    "env": { "HOME": "/" },
+    "expect": { "ok": true, "value": "//.claude-control" }
+  }
+]
