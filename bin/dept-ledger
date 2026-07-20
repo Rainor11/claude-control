@@ -418,7 +418,10 @@ function cmdApprovalResolve(a) {
       // чтобы дедуп/гард «уже исполнен» работали и после rotate.
       let apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
       if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
-      const eff = apr ? effectiveStatus(events, apr, 'approval_status', 'open') : null;
+      // M4: archive-осведомлённый eff (см. approvalEffectiveStatus) — тот же источник истины,
+      // что уже использует cmdApprovalExec, иначе полностью отротированная закрытая цепочка
+      // читалась бы как заново открытая 'open' (effectiveStatus сканирует только активный файл).
+      const eff = apr ? approvalEffectiveStatus(ref, apr) : null;
       // Task 11-fix: executing тоже блокирует resolve — заявка уже в работе у раннера,
       // менять решение (denied) под ней небезопасно (раннер продолжит исполнять «отменённую»).
       if (apr && ['executed', 'exec_failed'].includes(eff)) {
@@ -478,7 +481,8 @@ function cmdApprovalWithdraw(a) {
       const events = readAll();
       let apr = events.find((e) => e.event_id === ref && e.kind === 'approval');
       if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
-      const eff = apr ? effectiveStatus(events, apr, 'approval_status', 'open') : null;
+      // M4: то же архивно-осведомлённое eff, что resolve/exec — см. approvalEffectiveStatus.
+      const eff = apr ? approvalEffectiveStatus(ref, apr) : null;
       const auth = authorizeWithdraw(caller, apr, eff);
       if (auth.err) { const err = new Error(auth.err); err.cliError = true; throw err; }
       if (auth.deduped) return { event_id: ref, deduped: true };
@@ -504,6 +508,16 @@ function readChainStatuses(ref) { // статусы цепочки: активн
   rows.sort((x, y) => x.seq - y.seq);
   return rows;
 }
+// M4 (Codex-аудит): единая архивно-осведомлённая точка "что реально решено" для approval —
+// resolve/withdraw/exec ОБЯЗАНЫ читать её одинаково. До фикса resolve/withdraw считали eff
+// через effectiveStatus(events,...), который сканирует ТОЛЬКО активный файл: полностью
+// отротированная закрытая цепочка (approval_status тоже уехал в архив) читалась бы заново
+// как 'open' — второй ремень против гонки withdraw↔✅ (ниже) и гард "уже исполнен" не сработали
+// бы на старой заявке. apr передаётся вызывающим — он уже искал его (активный файл + архив).
+function approvalEffectiveStatus(ref, apr) {
+  const sts = readChainStatuses(ref);
+  return sts.length ? sts[sts.length - 1].data.status : (apr.data.status || 'open');
+}
 // Task 11-fix: разрешённые ИСТОЧНИКИ для каждого целевого статуса approval-exec.
 // executing — только из approved (диспетчер помечает ДО запуска раннера).
 // executed/exec_failed — из approved (прямой путь, back-compat: операторский ручной
@@ -525,8 +539,8 @@ function cmdApprovalExec(a) {
       let apr = readAll().find((e) => e.event_id === ref && e.kind === 'approval');
       if (!apr) { const arch = findInArchives(ref); if (arch && arch.kind === 'approval') apr = arch; }
       if (!apr) { const err = new Error('approval-exec: аппрув не найден: ' + ref); err.cliError = true; throw err; }
-      const sts = readChainStatuses(ref);
-      const eff = sts.length ? sts[sts.length - 1].data.status : (apr.data.status || 'open');
+      // M4: вынесено в approvalEffectiveStatus — тот же helper теперь у resolve/withdraw.
+      const eff = approvalEffectiveStatus(ref, apr);
       if (eff === status) return { event_id: ref, deduped: true };
       if (!EXEC_TARGET_FROM[status].includes(eff)) {
         const err = new Error(`approval-exec: эффективный статус «${eff}», переход в «${status}» недопустим (нужен один из: ${EXEC_TARGET_FROM[status].join('/')})`);
