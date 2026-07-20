@@ -93,6 +93,14 @@ function staleOpenApprovals(rows, nowMs, maxMin) {
     return Number.isFinite(t) && (nowMs - t) > thresholdMs;
   });
 }
+// M5 (Codex-аудит): напоминание о зависших open-заявках читало s.data.summary/s.data.from
+// БЕЗ страховки — битая/безполевая строка approval (мусор в ledger) роняла бы TypeError'ом
+// весь тик (этот блок стоит ДО исполнения approved-заявок ниже). Защитное чтение — конвенция
+// файла, см. targetOfRequest (`r.data && …`). Чистая, тестируется отдельно без прогона тика.
+function openReminderLabel(s) {
+  const d = (s && s.data) || {};
+  return { event_id: s && s.event_id, summary: d.summary, from: d.from };
+}
 // Фидбэк оператора 16.07: алерт «заявка evt_…» нечитаем — не видно, ЧТО за заявка и от кого;
 // алерт должен читаться без похода в ledger. Чистая функция: человеческая метка заявки из
 // {event_id, summary, from} → «<summary> — заявка <from> (<id>)»; summary схлопывается в одну
@@ -131,7 +139,7 @@ function runnerArgv(eventId, runnerBin, executorBin, env) {
   out.push(runnerBin, '--approval', eventId, '--executor', executorBin);
   return out;
 }
-module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval, staleOpenApprovals };
+module.exports = { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval, staleOpenApprovals, openReminderLabel };
 if (require.main !== module) return;
 
 // ---- CLI ---------------------------------------------------------------
@@ -394,12 +402,14 @@ const openApprovalRows = dlList(['--kind', 'approval', '--status', 'open']);
 const staleOpen = staleOpenApprovals(openApprovalRows, now, OPEN_REMIND_MIN);
 const openIds = new Set(openApprovalRows.map((r) => r.event_id));
 for (const s of staleOpen) {
-  if (dry) { console.log(`[dry] напоминание о зависшей заявке: ${humanApproval({ event_id: s.event_id, summary: s.data.summary, from: s.data.from })}`); continue; }
+  // M5: openReminderLabel защищает s.data (см. её комментарий выше) — было s.data.summary/from
+  // напрямую, TypeError на мусорной строке ронял бы весь тик ДО исполнения approved-заявок.
+  if (dry) { console.log(`[dry] напоминание о зависшей заявке: ${humanApproval(openReminderLabel(s))}`); continue; }
   if (remindState[s.event_id]) continue; // уже напоминали про этот эпизод
   // humanApproval ждёт ПЛОСКИЕ row.summary/row.from (см. её сигнатуру выше), а openApprovalRows —
   // сырые события ledger, где эти поля лежат в data. Без уплощения алерт выродился бы в
   // голый event_id — ровно то, от чего уходили по фидбэку оператора 16.07.
-  const human = humanApproval({ event_id: s.event_id, summary: s.data.summary, from: s.data.from });
+  const human = humanApproval(openReminderLabel(s));
   // p3#33: писать «напомнили» только при ДОСТАВЛЕННОМ алерте — иначе сетевой флап
   // проглотит напоминание навсегда (следующий тик повторит попытку).
   if (!notify(`⏳ dispatcher: заявка висит без решения >${OPEN_REMIND_MIN} мин: ${human} — реши кнопкой или попроси автора отозвать (dept-withdraw)`)) continue;
