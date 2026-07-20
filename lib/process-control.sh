@@ -287,13 +287,23 @@ process_control_tmux() {
 #  2) -p/--property Environment=... — независимый способ присвоить env transient-юниту,
 #     которым НАШ КОД не пользуется вовсе — блокируем флаг целиком, не разбирая содержимое
 #     (Environment= может нести несколько присваиваний через пробел в одной строке).
+#
+# ДЕФЕКТ 2 (повторное ревью T2): голая форма `--setenv CLAUDE_CONTROL_TEST_ROOT` (БЕЗ
+# "=value") НЕ ошибка у systemd-run — man: «When "=" and VALUE are omitted, the value of the
+# variable is passed from the environment in which systemd-run is invoked» — тихий
+# альтернативный канал присвоить переменную из окружения САМОГО systemd-run (которое
+# унаследует его от guard-процесса). Паттерны `CLAUDE_CONTROL_TEST_ROOT=*`/`...=*` требовали
+# буквальный "=" — голое имя без него не матчилось и проходило необнаруженным. Для каждой из
+# четырёх форм (раздельная `--setenv`/`-E` + следующий arg; слитная `--setenv=NAME`,
+# `-ENAME`, `-E=NAME`) в case ниже добавлена ТОЧНАЯ голая альтернатива БЕЗ "=" (не wildcard —
+# `-p*`/`--property*` ниже это wildcard, а здесь каждая форма перечислена явным литералом).
 process_control_systemd_run() {
   local arg prev=""
   for arg in "$@"; do
     case "$prev" in
       --setenv|-E)
         case "$arg" in
-          CLAUDE_CONTROL_TEST_ROOT=*)
+          CLAUDE_CONTROL_TEST_ROOT=*|CLAUDE_CONTROL_TEST_ROOT)
             echo "process-control: process_control_systemd_run — вызывающему запрещено переопределять CLAUDE_CONTROL_TEST_ROOT через --setenv (маркер назначает guard, получено '$arg')" >&2
             return 1
             ;;
@@ -301,7 +311,7 @@ process_control_systemd_run() {
         ;;
     esac
     case "$arg" in
-      --setenv=CLAUDE_CONTROL_TEST_ROOT=*|-E=CLAUDE_CONTROL_TEST_ROOT=*|-ECLAUDE_CONTROL_TEST_ROOT=*)
+      --setenv=CLAUDE_CONTROL_TEST_ROOT=*|--setenv=CLAUDE_CONTROL_TEST_ROOT|-E=CLAUDE_CONTROL_TEST_ROOT=*|-ECLAUDE_CONTROL_TEST_ROOT=*|-E=CLAUDE_CONTROL_TEST_ROOT|-ECLAUDE_CONTROL_TEST_ROOT)
         echo "process-control: process_control_systemd_run — вызывающему запрещено переопределять CLAUDE_CONTROL_TEST_ROOT через --setenv (получено '$arg')" >&2
         return 1
         ;;

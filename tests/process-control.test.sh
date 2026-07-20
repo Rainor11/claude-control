@@ -357,6 +357,65 @@ echo "$out" | command grep -qi "снаружи" || fail "check_unit_dir симл
 echo "OK: process_control_check_unit_dir — симлинк ВНУТРИ test root на каталог СНАРУЖИ — отказ (К1)"
 
 # ---------------------------------------------------------------------------------------
+# ДЕФЕКТ 1 (повторное ревью T2): process_control_check_unit_dir — БИТЫЙ (dangling) симлинк
+# (цель не существует) обязан резолвиться через `realpath -m` ТОЧНО ТАК ЖЕ, как симлинк на
+# существующий каталог (К1 выше). Bash-сторона зовёт настоящий `realpath -m` напрямую —
+# GNU realpath уже резолвит битые симлинки корректно (сверено фактическим запуском бинаря),
+# поэтому здесь дефекта НЕТ — эти тесты ЛОЧАТ уже верное поведение bash-стороны; симметричные
+# тесты на JS-стороне (checkUnitDir/realpathM) реально нашли и зафиксировали баг (см.
+# lib/process-control.js, "ДЕФЕКТ 1": fs.realpathSync не различал ENOENT компонента и
+# ENOENT цели битого симлинка).
+# ---------------------------------------------------------------------------------------
+
+dangle_out="$root1/danglink-outside"
+ln -sf "$outside_dir/never-created-xyz" "$dangle_out"   # цель НЕ существует, снаружи test root
+out="$(HOME="$home1" run_env "$root1" process_control_check_unit_dir "$dangle_out/foo/bar" 2>&1)" \
+  && fail "process_control_check_unit_dir с БИТЫМ симлинком наружу обязан отказывать: $out"
+echo "$out" | command grep -qi "снаружи" || fail "check_unit_dir битый симлинк наружу: сообщение не объясняет причину: $out"
+
+echo "OK: process_control_check_unit_dir — БИТЫЙ симлинк ВНУТРИ test root, указывающий НАРУЖУ (несуществующий путь), — отказ (Дефект 1)"
+
+dangle_in="$root1/danglink-inside"
+ln -sf "$root1/never-created-nested" "$dangle_in"   # цель НЕ существует, но ВНУТРИ test root
+out="$(HOME="$home1" run_env "$root1" process_control_check_unit_dir "$dangle_in/foo/bar")" \
+  || fail "process_control_check_unit_dir с БИТЫМ симлинком ВНУТРЬ (несуществующий путь) не должен отказывать: $out"
+
+echo "OK: process_control_check_unit_dir — БИТЫЙ симлинк ВНУТРИ test root, указывающий ВНУТРЬ, — без ложного отказа (Дефект 1)"
+
+chain2="$root1/chain2"
+chain1="$root1/chain1"
+ln -sf "$outside_dir/never-created-final-xyz" "$chain2"   # chain2 -> снаружи, битый
+ln -sf "$chain2" "$chain1"                                 # chain1 -> chain2
+out="$(HOME="$home1" run_env "$root1" process_control_check_unit_dir "$chain1/tail" 2>&1)" \
+  && fail "process_control_check_unit_dir с цепочкой симлинков (последний битый, наружу) обязан отказывать: $out"
+echo "$out" | command grep -qi "снаружи" || fail "check_unit_dir цепочка симлинков: сообщение не объясняет причину: $out"
+
+echo "OK: process_control_check_unit_dir — цепочка симлинков с битым последним звеном наружу — отказ (Дефект 1)"
+
+cyc_a="$root1/cyc_a"
+cyc_b="$root1/cyc_b"
+ln -sf "$cyc_b" "$cyc_a"
+ln -sf "$cyc_a" "$cyc_b"
+# Симлинк-цикл: GNU `realpath -m` не виснет и не падает (сверено фактическим запуском:
+# `realpath -m` на a<->b цикле — rc=0, путь возвращается БЕЗ дальнейшего резолва). Оба звена
+# цикла лежат ВНУТРИ test root, поэтому нерезолвленный (буквальный) путь тоже лексически
+# внутри root — containment проходит, вызов обязан завершиться без отказа (и, что важнее,
+# без зависания — если бы функция зациклилась, упал бы весь прогон по таймауту раннера).
+# shellcheck disable=SC2016  # НАМЕРЕННО: $1/$2/$3/$4 внутри одинарных кавычек — позиционные
+# параметры ВНУТРЕННЕГО `bash -c`, обязаны раскрыться ТАМ (после `unset`/`export` в его
+# собственном окружении), а не здесь, в родительском шелле, до timeout/bash -c.
+out="$(timeout 5 bash -c '
+  unset CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME CLAUDE_CONTROL_TEST_ROOT
+  export HOME="$1" CLAUDE_CONTROL_TEST_ROOT="$2"
+  # shellcheck disable=SC1090
+  . "$3"
+  process_control_check_unit_dir "$4"
+' bash "$home1" "$root1" "$LIB" "$cyc_a/tail" 2>&1)" \
+  || fail "process_control_check_unit_dir с симлинк-циклом (оба звена внутри test root) не должен отказывать/висеть (rc=$?, timeout 5s): $out"
+
+echo "OK: process_control_check_unit_dir — симлинк-цикл не виснет и не отказывает, когда цикл целиком внутри test root (Дефект 1)"
+
+# ---------------------------------------------------------------------------------------
 # К2 (ревью T2): process_control_tmux — имя воркера со встроенным переводом строки обязано
 # быть отклонено ДО построения argv (было: построчный `read`-транспорт резал такое имя на
 # ДВА argv-элемента, второй долетал до tmux как отдельный позиционный аргумент — argv-инъекция,
@@ -411,6 +470,59 @@ command grep -q -- "--setenv CLAUDE_CONTROL_TEST_ROOT=$root1 --setenv MY_TASK_VA
   || fail "process_control_systemd_run: легитимный --setenv вызывающего должен пройти ПОСЛЕ нашего маркерного: $(cat "$stub_log")"
 
 echo "OK: process_control_systemd_run — легитимный --setenv вызывающего (для СВОЕЙ переменной) не заблокирован (В1)"
+
+# ---------------------------------------------------------------------------------------
+# ДЕФЕКТ 2 (повторное ревью T2): голая форма `--setenv CLAUDE_CONTROL_TEST_ROOT` (БЕЗ
+# "=value") — systemd-run в этом случае берёт значение переменной ИЗ ОКРУЖЕНИЯ САМОГО
+# systemd-run (man: «When "=" and VALUE are omitted, the value of the variable is passed
+# from the environment in which systemd-run is invoked»), а не падает с ошибкой. Все
+# блок-паттерны выше требовали буквальный "=" — голая форма проходила необнаруженной.
+# Репро ревьюера: `--setenv CLAUDE_CONTROL_TEST_ROOT --unit=x /bin/true` давал rc=0.
+# ---------------------------------------------------------------------------------------
+
+: > "$stub_log"
+out="$(HOME="$home1" DEPT_SYSTEMD_RUN="$root1/fake-systemd-run" run_env "$root1" process_control_systemd_run --setenv CLAUDE_CONTROL_TEST_ROOT --unit=x /bin/true 2>&1)" \
+  && fail "process_control_systemd_run с голой формой --setenv CLAUDE_CONTROL_TEST_ROOT (без '=value') обязан отказывать: $out"
+echo "$out" | command grep -qi "запрещено переопределять" || fail "process_control_systemd_run голая форма --setenv: сообщение не объясняет причину: $out"
+[ -s "$stub_log" ] && fail "process_control_systemd_run с голой формой --setenv маркера: побочный эффект произошёл: $(cat "$stub_log")"
+
+echo "OK: process_control_systemd_run — голая форма --setenv CLAUDE_CONTROL_TEST_ROOT (раздельная) отклонена, без побочного эффекта (Дефект 2)"
+
+: > "$stub_log"
+out="$(HOME="$home1" DEPT_SYSTEMD_RUN="$root1/fake-systemd-run" run_env "$root1" process_control_systemd_run -E CLAUDE_CONTROL_TEST_ROOT --unit=x /bin/true 2>&1)" \
+  && fail "process_control_systemd_run с голой формой -E CLAUDE_CONTROL_TEST_ROOT обязан отказывать: $out"
+echo "$out" | command grep -qi "запрещено переопределять" || fail "process_control_systemd_run голая форма -E: сообщение не объясняет причину: $out"
+[ -s "$stub_log" ] && fail "process_control_systemd_run с голой формой -E маркера: побочный эффект произошёл: $(cat "$stub_log")"
+
+echo "OK: process_control_systemd_run — голая форма -E CLAUDE_CONTROL_TEST_ROOT (короткий флаг) отклонена, без побочного эффекта (Дефект 2)"
+
+: > "$stub_log"
+out="$(HOME="$home1" DEPT_SYSTEMD_RUN="$root1/fake-systemd-run" run_env "$root1" process_control_systemd_run --setenv=CLAUDE_CONTROL_TEST_ROOT --unit=x /bin/true 2>&1)" \
+  && fail "process_control_systemd_run с голой слитной формой --setenv=CLAUDE_CONTROL_TEST_ROOT обязан отказывать: $out"
+echo "$out" | command grep -qi "запрещено переопределять" || fail "process_control_systemd_run голая слитная форма: сообщение не объясняет причину: $out"
+[ -s "$stub_log" ] && fail "process_control_systemd_run с голой слитной формой маркера: побочный эффект произошёл: $(cat "$stub_log")"
+
+echo "OK: process_control_systemd_run — голая слитная форма --setenv=CLAUDE_CONTROL_TEST_ROOT отклонена, без побочного эффекта (Дефект 2)"
+
+: > "$stub_log"
+out="$(HOME="$home1" DEPT_SYSTEMD_RUN="$root1/fake-systemd-run" run_env "$root1" process_control_systemd_run --setenv MY_TASK_VAR --unit=x /bin/true)" \
+  || fail "process_control_systemd_run с голой формой --setenv для ЧУЖОЙ переменной не должен отказывать (не должен сломать T4): $out"
+command grep -q -- "--setenv CLAUDE_CONTROL_TEST_ROOT=$root1 --setenv MY_TASK_VAR --unit=x /bin/true" "$stub_log" \
+  || fail "process_control_systemd_run: голая форма --setenv для чужой переменной должна пройти ПОСЛЕ нашего маркерного: $(cat "$stub_log")"
+
+echo "OK: process_control_systemd_run — голая форма --setenv для ЧУЖОЙ переменной не заблокирована (Дефект 2, без ложных срабатываний)"
+
+# Дефект 2 (доп. находка, паритет): -p/--property уже блокируется bash-стороной ЦЕЛИКОМ через
+# wildcard `-p*|--property*` — этот wildcard матчит и слитную форму `-pEnvironment=...` (без
+# пробела) само по себе, дефекта здесь НЕТ (в отличие от JS-стороны, где было `a === '-p'`
+# точное сравнение — см. lib/process-control.js). Тест ЛОЧИТ уже верное поведение.
+: > "$stub_log"
+out="$(HOME="$home1" DEPT_SYSTEMD_RUN="$root1/fake-systemd-run" run_env "$root1" process_control_systemd_run -pEnvironment=FOO=bar --unit=x /bin/true 2>&1)" \
+  && fail "process_control_systemd_run со слитной формой -pEnvironment=... обязан отказывать: $out"
+echo "$out" | command grep -qi "не принимает -p/--property" || fail "process_control_systemd_run слитная -p: сообщение не объясняет причину: $out"
+[ -s "$stub_log" ] && fail "process_control_systemd_run со слитной формой -p: побочный эффект произошёл: $(cat "$stub_log")"
+
+echo "OK: process_control_systemd_run — слитная форма -pEnvironment=... (без пробела) отклонена целиком (Дефект 2, паритет-lock)"
 
 # ---------------------------------------------------------------------------------------
 # В2 (ревью T2): shared class → (varName, defaultBin) фикстура — сверяет, что bash `case` в
