@@ -167,4 +167,30 @@ rm -rf "$root6" "$outside_dir"
 echo "$out" | command grep -q "systemctl" || fail "симлинк-побег: сообщение не называет класс systemctl: $out"
 echo "OK: заглушка-симлинк наружу test root — явный отказ (делегировано T2)"
 
+# ---------------------------------------------------------------------------------------
+# 7) М1 (ревью T3) — запуск ПОД dash (не bash), минуя shebang: `sh tests/foo.test.sh`
+#    интерпретирует ВЕСЬ файл (включая source bootstrap.sh) как POSIX sh — без детекта
+#    строка BASH_SOURCE[0] упала бы под dash с невнятным "Bad substitution". Тело теста не
+#    должно быть достижимо в любом случае (безопасность не страдает), но сообщение обязано
+#    быть внятным, а не сырой ошибкой интерпретатора.
+# ---------------------------------------------------------------------------------------
+if command -v dash >/dev/null 2>&1; then
+  out="$(
+    unset CLAUDE_CONTROL_TEST_ROOT CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME \
+          SYSTEMCTL DEPT_SYSTEMD_RUN TMUX_BIN
+    # shellcheck disable=SC2016  # НАМЕРЕННО одинарные кавычки: '$1' обязан резолвиться ВНУТРИ
+    # -c скрипта dash (позиционный параметр ЕГО собственного вызова), не в этом bash — двойные
+    # кавычки заставили бы РОДИТЕЛЬСКИЙ bash подставить $1 (пусто/чужое) ДО передачи в dash.
+    dash -c '. "$1"; echo UNREACHABLE' -- "$BOOTSTRAP" 2>&1
+  )"
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "под dash bootstrap обязан отказать (получен rc=0): $out"
+  echo "$out" | command grep -q "UNREACHABLE" && fail "тело теста ПОСЛЕ bootstrap выполнилось под dash: $out"
+  echo "$out" | command grep -qi "Bad substitution" && fail "сообщение под dash — сырая ошибка интерпретатора, не внятный текст: $out"
+  echo "$out" | command grep -qi "bash" || fail "под dash: сообщение не объясняет требование bash: $out"
+  echo "OK: запуск под dash (не bash) — внятное сообщение, не сырая ошибка интерпретатора"
+else
+  echo "SKIP: dash не найден в PATH — сценарий М1 (не-bash интерпретатор) пропущен"
+fi
+
 echo "PASS bootstrap"

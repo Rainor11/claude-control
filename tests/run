@@ -37,6 +37,88 @@ fi
 . "$_RUN_REPO_DIR/lib/runtime-root.sh"
 SENTINEL_NAME="$_RUNTIME_ROOT_SENTINEL_NAME"
 
+# detect_bootstrap_connection (uses_bootstrap ниже — тонкая обёртка) — общий с
+# tests/lint-bootstrap.test.sh детектор, см. tests/lib/bootstrap-detect.sh (К1 ревью T3: там
+# же — почему "первая значимая строка", а не substring по всему файлу). Источник — от
+# _RUN_REPO_DIR (РЕАЛЬНЫЙ репозиторий), НЕ от _RUN_TESTS_DIR — та уже могла быть подменена
+# TESTS_RUN_DIR_OVERRIDE выше (fixture-каталог не содержит lib/bootstrap-detect.sh).
+# shellcheck disable=SC1091
+. "$_RUN_REPO_DIR/tests/lib/bootstrap-detect.sh"
+
+# -----------------------------------------------------------------------------------------
+# УБОРКА ПЕСОЧНИЦЫ — защита от прерывания (В3, ревью T3). Раньше `rm -rf "$canon_sandbox"` в
+# run_one был ЕДИНСТВЕННОЙ попыткой уборки, без trap — SIGTERM/SIGINT, полученный ПОКА тест
+# ещё выполняется (раннер блокирован в command substitution, ждёт дочерний bash/node), обрывал
+# tests/run ДО этой строки, и песочница оставалась в $TMPDIR НАВСЕГДА (не боевой урон — всё в
+# $TMPDIR, но мусор, подтверждено эмпирически ревьюером). Второй найденный случай: тест,
+# ограничивший права внутри своей же песочницы (`chmod 000` на подкаталог, проверяет свою
+# логику), приводил к ТИХОМУ провалу `rm -rf` — результат нигде не проверялся.
+#
+# Best-effort, честно (тот же принцип, что T2 про свой guard): SIGKILL не перехватить в
+# принципе (это ОС, не bash). Сигнал, отправленный ТОЛЬКО дочернему exec'нутому процессу теста
+# (не всей группе процессов), тоже не долетит до этого trap — под systemd (KillMode=
+# control-group по умолчанию) сигнал уйдёт всей группе разом, но при ручном
+# `kill -TERM <pid раннера>` это ограничение остаётся. Не выдаём best-effort за гарантию.
+_CURRENT_SANDBOX=""
+
+# _sandbox_looks_safe <path>: 0, если path непустой, абсолютный и лежит СТРОГО внутри
+# канонического ${TMPDIR:-/tmp} — защита от классического `rm -rf ""` → `rm -rf /`, если
+# переменная окажется пустой/невыставленной, и от уборки чего-либо ВНЕ песочницы (бриф:
+# «раннер убирает за собой песочницу, но НЕ удаляет ничего вне неё»).
+_sandbox_looks_safe() {
+  local path="$1" tmpbase
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  tmpbase="$(realpath -e "${TMPDIR:-/tmp}" 2>/dev/null)" || return 1
+  case "$path" in
+    "$tmpbase"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cleanup_sandbox: убирает _CURRENT_SANDBOX, если она выставлена и выглядит безопасной.
+# chmod -R u+rwx ПЕРЕД rm -rf — тест внутри своей песочницы мог сам себе `chmod 000` на
+# какой-то подкаталог (проверяет свою же логику прав) — `rm -rf` тогда не может рекурсивно
+# зайти внутрь (нужны r+x на директорию), молча проваливаясь (В3, подтверждено эмпирически).
+# Мы — владелец (mktemp создал от нашего uid), chmod от владельца работает НЕЗАВИСИМО от
+# текущих битов прав (это право владельца, не текущего режима файла).
+_cleanup_sandbox() {
+  local path="$_CURRENT_SANDBOX"
+  [ -n "$path" ] || return 0
+  if ! _sandbox_looks_safe "$path"; then
+    echo "tests/run: ОТКАЗ убрать '$path' — путь не похож на нашу песочницу внутри \${TMPDIR:-/tmp}, уборка пропущена (защита от удаления вне границ)" >&2
+    return 1
+  fi
+  chmod -R u+rwx "$path" 2>/dev/null
+  if rm -rf -- "$path"; then
+    _CURRENT_SANDBOX=""
+    return 0
+  fi
+  echo "tests/run: ПРЕДУПРЕЖДЕНИЕ — не удалось полностью убрать песочницу '$path' (rm -rf вернул ошибку), проверь вручную" >&2
+  return 1
+}
+
+# _on_term_signal <sig>: убрать текущую песочницу, снять свой же trap (не зациклиться) и
+# завершиться конвенционным кодом 128+N — стандартный паттерн "cleanup, затем честно
+# завершиться сигналом", а не тихо проглотить INT/TERM и продолжить как ни в чём не бывало.
+_on_term_signal() {
+  local sig="$1" rc
+  _cleanup_sandbox
+  trap - EXIT INT TERM
+  case "$sig" in
+    INT) rc=130 ;;
+    TERM) rc=143 ;;
+    *) rc=1 ;;
+  esac
+  exit "$rc"
+}
+trap '_cleanup_sandbox' EXIT
+trap '_on_term_signal INT' INT
+trap '_on_term_signal TERM' TERM
+
 # -----------------------------------------------------------------------------------------
 # КАРАНТИН — явный deny-list с причиной (проектное решение, см. отчёт iso-t3-report.md).
 #
@@ -63,9 +145,40 @@ SENTINEL_NAME="$_RUNTIME_ROOT_SENTINEL_NAME"
 # grep-аудит на systemctl/tmux/install.sh/uninstall.sh не нашёл других файлов, вызывающих
 # реальные бинарные side-effects без собственного мока) — если позже обнаружится ещё один
 # такой файл, он добавляется сюда ТЕМ ЖЕ способом.
+#
+# В2 (ревью T3) — ЧЕГО ЭТОТ КАРАНТИН НЕ ГАРАНТИРУЕТ (та же честность, что T2 про свой guard,
+# см. lib/process-control.sh «ЧЕГО ЭТОТ GUARD НЕ ГАРАНТИРУЕТ»): is_quarantined проверяет
+# РАСПОЛОЖЕНИЕ/СОДЕРЖИМОЕ файла (имя ИЛИ канонический realpath, см. QUARANTINE_REAL ниже —
+# закрывает симлинк/копию-по-inode под другим именем), а НЕ его БЕЗВРЕДНОСТЬ. Файл с ИЗМЕНЁННЫМ
+# содержимым (не symlink, не byte-for-byte копия — переписанный `cmd_sleep`-вызов под новым
+# именем) карантин НЕ поймает: у него другой canonical path И другое содержимое. Единственная
+# защита от ЭТОГО класса — статический grep-аудит (iso-t3-report.md) плюс PATH-shadow
+# defense-in-depth (см. ниже, ловит ГОЛЫЕ имена команд независимо от карантина). T4/T5 не
+# должны считать карантин сильнее, чем он есть.
 declare -A QUARANTINE=(
   [tests/asana-project-integration.test.sh]="claude-auto sleep testw → bin/claude-auto cmd_sleep делает настоящий 'systemctl --user disable --now' + 'tmux -L claude-testw kill-session' (голые имена команд, guard T2 к bin/* ещё не подключён — это T4). Снимается в T4 после подключения guard к cmd_sleep/cmd_stop."
 )
+
+# QUARANTINE_REAL — канонические (realpath) абсолютные пути карантинных файлов, вычисленные
+# от их РЕАЛЬНОГО расположения в tests/ репозитория (карантинный файл физически лежит только
+# там, независимо от TESTS_RUN_DIR_OVERRIDE). Закрывает В2 (ревью T3): tests/asana-copy.test.sh
+# — СИМЛИНК на tests/asana-project-integration.test.sh под другим именем — раньше проходил
+# discovery по ИМЕНИ (не совпадало ни с одним ключом QUARANTINE) и физически исполнялся бы,
+# долетая до настоящего systemd/tmux. realpath разыменовывает симлинк до канонического файла —
+# сравнение "то же физическое содержимое", а не "то же имя". См. is_quarantined ниже — сначала
+# быстрая проверка по имени (частый случай, без обращения к ФС), затем по realpath (закрывает
+# симлинк/копию-по-inode).
+declare -A QUARANTINE_REAL=()
+for _q_rel in "${!QUARANTINE[@]}"; do
+  # _RUN_REPO_DIR — корень репозитория (НЕ tests/), _q_rel уже содержит префикс "tests/" —
+  # конкатенация НАПРЯМУЮ, без strip (в отличие от run_one::abs, который строится от
+  # _RUN_TESTS_DIR, а не от _RUN_REPO_DIR).
+  _q_abs="$_RUN_REPO_DIR/$_q_rel"
+  if [ -e "$_q_abs" ]; then
+    _q_real="$(realpath -e "$_q_abs" 2>/dev/null)" && QUARANTINE_REAL["$_q_real"]="${QUARANTINE[$_q_rel]}"
+  fi
+done
+unset _q_rel _q_abs _q_real
 
 usage() {
   cat <<'EOF'
@@ -96,9 +209,30 @@ discover() {
   done | sort
 }
 
-# is_quarantined <rel>: 0, если файл в deny-list.
+# is_quarantined <rel> <abs>: 0, если файл в deny-list — ПО ИМЕНИ (быстрый путь, частый
+# случай, без обращения к ФС) ИЛИ по каноническому realpath (В2 — закрывает симлинк/копию-по-
+# inode под ДРУГИМ именем, см. QUARANTINE_REAL выше). <abs> опционален — если не передан или
+# не существует, работает только проверка по имени (тот же результат, что и раньше).
 is_quarantined() {
-  [ -n "${QUARANTINE[$1]+set}" ]
+  local rel="$1" abs="${2:-}" real
+  [ -n "${QUARANTINE[$rel]+set}" ] && return 0
+  [ -n "$abs" ] && [ -e "$abs" ] || return 1
+  real="$(realpath -e "$abs" 2>/dev/null)" || return 1
+  [ -n "${QUARANTINE_REAL[$real]+set}" ]
+}
+
+# quarantine_reason <rel> <abs>: причина карантина — по имени (QUARANTINE) ИЛИ по realpath
+# (QUARANTINE_REAL, В2 — симлинк/копия-по-inode под другим именем). Вызывать ТОЛЬКО после
+# is_quarantined вернул истину (иначе пусто) — не дублирует её проверку, просто достаёт текст.
+quarantine_reason() {
+  local rel="$1" abs="${2:-}" real
+  if [ -n "${QUARANTINE[$rel]+set}" ]; then
+    printf '%s' "${QUARANTINE[$rel]}"
+    return 0
+  fi
+  if [ -n "$abs" ] && real="$(realpath -e "$abs" 2>/dev/null)" && [ -n "${QUARANTINE_REAL[$real]+set}" ]; then
+    printf '%s' "${QUARANTINE_REAL[$real]}"
+  fi
 }
 
 # make_stub <path>: исполняемая заглушка процесс-контроля — логирует свой вызов (argv0 +
@@ -122,24 +256,28 @@ STUB
 }
 
 # uses_bootstrap <abs>: 0, если файл уже подключает tests/lib/bootstrap.{sh,mjs} — тот же
-# признак "тест мигрирован", что использует tests/lint-bootstrap.test.sh. Решает, обязан ли
-# раннер ПРИНУДИТЕЛЬНО экспортировать SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN: их консультирует
-# ТОЛЬКО bootstrap-preflight (T2) — НЕ мигрированные (allow-list, T6) тесты строят СВОИ
-# собственные моки этих же переменных внутри себя И явно тестируют сценарий "переменная НЕ
-# задана — резолв через PATH" (прецедент, найденный ЭМПИРИЧЕСКИ при верификации раннера:
-# tests/process-control.test.sh, сценарий «process_control_systemctl без маркера: прокси на
-# настоящий бинарь, проверяем фейковым бинарём в PATH» — принудительный SYSTEMCTL от раннера
-# ломает именно этот сценарий, подменяя собой ожидаемый PATH-fallback). Раннер не навязывает
-# ещё не принятый тестом контракт — sentinel/маркер/HOME/TELEGRAM_NOTIFY/RNR_ASKS_DB/PATH-
-# shadow остаются БЕЗ УСЛОВИЙ (ни один существующий тест не тестирует ИХ отсутствие).
+# признак "тест мигрирован", что использует tests/lint-bootstrap.test.sh (has_bootstrap).
+# Решает, обязан ли раннер ПРИНУДИТЕЛЬНО экспортировать SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN:
+# их консультирует ТОЛЬКО bootstrap-preflight (T2) — НЕ мигрированные (allow-list, T6) тесты
+# строят СВОИ собственные моки этих же переменных внутри себя И явно тестируют сценарий
+# "переменная НЕ задана — резолв через PATH" (прецедент, найденный ЭМПИРИЧЕСКИ при
+# верификации раннера: tests/process-control.test.sh, сценарий «process_control_systemctl без
+# маркера: прокси на настоящий бинарь, проверяем фейковым бинарём в PATH» — принудительный
+# SYSTEMCTL от раннера ломает именно этот сценарий, подменяя собой ожидаемый PATH-fallback).
+# Раннер не навязывает ещё не принятый тестом контракт — sentinel/маркер/HOME/
+# TELEGRAM_NOTIFY/RNR_ASKS_DB/PATH-shadow остаются БЕЗ УСЛОВИЙ (ни один существующий тест не
+# тестирует ИХ отсутствие).
 #
-# Паттерн ЯКОРНЫЙ (строка обязана НАЧИНАТЬСЯ с `.`+пробел ИЛИ `import`+граница слова), не
-# голый substring — самокритика при ревью: substring совпал бы и с комментарием, ПРОСТО
-# УПОМИНАЮЩИМ "lib/bootstrap.sh" без реального source/import (ложное срабатывание), а для
-# lint-bootstrap.test.sh (тот же паттерн, см. её has_bootstrap) это значило бы "тест
-# посчитан защищённым рубежом 2, хотя реально не подключил bootstrap ни разу".
+# Тонкая обёртка над detect_bootstrap_connection (tests/lib/bootstrap-detect.sh, sourced
+# выше) — ОДНА и та же реализация, что и tests/lint-bootstrap.test.sh::has_bootstrap, вынесена
+# в общий файл ПОСЛЕ находки К1 (ревью T3): прежний "голый substring по всему файлу"
+# засчитывал bootstrap подключённым в 4 случаях без реальной защиты (comment-trailing trick,
+# heredoc-заглушка, недостижимая ветка, bootstrap последней строкой ПОСЛЕ опасного кода) — см.
+# полное обоснование в tests/lib/bootstrap-detect.sh. Дублировать НОВУЮ (многострочную)
+# логику в двух местах значило бы гарантированно разойтись — общий файл делает это
+# структурно невозможным.
 uses_bootstrap() {
-  command grep -qE '^[[:space:]]*(\.[[:space:]]|import\>).*lib/bootstrap\.(sh|mjs)' "$1" 2>/dev/null
+  detect_bootstrap_connection "$1"
 }
 
 # run_one <rel>: свежая песочница → выполнить → уборка. Возвращает 0/1/2
@@ -151,9 +289,9 @@ run_one() {
   # сканируем ли реальный tests/ или fixture-override.
   local rel="$1" abs="$_RUN_TESTS_DIR/${1#tests/}"
 
-  if is_quarantined "$rel"; then
+  if is_quarantined "$rel" "$abs"; then
     echo "QUARANTINE: $rel"
-    echo "  причина: ${QUARANTINE[$rel]}"
+    echo "  причина: $(quarantine_reason "$rel" "$abs")"
     RUN_ONE_STATUS=2
     return 0
   fi
@@ -170,12 +308,18 @@ run_one() {
     RUN_ONE_STATUS=1
     return 0
   }
+  # _CURRENT_SANDBOX (ГЛОБАЛЬНАЯ, не local!) — с этого момента trap на EXIT/INT/TERM (см.
+  # заголовок файла, В3) видит путь и уберёт его даже при прерывании ДО того, как тест
+  # закончится штатно. Обновляем на canon_sandbox ниже, как только он резолвится.
+  _CURRENT_SANDBOX="$sandbox"
   canon_sandbox="$(realpath -e "$sandbox")" || {
     echo "FAIL: $rel — realpath не смог канонизировать песочницу $sandbox"
     rm -rf "$sandbox"
+    _CURRENT_SANDBOX=""
     RUN_ONE_STATUS=1
     return 0
   }
+  _CURRENT_SANDBOX="$canon_sandbox"
 
   # --- контракт песочницы (см. brief «Контракт песочницы») ------------------------------
   : > "$canon_sandbox/$SENTINEL_NAME"
@@ -255,7 +399,12 @@ run_one() {
   # замена, `${var//search/replace}` (предложение SC2001) не расставит префикс на КАЖДОЙ
   # строке без отдельного цикла построчного чтения; sed здесь проще и надёжнее.
   echo "$out" | sed "s|^|[$rel] |"
-  rm -rf "$canon_sandbox"
+  # _cleanup_sandbox (В3) — chmod -R u+rwx перед rm -rf (тест мог сам себе ограничить права
+  # внутри своей же песочницы) + проверка результата с сообщением оператору, вместо
+  # непроверяемого голого `rm -rf`. Она же — обработчик EXIT/INT/TERM (см. заголовок файла) —
+  # здесь вызывается ЯВНО в штатном пути, чтобы не копить песочницы до самого конца всего
+  # прогона (много тестов подряд), trap остаётся страховкой ТОЛЬКО на случай прерывания.
+  _cleanup_sandbox
 
   if [ "$rc" -eq 0 ]; then
     echo "PASS: $rel"
@@ -306,8 +455,9 @@ fi
 if [ "$list_only" = true ]; then
   echo "Обнаружено (${#all_tests[@]}):"
   for rel in "${all_tests[@]}"; do
-    if is_quarantined "$rel"; then
-      echo "  [КАРАНТИН] $rel — ${QUARANTINE[$rel]}"
+    list_abs="$_RUN_TESTS_DIR/${rel#tests/}"
+    if is_quarantined "$rel" "$list_abs"; then
+      echo "  [КАРАНТИН] $rel — $(quarantine_reason "$rel" "$list_abs")"
     else
       echo "  $rel"
     fi

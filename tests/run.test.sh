@@ -40,20 +40,27 @@ echo "SANDBOX=$CLAUDE_CONTROL_TEST_ROOT"
 echo "toy-legacy: OK"
 EOF
 
-# toy-migrated.test.sh — содержит СТРОКУ, синтаксически похожую на реальный source
-# bootstrap.sh (нужно, чтобы tests/run::uses_bootstrap — якорный паттерн "начинается с `.`+
-# пробел ... lib/bootstrap.sh", НЕ голый substring, см. правку после самопроверки диффа —
-# распознал файл как "мигрированный"), но обёрнутую в `: <<'MARKER' ... MARKER` (heredoc —
-# данные для no-op `:`, НЕ исполняемая команда) — фикстуре не нужен настоящий bootstrap.sh
-# рядом, а реальный `.` на несуществующий путь уронил бы этот toy-тест раньше времени.
-# Раннер ОБЯЗАН выставить все 3 seam-переменные внутри test root, PATH-заглушки обязаны
-# реально перехватывать вызовы (проверяем STUB_LOG).
+# TOY_BOOTSTRAP_TESTS_DIR — абсолютный путь к РЕАЛЬНОМУ tests/ репозитория (НЕ FIXTURE_DIR).
+# toy-migrated.test.sh ниже РЕАЛЬНО source'ит настоящий tests/lib/bootstrap.sh (после фикса
+# К1, см. iso-t3-report.md, детектор требует, чтобы bootstrap был ПЕРВОЙ значимой строкой —
+# прежний heredoc-трюк, имитировавший подключение БЕЗ реального source, стал сам одним из 4
+# подтверждённых обходов и намеренно перестал засчитываться; фикстура обязана соответствовать
+# новому правилу, а не имитировать его, см. iso-t3-brief.md "почини фикстуру, если она станет
+# невалидной"). export — heredoc фикстуры ЦЕЛИКОМ в одинарных кавычках (<<'EOF' ниже), значит
+# "$TOY_BOOTSTRAP_TESTS_DIR" остаётся ЛИТЕРАЛЬНЫМ текстом в файле и резолвится УЖЕ внутри
+# дочернего процесса теста (не в момент создания фикстуры родительским run.test.sh) — простой
+# способ передать абсолютный путь без порчи остальных '$' внутри heredoc'а. Наследуется в
+# дочерний процесс теста обычным bash-наследованием окружения (run_one НЕ делает env -i).
+export TOY_BOOTSTRAP_TESTS_DIR="$DIR/tests"
+
+# toy-migrated.test.sh — РЕАЛЬНО подключает настоящий tests/lib/bootstrap.sh первой значимой
+# строкой (после `set -u` — допустимая пред-bootstrap директива, см. tests/lib/
+# bootstrap-detect.sh). Раннер ОБЯЗАН выставить все 3 seam-переменные внутри test root,
+# PATH-заглушки обязаны реально перехватывать вызовы (проверяем STUB_LOG).
 cat > "$FIXTURE_DIR/toy-migrated.test.sh" <<'EOF'
 #!/bin/bash
-: <<'BOOTSTRAP_MARKER'
-. "$(dirname "$0")/lib/bootstrap.sh"
-BOOTSTRAP_MARKER
 set -u
+. "$TOY_BOOTSTRAP_TESTS_DIR/lib/bootstrap.sh"
 [ -n "${SYSTEMCTL:-}" ] || { echo "toy-migrated: SYSTEMCTL обязан быть выставлен"; exit 1; }
 [ -n "${DEPT_SYSTEMD_RUN:-}" ] || { echo "toy-migrated: DEPT_SYSTEMD_RUN обязан быть выставлен"; exit 1; }
 [ -n "${TMUX_BIN:-}" ] || { echo "toy-migrated: TMUX_BIN обязан быть выставлен"; exit 1; }
@@ -78,6 +85,25 @@ esac
 [ -n "${RNR_ASKS_DB:-}" ] || { echo "toy-migrated: RNR_ASKS_DB не выставлен"; exit 1; }
 [ "$HOME" != "/home/rainor" ] || { echo "toy-migrated: HOME указывает на боевой домашний каталог"; exit 1; }
 echo "toy-migrated: OK"
+EOF
+
+# toy-bypass-lastline.test.sh — К1 случай 4 (самый критичный по брифу, см. iso-t3-report.md):
+# "упоминает" bootstrap ПОСЛЕДНЕЙ строкой файла, ПОСЛЕ произвольного кода (здесь — безобидного
+# echo, для реального опасного кода конструкция была бы буквально та же). Первая значимая
+# строка — НЕ bootstrap, значит detect_bootstrap_connection обязан признать файл
+# НЕЗАЩИЩЁННЫМ, и раннер НЕ форсит SYSTEMCTL/DEPT_SYSTEMD_RUN/TMUX_BIN (тот же regression-
+# принцип, что toy-legacy, но конкретно на самом опасном из 4 подтверждённых обходов).
+cat > "$FIXTURE_DIR/toy-bypass-lastline.test.sh" <<'EOF'
+#!/bin/bash
+set -u
+echo "toy-bypass-lastline: код ДО псевдо-bootstrap уже выполнился"
+[ -z "${SYSTEMCTL:-}" ] || { echo "toy-bypass-lastline: SYSTEMCTL НЕ должен быть выставлен — bootstrap НЕ первая значимая строка"; exit 1; }
+echo "toy-bypass-lastline: OK"
+exit 0
+# Строка ниже НИКОГДА не исполняется (exit 0 выше) — именно это и демонстрирует К1 случай 4:
+# текстуально файл "подключает" bootstrap, но реально это происходит (если вообще происходит)
+# ПОСЛЕ всего опасного кода, а не до него.
+. tests/lib/bootstrap.sh
 EOF
 
 # toy-fail.test.sh — намеренно падает, для проверки FAIL-агрегации раннера.
@@ -110,8 +136,10 @@ echo "$out" | command grep -q "PASS: tests/toy-legacy.test.sh" || fail "toy-lega
 echo "$out" | command grep -q "PASS: tests/toy-migrated.test.sh" || fail "toy-migrated не помечен PASS: $out"
 echo "$out" | command grep -q "FAIL: tests/toy-fail.test.sh" || fail "toy-fail не помечен FAIL: $out"
 echo "$out" | command grep -q "PASS: tests/toy-pass.test.mjs" || fail ".mjs-тест (node --test) не прошёл через раннер: $out"
-echo "$out" | command grep -q "3 passed, 1 failed, 0 quarantined из 4" \
-  || fail "итоговая сводка не совпала (ожидали 3 passed/1 failed/0 quarantined из 4): $out"
+echo "$out" | command grep -q "toy-bypass-lastline: OK" || fail "toy-bypass-lastline не прошёл: $out"
+echo "$out" | command grep -q "PASS: tests/toy-bypass-lastline.test.sh" || fail "toy-bypass-lastline не помечен PASS: $out"
+echo "$out" | command grep -q "4 passed, 1 failed, 0 quarantined из 5" \
+  || fail "итоговая сводка не совпала (ожидали 4 passed/1 failed/0 quarantined из 5): $out"
 echo "OK: полный прогон fixture — discovery + PASS/FAIL агрегация корректны"
 
 # -----------------------------------------------------------------------------------------
@@ -193,5 +221,79 @@ echo "$out_mixed" | command grep -q "QUARANTINE: tests/asana-project-integration
 echo "$out_mixed" | command grep -q "1 passed, 0 failed, 1 quarantined из 2" \
   || fail "смешанный прогон: сводка не совпала: $out_mixed"
 echo "OK: карантин побеждает даже в смешанном списке с легитимным кандидатом"
+
+# -----------------------------------------------------------------------------------------
+# 8) В2 (ревью T3) — СИМЛИНК на карантинный файл под ДРУГИМ именем ТОЖЕ карантинится (по
+#    realpath, не по имени) — закрывает обход "tests/asana-copy.test.sh -> реальный
+#    tests/asana-project-integration.test.sh под другим именем не попадал под карантин по
+#    ИМЕНИ и физически исполнялся бы". Отдельный fixture-каталог (НЕ FIXTURE_DIR выше) — чтобы
+#    не сбить счётчики сценария 1. Симлинк указывает на РЕАЛЬНЫЙ карантинный файл, но
+#    is_quarantined проверяется ДО mktemp/exec — та же гарантия "физически не запускается",
+#    что и у оригинала под своим именем.
+# -----------------------------------------------------------------------------------------
+SYMLINK_FIXTURE_DIR="$(mktemp -d)"
+ln -s "$DIR/tests/asana-project-integration.test.sh" "$SYMLINK_FIXTURE_DIR/asana-copy-symlink.test.sh"
+out_symlink="$(TESTS_RUN_DIR_OVERRIDE="$SYMLINK_FIXTURE_DIR" "$RUNNER" 2>&1)"
+rc_symlink=$?
+rm -rf "$SYMLINK_FIXTURE_DIR"
+[ "$rc_symlink" -eq 0 ] || fail "симлинк на карантинный файл под другим именем обязан дать rc=0 (карантин, не FAIL): $out_symlink"
+echo "$out_symlink" | command grep -q "QUARANTINE: tests/asana-copy-symlink.test.sh" \
+  || fail "В2: симлинк на карантинный файл под другим именем НЕ пойман (обход по имени всё ещё возможен): $out_symlink"
+echo "$out_symlink" | command grep -q "PASS:\|FAIL:" && fail "В2: симлинк-обход дал попытку исполнения (PASS/FAIL) — карантин не сработал: $out_symlink"
+echo "$out_symlink" | command grep -q "0 passed, 0 failed, 1 quarantined из 1" \
+  || fail "В2: сводка для симлинк-обхода не совпала: $out_symlink"
+echo "OK: В2 — симлинк на карантинный файл под другим именем ТОЖЕ карантинится (realpath, не имя)"
+
+# -----------------------------------------------------------------------------------------
+# 9) В3 (ревью T3, случай "б") — тест, ограничивший права ВНУТРИ своей же песочницы (chmod 000
+#    на подкаталог), НЕ мешает уборке. Раньше `rm -rf` тихо проваливался (нет r+x на locked/,
+#    рекурсия не заходит внутрь), результат нигде не проверялся — теперь `chmod -R u+rwx`
+#    ПЕРЕД `rm -rf` восстанавливает права (мы владелец — это работает независимо от текущего
+#    режима файла) в _cleanup_sandbox. Отдельные fixture/TMPDIR — не сбивают счётчики сценария 1.
+# -----------------------------------------------------------------------------------------
+CHMOD_FIXTURE_DIR="$(mktemp -d)"
+CHMOD_TMPDIR="$(mktemp -d)"
+cat > "$CHMOD_FIXTURE_DIR/toy-chmod-lock.test.sh" <<'EOF'
+#!/bin/bash
+set -u
+mkdir -p "$CLAUDE_CONTROL_TEST_ROOT/locked"
+touch "$CLAUDE_CONTROL_TEST_ROOT/locked/file.txt"
+chmod 000 "$CLAUDE_CONTROL_TEST_ROOT/locked"
+echo "toy-chmod-lock: OK"
+EOF
+out_chmod="$(TESTS_RUN_DIR_OVERRIDE="$CHMOD_FIXTURE_DIR" TMPDIR="$CHMOD_TMPDIR" "$RUNNER" 2>&1)"
+rc_chmod=$?
+[ "$rc_chmod" -eq 0 ] || fail "В3: тест с chmod 000 внутри своей песочницы обязан пройти: $out_chmod"
+echo "$out_chmod" | command grep -q "toy-chmod-lock: OK" || fail "В3: toy-chmod-lock не прошёл: $out_chmod"
+leftover_chmod="$(find "$CHMOD_TMPDIR" -mindepth 1 2>/dev/null | wc -l)"
+rm -rf "$CHMOD_FIXTURE_DIR" "$CHMOD_TMPDIR"
+[ "$leftover_chmod" -eq 0 ] || fail "В3: песочница НЕ убрана после chmod 000 внутри неё — rm -rf молча провалился (leftover=$leftover_chmod)"
+echo "OK: В3 — chmod 000 внутри песочницы не мешает уборке (chmod -R u+rwx перед rm -rf)"
+
+# -----------------------------------------------------------------------------------------
+# 10) В3 (случай "а") — SIGTERM раннеру ПОКА тест ещё выполняется (раннер блокирован в
+#     command substitution, ждёт дочерний sleep) убирает песочницу через trap на EXIT/INT/
+#     TERM, а не оставляет её в $TMPDIR навсегда (раньше — ни одного trap в файле).
+# -----------------------------------------------------------------------------------------
+SIGTERM_FIXTURE_DIR="$(mktemp -d)"
+SIGTERM_TMPDIR="$(mktemp -d)"
+SIGTERM_LOG="$(mktemp)"
+cat > "$SIGTERM_FIXTURE_DIR/toy-sleep-forever.test.sh" <<'EOF'
+#!/bin/bash
+set -u
+sleep 20
+EOF
+TESTS_RUN_DIR_OVERRIDE="$SIGTERM_FIXTURE_DIR" TMPDIR="$SIGTERM_TMPDIR" "$RUNNER" toy-sleep-forever.test.sh \
+  > "$SIGTERM_LOG" 2>&1 &
+runner_pid=$!
+sleep 1
+kill -TERM "$runner_pid" 2>/dev/null
+wait "$runner_pid" 2>/dev/null
+term_rc=$?
+leftover_term="$(find "$SIGTERM_TMPDIR" -mindepth 1 2>/dev/null | wc -l)"
+rm -rf "$SIGTERM_FIXTURE_DIR" "$SIGTERM_TMPDIR" "$SIGTERM_LOG"
+[ "$term_rc" -eq 143 ] || fail "В3: SIGTERM раннеру во время выполнения теста обязан дать rc=143 (128+15), получили $term_rc"
+[ "$leftover_term" -eq 0 ] || fail "В3: SIGTERM раннеру ПОКА тест выполняется оставил песочницу в TMPDIR (leftover=$leftover_term) — trap не сработал"
+echo "OK: В3 — SIGTERM во время выполнения теста убирает песочницу (trap EXIT/INT/TERM)"
 
 echo "PASS run"

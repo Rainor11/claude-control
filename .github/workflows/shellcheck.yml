@@ -40,6 +40,8 @@ jobs:
             tests/process-control.test.sh \
             tests/run \
             tests/lib/bootstrap.sh \
+            tests/lib/bootstrap-detect.sh \
             tests/bootstrap.test.sh \
+            tests/bootstrap-detect.test.sh \
             tests/run.test.sh \
             tests/lint-bootstrap.test.sh
