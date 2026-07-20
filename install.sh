@@ -69,6 +69,11 @@ LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 URL_NOTIFY_UNIT="claude-control-url-notify.service"
 
 BIN_DIR="$PREFIX/bin"
+# LIB_DIR sibling of BIN_DIR (mirrors the repo layout bin/../lib) — bin scripts that
+# `source "$BINDIR/../lib/..."` resolve to the right place under BOTH repo-layout (dev
+# checkout) and install-layout (copy/link install), including through --link symlinks
+# (T1: .superpowers/sdd/iso-t1-brief.md — foundation for lib/runtime-root.{sh,js}).
+LIB_DIR="$PREFIX/lib"
 CONTROL_DIR="$HOME/.claude-control"
 if [[ "$OS_KIND" == "darwin" ]]; then
   UNIT_DIR="$HOME/Library/LaunchAgents"
@@ -149,6 +154,7 @@ fi
 say "OS:       $OS_KIND"
 say "Repo:     $REPO_DIR"
 say "Bin dir:  $BIN_DIR"
+say "Lib dir:  $LIB_DIR"
 say "Units:    $UNIT_DIR"
 say "Runtime:  $CONTROL_DIR"
 if [[ "$OS_KIND" == "darwin" ]]; then
@@ -156,7 +162,7 @@ if [[ "$OS_KIND" == "darwin" ]]; then
 fi
 say "Mode:     $INSTALL_MODE"
 
-run mkdir -p "$BIN_DIR" "$UNIT_DIR" "$CONTROL_DIR"
+run mkdir -p "$BIN_DIR" "$LIB_DIR" "$UNIT_DIR" "$CONTROL_DIR"
 # Tighten CONTROL_DIR so stdout/stderr logs (which may capture claude tokens
 # in error paths) and projects.yaml aren't world-readable.
 run chmod 700 "$CONTROL_DIR"
@@ -200,6 +206,29 @@ done
 # can't satisfy the allow rule. Internal helpers (claude-auto-run/-identity/-heartbeat/
 # -notify/-reconciler) are invoked by the systemd units/hooks via absolute path and stay
 # out of PATH on purpose.
+
+# --- lib files ----------------------------------------------------------------
+# T1 (.superpowers/sdd/iso-t1-brief.md): a bin script that does
+# `. "$BINDIR/../lib/runtime-root.sh"` (BINDIR = its own resolved dirname) only finds it if
+# lib/ sits next to bin/ in BOTH repo-layout and install-layout — install.sh copied bin/
+# scripts but never installed lib/ at all, which would silently break that lookup after a
+# copy-install. No caller does this yet (migration is task T5); installing lib/ now is
+# purely additive so T5 doesn't need a second install.sh change.
+install_lib() {
+  local name="$1"
+  local src="$REPO_DIR/lib/$name"
+  local dst="$LIB_DIR/$name"
+  backup_existing "$dst"
+  if [[ "$INSTALL_MODE" == "link" ]]; then
+    run ln -s "$src" "$dst"
+  else
+    run cp "$src" "$dst"
+  fi
+}
+
+for libfile in runtime-root.sh runtime-root.js; do
+  install_lib "$libfile"
+done
 
 # --- runtime files (examples, idempotent) -----------------------------------
 
