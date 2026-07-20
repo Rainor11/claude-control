@@ -7,10 +7,17 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CA="$DIR/bin/claude-auto"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-export CLAUDE_CONTROL_DIR="$TMP/cc"
-W="$TMP/cc/workers/testw"
+# T4: control-dir ВНУТРЬ test root, когда тест идёт через tests/run. cmd_sleep теперь
+# обёрнут guard'ом процесс-контроля (T4) — под маркером CLAUDE_CONTROL_TEST_ROOT легаси-
+# переменная, указывающая НАРУЖУ test root, справедливо fail-closed'ится резолвером (T1:
+# «утечка боевого окружения в тест»), и `sleep testw` не дошёл бы до заглушки. Кладём cc
+# внутрь маркера → guard резолвит шов в заглушку раннера (внутри root) и `systemctl
+# disable`/`tmux kill` уходят в неё, а не в настоящий бинарь. Вне раннера (маркера нет) —
+# прежний $TMP (тест так же запускается standalone).
+export CLAUDE_CONTROL_DIR="${CLAUDE_CONTROL_TEST_ROOT:-$TMP}/cc"
+W="$CLAUDE_CONTROL_DIR/workers/testw"
 mkdir -p "$W/state" "$W/logs"
-echo '{"workers":{"testw":{"state":"stopped"}}}' > "$TMP/cc/autonomous.json"
+echo '{"workers":{"testw":{"state":"stopped"}}}' > "$CLAUDE_CONTROL_DIR/autonomous.json"
 echo '{"session_id":"x","cwd":"/tmp","permission_mode":"auto"}' > "$W/spec.json"
 STATE="$W/state"
 

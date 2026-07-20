@@ -122,42 +122,33 @@ trap '_on_term_signal TERM' TERM
 # -----------------------------------------------------------------------------------------
 # КАРАНТИН — явный deny-list с причиной (проектное решение, см. отчёт iso-t3-report.md).
 #
-# Почему deny-list, а не что-то "умнее": guard процесс-контроля (T2) существует и покрыт
-# тестами, но пока НЕ подключён ни к одному файлу в bin/, bot/, channels/ — это T4. Значит
-# ЛЮБОЙ тест, который вызывает bin/* код, реально дёргающий systemctl/systemd-run/tmux ПО
-# БАРОЙ КОМАНДЕ (а не через переопределяемый seam), долетает до настоящего бинаря
-# НЕЗАВИСИМО от того, что раннер выставил маркер и заглушки — bin/* их сегодня не
-# консультирует. Песочница (маркер+sentinel+заглушки+HOME) — необходимое, но НЕ достаточное
-# условие безопасности ДО T4. Единственный СЕГОДНЯ подтверждённый чтением кода такой тест —
-# tests/asana-project-integration.test.sh (см. .superpowers/sdd/isolation-plan.md, находка
-# №1): `claude-auto sleep testw` → bin/claude-auto:975-976 делает настоящий
-# `systemctl --user disable --now` + `tmux -L claude-testw kill-session`, оба вызова —
-# ГОЛЫЕ имена команд, guard их не видит и не может увидеть до T4.
+# Механизм остаётся общим: ЛЮБОЙ тест, который вызывает bin/* код, реально дёргающий
+# systemctl/systemd-run/tmux в обход переопределяемого seam guard'а (T2), долетал бы до
+# настоящего бинаря независимо от маркера/заглушек. Такой файл заносится сюда ТЕМ ЖЕ
+# способом (ключ = "tests/<имя>", значение = причина).
 #
-# Карантин проверяется ПЕРВЫМ, ДО построения списка на выполнение — filter_quarantine()
+# СЕЙЧАС СПИСОК ПУСТ. Единственный исторический жилец —
+# tests/asana-project-integration.test.sh — СНЯТ в T4: guard процесс-контроля подключён к
+# bin/claude-auto cmd_sleep (`process_control_systemctl`/`process_control_tmux`), поэтому его
+# `claude-auto sleep testw` под маркером теперь уходит В ЗАГЛУШКУ (доказано логом заглушки в
+# .superpowers/sdd/iso-t4-report.md), а не в настоящий `systemctl --user disable --now` +
+# `tmux kill-session`. Сам тест доработан (control-dir внутрь test root), чтобы guard
+# резолвил шов в заглушку, а не fail-closed'ился на легаси-переменной наружу root.
+#
+# Карантин проверяется ПЕРВЫМ, ДО построения списка на выполнение — is_quarantined
 # вызывается на любом источнике кандидатов (auto-discovery ИЛИ явный аргумент командной
 # строки) и ПОБЕЖДАЕТ даже явное указание файла по имени: раннер спроектирован так, чтобы
 # карантинный файл было ФИЗИЧЕСКИ НЕВОЗМОЖНО запустить через него, а не просто "по
-# умолчанию пропускается, если не попросить иначе". Единственный способ снять карантин —
-# отредактировать этот массив (T4, после подключения guard к cmd_sleep).
-#
-# Это НЕ исчерпывающий аудит всех 23 существующих тестов (см. iso-t3-report.md — статический
-# grep-аудит на systemctl/tmux/install.sh/uninstall.sh не нашёл других файлов, вызывающих
-# реальные бинарные side-effects без собственного мока) — если позже обнаружится ещё один
-# такой файл, он добавляется сюда ТЕМ ЖЕ способом.
+# умолчанию пропускается, если не попросить иначе".
 #
 # В2 (ревью T3) — ЧЕГО ЭТОТ КАРАНТИН НЕ ГАРАНТИРУЕТ (та же честность, что T2 про свой guard,
 # см. lib/process-control.sh «ЧЕГО ЭТОТ GUARD НЕ ГАРАНТИРУЕТ»): is_quarantined проверяет
 # РАСПОЛОЖЕНИЕ/СОДЕРЖИМОЕ файла (имя ИЛИ канонический realpath, см. QUARANTINE_REAL ниже —
-# закрывает симлинк/копию-по-inode под другим именем), а НЕ его БЕЗВРЕДНОСТЬ. Файл с ИЗМЕНЁННЫМ
-# содержимым (не symlink, не byte-for-byte копия — переписанный `cmd_sleep`-вызов под новым
-# именем) карантин НЕ поймает: у него другой canonical path И другое содержимое. Единственная
-# защита от ЭТОГО класса — статический grep-аудит (iso-t3-report.md) плюс PATH-shadow
-# defense-in-depth (см. ниже, ловит ГОЛЫЕ имена команд независимо от карантина). T4/T5 не
-# должны считать карантин сильнее, чем он есть.
-declare -A QUARANTINE=(
-  [tests/asana-project-integration.test.sh]="claude-auto sleep testw → bin/claude-auto cmd_sleep делает настоящий 'systemctl --user disable --now' + 'tmux -L claude-testw kill-session' (голые имена команд, guard T2 к bin/* ещё не подключён — это T4). Снимается в T4 после подключения guard к cmd_sleep/cmd_stop."
-)
+# закрывает симлинк/копию-по-inode под другим именем), а НЕ его БЕЗВРЕДНОСТЬ. Единственная
+# защита от переписанного-под-новым-именем side-effect — статический grep-аудит
+# (iso-t3-report.md) плюс PATH-shadow defense-in-depth (см. ниже, ловит ГОЛЫЕ имена команд
+# независимо от карантина). T4/T5 не должны считать карантин сильнее, чем он есть.
+declare -A QUARANTINE=()
 
 # QUARANTINE_REAL — канонические (realpath) абсолютные пути карантинных файлов, вычисленные
 # от их РЕАЛЬНОГО расположения в tests/ репозитория (карантинный файл физически лежит только
@@ -169,16 +160,31 @@ declare -A QUARANTINE=(
 # быстрая проверка по имени (частый случай, без обращения к ФС), затем по realpath (закрывает
 # симлинк/копию-по-inode).
 declare -A QUARANTINE_REAL=()
-for _q_rel in "${!QUARANTINE[@]}"; do
-  # _RUN_REPO_DIR — корень репозитория (НЕ tests/), _q_rel уже содержит префикс "tests/" —
-  # конкатенация НАПРЯМУЮ, без strip (в отличие от run_one::abs, который строится от
-  # _RUN_TESTS_DIR, а не от _RUN_REPO_DIR).
-  _q_abs="$_RUN_REPO_DIR/$_q_rel"
-  if [ -e "$_q_abs" ]; then
-    _q_real="$(realpath -e "$_q_abs" 2>/dev/null)" && QUARANTINE_REAL["$_q_real"]="${QUARANTINE[$_q_rel]}"
-  fi
-done
-unset _q_rel _q_abs _q_real
+_build_quarantine_real() {
+  local rel abs real
+  for rel in "${!QUARANTINE[@]}"; do
+    # _RUN_REPO_DIR — корень репозитория (НЕ tests/), rel уже содержит префикс "tests/" —
+    # конкатенация НАПРЯМУЮ, без strip (в отличие от run_one::abs, который строится от
+    # _RUN_TESTS_DIR, а не от _RUN_REPO_DIR).
+    abs="$_RUN_REPO_DIR/$rel"
+    if [ -e "$abs" ]; then
+      real="$(realpath -e "$abs" 2>/dev/null)" && QUARANTINE_REAL["$real"]="${QUARANTINE[$rel]}"
+    fi
+  done
+}
+
+# Тест-шов (используется ТОЛЬКО tests/run.test.sh — тот же класс, что TESTS_RUN_DIR_OVERRIDE
+# выше): QUARANTINE_TEST_ADD добавляет ОДИН карантинный ключ, чтобы проверить МЕХАНИКУ карантина
+# (имя/realpath/приоритет над явным аргументом), не завися от конкретного боевого жильца. После
+# T4 боевой список QUARANTINE ПУСТ — asana-project-integration снят (guard процесс-контроля
+# подключён к claude-auto cmd_sleep), и проверять механику стало не на чем без такого шва. Шов
+# ТОЛЬКО ДОБАВЛЯЕТ запись (никогда не убирает) — ослабить боевую защиту им нельзя; в проде
+# переменная не выставлена, поведение не меняется вовсе (как у TESTS_RUN_DIR_OVERRIDE).
+if [ -n "${QUARANTINE_TEST_ADD:-}" ]; then
+  QUARANTINE["$QUARANTINE_TEST_ADD"]="тест-шов QUARANTINE_TEST_ADD: искусственный карантин для проверки механики (tests/run.test.sh) — эмулирует случай 'claude-auto sleep → настоящий systemctl disable' до подключения guard'а"
+fi
+_build_quarantine_real
+unset -f _build_quarantine_real
 
 usage() {
   cat <<'EOF'
