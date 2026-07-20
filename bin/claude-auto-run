@@ -18,6 +18,17 @@
 # Subsequent starts just --resume <W>, so restarts continue the SAME session.
 set -u
 
+# T4: guard процесс-контроля (lib/process-control.sh, задача T2) — оборачивает вызовы tmux
+# ниже (per-worker сокет claude-<name> общий с боевым флотом). Резолв через readlink -f:
+# юнит запускает нас полным путём __BIN_DIR__/claude-auto-run, но через symlink тоже должно
+# работать; lib лежит в ../lib и в repo-, и в install-layout (сделано в T1). Это ГОРЯЧИЙ путь
+# подъёма воркера — source библиотеки лишь определяет функции (без побочных эффектов) и не
+# меняет поведение без маркера.
+_CAR_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_CAR_BIN_DIR="$(cd "$(dirname "$_CAR_SELF")" && pwd)"
+# shellcheck disable=SC1091
+. "$_CAR_BIN_DIR/../lib/process-control.sh"
+
 CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 WORKERS_DIR="$CONTROL_DIR/workers"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
@@ -128,7 +139,7 @@ if [ -f "$trust_cfg" ] && command -v jq >/dev/null 2>&1; then
 fi
 
 # Already running? Then just attach our lifetime to it (don't double-launch).
-if tmux -L "$sess" has-session -t "$sess" 2>/dev/null; then
+if process_control_tmux "$name" has-session -t "$sess" 2>/dev/null; then
   say "tmux session $sess already running — supervising existing"
 else
   # Build claude argv.
@@ -247,11 +258,21 @@ else
   # ONLY our own worker orphan — never an unrelated default-socket session that merely shares
   # the name, e.g. a claude-rc project session (also named claude-<x>; it sets CCR_*, never
   # CLAUDE_AUTO_NAME). A harmless no-op once no worker uses the default socket.
-  if [ "$(TMUX= tmux show-environment -t "$sess" CLAUDE_AUTO_NAME 2>/dev/null)" = "CLAUDE_AUTO_NAME=$name" ]; then
-    TMUX= tmux kill-session -t "$sess" 2>/dev/null || true
-    say "reaped stale default-socket orphan $sess (pre-per-socket migration)"
+  # T4: этот reap адресует ДЕФОЛТНЫЙ tmux-сокет (без -L; TMUX= обнуляет унаследованный) — он
+  # ОБЩИЙ с реальным tmux оператора. Обернуть в process_control_tmux НЕЛЬЗЯ: тот форсит свой
+  # сокет (-L claude-<name> / -S <root>/tmux.sock) и сменил бы адресацию default→named,
+  # сломав смысл reap'а БЕЗ маркера. Поэтому под тестовым маркером блок ПРОПУСКАЕТСЯ (в
+  # песочнице легаси-сессии на дефолтном сокете нет и быть не может — kill там мог бы задеть
+  # настоящую сессию claude-<name>); без маркера — выполняется побитово как раньше. Гейт —
+  # тем же резолвером маркера, что и весь guard (пустой stdout при rc 0 = маркера нет).
+  _car_test_root="$(_process_control_test_root)" && _car_resolver_ok=1 || _car_resolver_ok=0
+  if [ "$_car_resolver_ok" = 1 ] && [ -z "$_car_test_root" ]; then
+    if [ "$(TMUX= tmux show-environment -t "$sess" CLAUDE_AUTO_NAME 2>/dev/null)" = "CLAUDE_AUTO_NAME=$name" ]; then
+      TMUX= tmux kill-session -t "$sess" 2>/dev/null || true
+      say "reaped stale default-socket orphan $sess (pre-per-socket migration)"
+    fi
   fi
-  tmux -L "$sess" new-session -d -s "$sess" -c "$cwd" \
+  process_control_tmux "$name" new-session -d -s "$sess" -c "$cwd" \
     -e "EVENT_BRIDGE_CONFIG=$home/event-bridge.config.json" \
     -e "EVENT_BRIDGE_STATE_DIR=$home/state" \
     -e "CLAUDE_AUTO_NAME=$name" \
@@ -321,7 +342,7 @@ WEDGE_MIN="${CLAUDE_AUTO_WEDGE_MINUTES:-15}"
 [[ "$WEDGE_MIN" =~ ^[0-9]+$ ]] || WEDGE_MIN=15   # sanitize env override
 maybe_alert_wedged() {
   local pane tail sig now osig first alerted
-  pane="$(tmux -L "$sess" capture-pane -pt "$sess" 2>/dev/null)" || return 0
+  pane="$(process_control_tmux "$name" capture-pane -pt "$sess" 2>/dev/null)" || return 0
   # A running turn ('esc to interrupt') is progress, NOT a wedge → reset and bail.
   if printf '%s' "$pane" | grep -qiE 'esc to interrupt'; then rm -f "$WEDGE_FLAG" 2>/dev/null; return 0; fi
   # Look ONLY at the active bottom region — a blocking dialog always lives at the input
@@ -356,7 +377,7 @@ $excerpt"
 # Block until the session ends. This keeps the systemd unit's main process alive
 # for the worker's lifetime; when claude exits/crashes the loop returns, the unit
 # exits, and Restart=always brings it back (resuming the pinned session).
-while tmux -L "$sess" has-session -t "$sess" 2>/dev/null; do
+while process_control_tmux "$name" has-session -t "$sess" 2>/dev/null; do
   flip_seeded_if_ready
   maybe_alert_wedged
   maybe_compact
