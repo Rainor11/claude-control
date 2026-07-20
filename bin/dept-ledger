@@ -306,31 +306,33 @@ function cmdSend(a) {
   const from = a.actor || process.env.CLAUDE_AUTO_NAME || 'operator';
   const reg = readRegistry();
   const roleOf = (n) => (reg.workers[n] || {}).role;
+  // Anti-spoof identity guard — изначально стоял ТОЛЬКО на policy_refresh (Codex-крит канона
+  // фазы 4, находка 2; добито /bug ф4 паритетом с N1), расширен на ВСЕ типы шины (задача
+  // 20.07): обычное сообщение (question/proposal/handoff/incident/kb_change_request/
+  // decision_request) воркер мог отправить с --actor <чужое-имя> или
+  // `CLAUDE_AUTO_NAME=<чужое-имя> send` (без --actor) — тем же приёмом, что раньше подделывал
+  // только policy_refresh. Это же попутно обходило МК→МК бан ниже: он проверяет roleOf(from),
+  // а from при спуфинге — ЗАЯВЛЕННОЕ имя (например, «руководитель»), не настоящий отправитель —
+  // МК мог представиться dept-head и написать другому МК напрямую. Гард стоит ДО МК→МК/§5-
+  // проверок намеренно: если вызов реально из сессии воркера (callerWorkerName() !== null),
+  // РЕЗОЛВНУТАЯ identity from (a.actor || CLAUDE_AUTO_NAME || 'operator' — то, что реально
+  // уйдёт в data.from) обязана совпасть с реальным именем — тогда все проверки ниже уже видят
+  // настоящего отправителя, спуфинг невозможен структурно, не «залатан по одному типу».
+  // Раннеры/оператор/тесты (callerWorkerName() === null) гард не касается — --actor работает
+  // как раньше (см. dept-planerka-exec/dept-rebase-check/dept-dispatcher).
+  const realCaller = callerWorkerName();
+  if (realCaller && from !== realCaller) {
+    die(`send: отправка от чужого имени запрещена — сообщение уходит от того, кто его шлёт (ты «${realCaller}»)`);
+  }
   if (roleOf(from) === 'мк' && roleOf(a.to) === 'мк') {
     die('send: прямое сообщение МК→МК запрещено (policy 3.1) — отправь question руководителю');
   }
-  // Codex-крит (канон фазы 4, находка 2; добито /bug ф4: паритет с N1): policy_refresh шлёт
-  // только исполнитель планёрки (systemd-раннер dept-planerka-exec, НЕ сессия воркера) и
-  // Руководитель — напоминание молчунам (policy-v9 п. 3.1/8.5). cmdSend раньше ограничивал
-  // только адресата (§5 ниже), отправителя — никак: любой воркер мог разослать policy_refresh,
-  // в т.ч. подделав --actor dept-head. Гард — тот же /proc, что у policy-ack: если вызов
-  // реально из сессии воркера — (а) отправитель обязан быть Руководителем, (б) РЕЗОЛВНУТАЯ
-  // identity from (a.actor || CLAUDE_AUTO_NAME || 'operator' — то, что реально уйдёт в
-  // data.from) обязана совпасть с реальным именем. Сравнение именно from, не сырого --actor —
-  // иначе `CLAUDE_AUTO_NAME=<чужое-имя> send --type policy_refresh` (без --actor) подделывал
-  // отправителя рассылки молча (ровно дыра N1 финального ревью, только в send). Раннер
-  // планёрки НЕ воркер-сессия (callerWorkerName() === null) — его data.from=dept-head
-  // продолжает работать без правок.
-  if (a.type === 'policy_refresh') {
-    const realCaller = callerWorkerName();
-    if (realCaller) {
-      if (roleOf(realCaller) !== 'руководитель') {
-        die('send: policy_refresh шлёт исполнитель планёрки или Руководитель (policy 3.1/8.5)');
-      }
-      if (from !== realCaller) {
-        die(`send: отправка policy_refresh за другого запрещена — шли от своего имени (ты «${realCaller}»)`);
-      }
-    }
+  // policy_refresh — доп. ролевое ограничение (policy-v9 п. 3.1/8.5): шлёт только исполнитель
+  // планёрки (systemd-раннер dept-planerka-exec, НЕ сессия воркера) или Руководитель —
+  // напоминание молчунам. Identity уже проверена гардом выше (общий для всех типов) — здесь
+  // остаётся только ролевая часть, эксклюзивная для policy_refresh.
+  if (a.type === 'policy_refresh' && realCaller && roleOf(realCaller) !== 'руководитель') {
+    die('send: policy_refresh шлёт исполнитель планёрки или Руководитель (policy 3.1/8.5)');
   }
   // policy_refresh — рассылка планёрки «перечитай policy-vN + ack» (фаза 4): Руководитель
   // перечитывает правила наравне со всеми, поэтому исключён из фильтра §5. Остальные
