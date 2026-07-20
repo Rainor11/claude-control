@@ -40,6 +40,16 @@
 #   process_control_preflight systemd_run || exit 1   # ДО мутации реестра/леджера
 #   ...
 #   process_control_systemctl --user restart "claude-auto@$name.service"
+#
+# М1 (ревью T2) — ЧЕГО ЭТОТ GUARD НЕ ГАРАНТИРУЕТ: containment (`_runtime_root_contained`)
+# проверяет ТОЛЬКО РАСПОЛОЖЕНИЕ заглушки/каталога (лежит ли внутри test root), а НЕ её
+# БЕЗВРЕДНОСТЬ. `cp /usr/bin/systemctl "$test_root/fake-systemctl"` пройдёт проверку — это
+# буквально настоящий systemctl, просто скопированный внутрь test root. Guard закрывает
+# конкретно найденные векторы (asana-project-integration.test.sh дотягивался до боевого
+# systemd мимо любой заглушки; инцидент 20.07 писал unit-файл в обход systemctl вовсе), а НЕ
+# "что угодно под маркером безопасно исполнить". T4/T5 (подключение guard'а к bin/*, будущие
+# задачи) не должны считать эту проверку сильнее, чем она есть — ответственность за то, ЧТО
+# именно оказывается заглушкой, остаётся на тестовом раннере.
 
 # Находим свой каталог через BASH_SOURCE (не $0!) — эта библиотека сама source'ит соседний
 # lib/runtime-root.sh, и при `source process-control.sh` из чужого скрипта $0 указывал бы на
@@ -125,13 +135,19 @@ process_control_systemd_run_setenv_argv() {
 # через слой A и решения через слой B).
 # ---------------------------------------------------------------------------------------
 
-# _process_control_check_binary_seam <var_name> <value> — под маркером: <value> обязан
+# process_control_check_binary_seam <var_name> <value> — под маркером: <value> обязан
 # резолвиться (command -v — поддерживает и голое имя из PATH, и абсолютный путь) в
 # исполняемый файл, и этот файл (ПОСЛЕ realpath — символическая ссылка на боевой бинарь
 # ВНУТРИ test root обязана быть поймана, не только буквальный путь) обязан лежать ВНУТРИ
 # test root. Без маркера — не проверяет НИЧЕГО (прод-путь, идентичный сегодняшнему —
 # guard не добавляет новых отказов там, где раньше их не было).
-_process_control_check_binary_seam() {
+#
+# М3 (ревью T2): публичная (была `_process_control_check_binary_seam`) — паритет с JS-стороной,
+# где `checkBinarySeam` экспортирован из module.exports с самого начала. Для T4-миграции
+# bash-кода, который продолжает сам вычислять свой шов (тот же резон, что у уже публичной
+# `process_control_check_unit_dir` рядом с `process_control_unit_dir`), нужен эквивалент —
+# приватность здесь была не осознанным решением, а случайной асимметрией с JS.
+process_control_check_binary_seam() {
   local var_name="$1" value="$2" test_root resolved
   test_root="$(_process_control_test_root)" || return 1
   [ -n "$test_root" ] || return 0
@@ -161,13 +177,13 @@ process_control_preflight() {
   local class="${1:-}"
   case "$class" in
     systemctl)
-      _process_control_check_binary_seam SYSTEMCTL "${SYSTEMCTL:-systemctl}"
+      process_control_check_binary_seam SYSTEMCTL "${SYSTEMCTL:-systemctl}"
       ;;
     systemd_run)
-      _process_control_check_binary_seam DEPT_SYSTEMD_RUN "${DEPT_SYSTEMD_RUN:-systemd-run}"
+      process_control_check_binary_seam DEPT_SYSTEMD_RUN "${DEPT_SYSTEMD_RUN:-systemd-run}"
       ;;
     tmux)
-      _process_control_check_binary_seam TMUX_BIN "${TMUX_BIN:-tmux}"
+      process_control_check_binary_seam TMUX_BIN "${TMUX_BIN:-tmux}"
       ;;
     unit_dir)
       process_control_unit_dir >/dev/null
@@ -192,32 +208,118 @@ process_control_systemctl() {
 # (НЕ переменная `TMUX` — её выставляет сам tmux изнутри активной сессии в
 # `<сокет>,<pid>,<индекс>`, использовать это имя под своё переопределение означало бы либо
 # конфликтовать с реальным tmux-окружением вызывающего, либо срабатывать по чужому
-# случайному значению). Адресация сокета — через process_control_tmux_socket_argv (слой B):
-# без маркера `-L claude-<name>` (сегодняшнее bin/claude-auto-run:81), под маркером единый
-# `-S "<root>/tmux.sock"`.
+# случайному значению). Адресация сокета: без маркера `-L claude-<name>` (сегодняшнее
+# bin/claude-auto-run:81), под маркером единый `-S "<root>/tmux.sock"`.
+#
+# К2 (ревью T2): argv сокета строится ПРЯМО ЗДЕСЬ инлайновым `if`, а НЕ через
+# `process_control_tmux_socket_argv` + `while read -r line; do sock_args+=("$line"); done`
+# (было раньше). Построчный транспорт через `read` РЕЖЕТ вывод по `\n` — если `name` содержит
+# ВСТРОЕННЫЙ перевод строки (например `$'a\nkill-server'`), значение "claude-$name" вместо
+# ОДНОГО argv-элемента с `\n` внутри превращается в ДВА отдельных элемента, и вторая "строка"
+# (`kill-server`) долетает до tmux как ПОЗИЦИОННЫЙ аргумент — argv-инъекция вместо простого
+# искажения имени сессии (проверено ревьюером: `tmux -L claude-a kill-server list-sessions`).
+# `process_control_tmux_socket_argv` остаётся как чистая функция для фикстуры/кросс-проверки
+# с JS (`tmuxSocketArgv` строит массив нативно, без транспорта через текст, поэтому у неё
+# этого бага никогда не было) — но РЕАЛЬНЫЙ вызов её больше не использует.
+#
+# Валидация charset `name` — тот же паттерн, что `bin/claude-auto:78,486,649`
+# (`^[a-zA-Z0-9_-]+$`) — fail-closed ДО построения argv: без неё встроенный `\n` (или другой
+# спецсимвол) в имени воротился бы в argv буквально (exec через массив, не через `eval`, так
+# что shell-инъекции как таковой нет, но искажение argv само по себе уже нежелательно —
+# и после этого фикса единственный канал распространения имени тоже устранён).
+#
+# В1 (ревью T2): guard прежде НЕ владел своим argv — "$@" вызывающего шёл ПОСЛЕ наших
+# sock_args, и если вызывающий (по ошибке или инъекции) добавлял СВОЙ -L/-S, оба долетали до
+# tmux. Повтор ОДНОИМЁННОГО флага в getopt-разборе — "последний побеждает", а `-S` вдобавок
+# ещё и молча гасит предшествующий `-L` (man tmux: "If -S is specified... any -L flag is
+# ignored") — оба случая переопределяют адресацию, которую guard обязан гарантировать под
+# маркером (проверено ревьюером: `fake-tmux -S <root>/tmux.sock -S /tmp/GLOBAL-prod.sock ...`).
+# Сканируем "$@" ДО вызова бинаря и отказываем явно, а не полагаемся, что вызывающий никогда
+# так не сделает.
 process_control_tmux() {
   local name="${1:?process_control_tmux: usage: process_control_tmux <name> [tmux-args...]}"
   shift
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || {
+    echo "process-control: process_control_tmux: имя воркера '$name' содержит недопустимые символы (разрешено [a-zA-Z0-9_-])" >&2
+    return 1
+  }
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -L|-L*|-S|-S*)
+        echo "process-control: process_control_tmux не принимает -L/-S от вызывающего — сокет назначает guard, передайте только tmux-команду и её аргументы (получено: '$arg')" >&2
+        return 1
+        ;;
+    esac
+  done
   process_control_preflight tmux || return 1
   local test_root
   test_root="$(_process_control_test_root)" || return 1
-  local -a sock_args=()
-  while IFS= read -r line; do sock_args+=("$line"); done < <(process_control_tmux_socket_argv "$name" "$test_root")
+  local -a sock_args
+  if [ -n "$test_root" ]; then
+    sock_args=(-S "$test_root/tmux.sock")
+  else
+    sock_args=(-L "claude-$name")
+  fi
   "${TMUX_BIN:-tmux}" "${sock_args[@]}" "$@"
 }
 
 # process_control_systemd_run <args...> — прокси на переопределяемый шов DEPT_SYSTEMD_RUN
 # (прецедент bin/dept-dispatcher:185: SYSTEMD_RUN = process.env.DEPT_SYSTEMD_RUN ||
 # 'systemd-run'). Под маркером ПРЕПЕНДИТ --setenv CLAUDE_CONTROL_TEST_ROOT=<root> ПЕРЕД
-# аргументами вызывающего (см. process_control_systemd_run_setenv_argv) — маркер обязан
-# долететь до transient-юнита, иначе вложенный процесс потеряет защиту (см. шапку файла,
-# проблема №4). Без маркера argv не меняется — поведение идентично прямому вызову.
+# аргументами вызывающего — маркер обязан долететь до transient-юнита, иначе вложенный
+# процесс потеряет защиту (см. шапку файла, проблема №4). Без маркера argv не меняется —
+# поведение идентично прямому вызову.
+#
+# К2 (ревью T2): argv строится ПРЯМО ЗДЕСЬ (не через read-loop транспорт из
+# `process_control_systemd_run_setenv_argv`, см. подробное обоснование у process_control_tmux
+# выше — та же построчная уязвимость применима и здесь, если `test_root` когда-либо содержал
+# бы встроенный перевод строки: технически допустимо в имени каталога Linux, хоть и экзотично).
+#
+# В1 (ревью T2): guard прежде НЕ владел своим argv — сканируем "$@" на ДВА независимых вектора
+# инъекции env ДО вызова бинаря:
+#  1) повторный --setenv/-E С ИМЕНЕМ НАШЕГО МАРКЕРА — systemd-run берёт последнее значение
+#     одноимённой переменной (man systemd-run: "--setenv может повторяться"), а наш --setenv
+#     стоит ПЕРВЫМ — одноимённый после него победил бы и подменил test root (проверено
+#     ревьюером: `fake-sdrun --setenv CLAUDE_CONTROL_TEST_ROOT=<root> --setenv
+#     CLAUDE_CONTROL_TEST_ROOT=/home/rainor/.claude-control`). Другие --setenv (для СВОИХ
+#     переменных вызывающего) разрешены — легитимный сценарий T4 (передать задаче env).
+#  2) -p/--property Environment=... — независимый способ присвоить env transient-юниту,
+#     которым НАШ КОД не пользуется вовсе — блокируем флаг целиком, не разбирая содержимое
+#     (Environment= может нести несколько присваиваний через пробел в одной строке).
 process_control_systemd_run() {
+  local arg prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      --setenv|-E)
+        case "$arg" in
+          CLAUDE_CONTROL_TEST_ROOT=*)
+            echo "process-control: process_control_systemd_run — вызывающему запрещено переопределять CLAUDE_CONTROL_TEST_ROOT через --setenv (маркер назначает guard, получено '$arg')" >&2
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+    case "$arg" in
+      --setenv=CLAUDE_CONTROL_TEST_ROOT=*|-E=CLAUDE_CONTROL_TEST_ROOT=*|-ECLAUDE_CONTROL_TEST_ROOT=*)
+        echo "process-control: process_control_systemd_run — вызывающему запрещено переопределять CLAUDE_CONTROL_TEST_ROOT через --setenv (получено '$arg')" >&2
+        return 1
+        ;;
+      -p*|--property*)
+        echo "process-control: process_control_systemd_run не принимает -p/--property от вызывающего (Environment= — зарезервированный вектор для маркера, guard блокирует весь флаг целиком) — получено '$arg'" >&2
+        return 1
+        ;;
+    esac
+    prev="$arg"
+  done
+
   process_control_preflight systemd_run || return 1
   local test_root
   test_root="$(_process_control_test_root)" || return 1
   local -a setenv_args=()
-  while IFS= read -r line; do setenv_args+=("$line"); done < <(process_control_systemd_run_setenv_argv "$test_root")
+  if [ -n "$test_root" ]; then
+    setenv_args=(--setenv "CLAUDE_CONTROL_TEST_ROOT=$test_root")
+  fi
   "${DEPT_SYSTEMD_RUN:-systemd-run}" "${setenv_args[@]}" "$@"
 }
 

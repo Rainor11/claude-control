@@ -1,0 +1,5 @@
+[
+  { "class": "systemctl", "varName": "SYSTEMCTL", "defaultBin": "systemctl" },
+  { "class": "systemd_run", "varName": "DEPT_SYSTEMD_RUN", "defaultBin": "systemd-run" },
+  { "class": "tmux", "varName": "TMUX_BIN", "defaultBin": "tmux" }
+]
