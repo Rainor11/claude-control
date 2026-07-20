@@ -44,6 +44,12 @@ if [ -n "$approval" ]; then
   note="$(jq -r '.note // empty' <<<"$request_json")"
 fi
 [[ "$name" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad name '$name'"
+# M6: 'watchdog' зарезервировано системой — сторож пишет actor=watchdog в журнал
+# (dept-liveness-request/-exec, claude-auto-liveness), и dept-dispatcher/dept-inbox доверяют
+# этой строке как признаку подлинности (data.from === 'watchdog'). Воркер с таким именем
+# прошёл бы callerWorkerName() как ГЕНУИННЫЙ watchdog, а не подделка — см. RESERVED_WORKER_NAMES
+# в bin/claude-auto (там же настоящий гейт создания; здесь — fail-fast до записи скелета папки).
+[ "$name" != "watchdog" ] || die "имя 'watchdog' зарезервировано системой (сторож пишет actor=watchdog в журнал) — выбери другое"
 [[ "$client" =~ ^[a-zA-Zа-яё0-9-]{1,60}$ ]] || die "bad client slug '$client'"
 [[ "$gid" =~ ^[0-9]{6,}$ ]] || die "bad asana gid '$gid'"
 [ -n "$url" ] || url="https://app.asana.com/0/0/$gid"

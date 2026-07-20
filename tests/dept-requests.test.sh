@@ -59,6 +59,12 @@ out3="$(DEPT_APPROVE_TEST_ACTOR=test-head "$SANDBOX/dept-spawn-request" --client
   && fail "заявка с занятым именем прошла"
 echo "$out3" | grep -q 'занято' || fail "отказ по занятому имени без пояснения"
 
+# ---- 3b) M6: имя 'watchdog' зарезервировано системой (сторож пишет actor=watchdog в
+#         журнал) — fail-fast на этапе заявки, до аппрува и до dept-spawn-exec -------------
+out3b="$(DEPT_APPROVE_TEST_ACTOR=test-head "$SANDBOX/dept-spawn-request" --client тест --name watchdog --asana-gid 7654322 2>&1)" \
+  && fail "заявка на имя 'watchdog' прошла (зарезервировано системой)"
+echo "$out3b" | command grep -q 'зарезервировано' || fail "отказ по 'watchdog' без пояснения про резервирование"
+
 # ---- 4) dept-spawn-exec: рендер-часть с фейковым claude-auto (реальный bin/, не SANDBOX —
 #         скрипту нужен REPO=bin/.. с настоящими examples/department/*.template.*) ----------
 RENDER_DEPT_HOME="$(mktemp -d)"
@@ -109,6 +115,15 @@ CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_C
   --asana-url 'https://app.asana.com/0/0/1112223' --note 'клиент любит скорость' \
   || fail "повторный dept-spawn-exec (идемпотентность) упал"
 [ "$(grep -c 'CA_CALLED' "$FAKE_CA_LOG")" = "2" ] || fail "fake claude-auto должен быть вызван дважды (bootstrap идемпотентен, а не no-op)"
+
+# ---- 4b) M6: dept-spawn-exec (прямые флаги, второй забор после dept-spawn-request) —
+#         имя 'watchdog' отвергается ДО любых побочных эффектов (fake claude-auto НЕ звался) --
+: > "$FAKE_CA_LOG"
+out4b="$(CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
+  "$DIR/bin/dept-spawn-exec" --client rendertest --name watchdog --asana-gid 1112224 2>&1)" \
+  && fail "dept-spawn-exec создал воркера 'watchdog' (зарезервировано системой)"
+echo "$out4b" | command grep -q 'зарезервировано' || fail "dept-spawn-exec: отказ по 'watchdog' без пояснения"
+[ -s "$FAKE_CA_LOG" ] && fail "dept-spawn-exec вызвал claude-auto ДО отказа по зарезервированному имени"
 
 # ---- 5) dept-sleep-request: не-мк отвергается; валидная заявка проходит --------------
 "$DL" registry-set test-notmk --role тп >/dev/null

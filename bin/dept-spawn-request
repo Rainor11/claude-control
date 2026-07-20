@@ -63,6 +63,10 @@ role="$(role_of "$actor")"
 [ -n "$client" ] && [ -n "$name" ] && [ -n "$gid" ] \
   || die "usage: dept-spawn-request --client <slug> --name <mk-имя> --asana-gid <GID> [--asana-url <url>] [--note '<s>']"
 [[ "$name" =~ ^[a-zA-Z0-9_-]{1,40}$ ]] || die "bad --name '$name' (нужен [a-zA-Z0-9_-]{1,40})"
+# M6: fail-fast — не тратить цикл заявка→аппрув на имя, которое всё равно отклонит exec
+# (bin/dept-spawn-exec) / claude-auto (RESERVED_WORKER_NAMES). 'watchdog' зарезервировано
+# системой (сторож пишет actor=watchdog в журнал).
+[ "$name" != "watchdog" ] || die "имя 'watchdog' зарезервировано системой (сторож пишет actor=watchdog в журнал) — выбери другое"
 [[ "$client" =~ ^[a-zа-яё0-9-]{1,60}$ ]] || die "bad --client '$client' (нужен [a-zа-яё0-9-]{1,60})"
 [[ "$gid" =~ ^[0-9]{6,}$ ]] || die "bad --asana-gid '$gid' (нужны цифры, ≥6 знаков)"
 [ -n "$url" ] || url="https://app.asana.com/0/0/$gid"

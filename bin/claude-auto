@@ -77,6 +77,17 @@ mcp_catalog() {  # echo the catalog object ({} if unreadable/absent)
 }
 mcp_valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }  # same charset as MCP server keys
 
+# M6 (Codex-аудит): names the ledger writes as actor= for the SYSTEM itself, not a worker
+# session — currently just the liveness watchdog (bin/claude-auto-liveness, bin/dept-liveness-request:
+# `--actor watchdog`, checked verbatim by dept-dispatcher pickExecutable / dept-inbox for
+# liveness_restart). A worker literally named 'watchdog' would pass callerWorkerName()
+# (the /proc-based identity resolver used to gate privileged writes) as a genuinely, not
+# spoofed, watchdog-identified caller — indistinguishable from the real sentinel in the
+# journal and able to satisfy the naive `data.from === 'watchdog'` string check. Reserve the
+# name at every worker-creation gate (adopt/spawn here; dept-spawn-request/-exec mirror it).
+RESERVED_WORKER_NAMES=(watchdog)
+name_reserved() { local n; for n in "${RESERVED_WORKER_NAMES[@]}"; do [ "$1" = "$n" ] && return 0; done; return 1; }
+
 # Identity + event-bridge awareness sections for a worker's CLAUDE.md (the STATIC
 # base layer; the dynamic, live-probe-list version is the SessionStart hook
 # claude-auto-identity). Shared by `adopt` (fresh worker) and `upgrade` (retrofit
@@ -474,6 +485,7 @@ cmd_adopt() {
   [ -n "$name" ] || die "adopt: --name <name> required"
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "adopt: name must be [a-zA-Z0-9_-]"
   [ "${#name}" -le 40 ] || die "adopt: --name too long (max 40 chars)"  # keep in sync with RnR bot _WORKER_RE
+  name_reserved "$name" && die "adopt: name '$name' is reserved (the liveness watchdog writes actor=$name to the ledger) — pick another"
   [ -d "$cwd" ] || die "adopt: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"  # absolutize
 
@@ -636,6 +648,7 @@ cmd_spawn() {
   [ -n "$mission_file" ] && [ -f "$mission_file" ] || die "spawn: --mission-file обязателен и должен существовать"
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "spawn: name must be [a-zA-Z0-9_-]"
   [ "${#name}" -le 40 ] || die "spawn: --name too long (max 40)"
+  name_reserved "$name" && die "spawn: name '$name' is reserved (the liveness watchdog writes actor=$name to the ledger) — pick another"
   [ -d "$cwd" ] || die "spawn: cwd does not exist: $cwd"
   cwd="$(cd "$cwd" && pwd)"
   local home="$WORKERS_DIR/$name"
