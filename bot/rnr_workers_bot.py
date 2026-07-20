@@ -981,11 +981,19 @@ async def process_approval(bot: Bot, row):
         # инжектим исход воркеру — он сам её отозвал, сообщать ему нечего. Схема approvals
         # не хранит исходный HTML карточки (нет card_html) — перерисовываем через
         # render_approval(row), как и присылали изначально в card_sender_loop.
-        # notified_at ставим ВСЕГДА (даже если оба edit ниже упали) — иначе
-        # next_actionable() крутил бы эту строку в exec_loop вечно.
+        #
+        # M8 (Codex-аудит): раньше notified_at ставился ВСЕГДА, даже если ОБА edit ниже
+        # упали — next_actionable() переставал крутить строку (это верно), но карточка
+        # навсегда оставалась с живыми кнопками (нажатие безопасно отбивается SQLite-claim,
+        # но оператор видит мусор и не видит причину отзыва). Ограниченный ретрай на том же
+        # attempts/APPR_MAX_ATTEMPTS, что уже используют denied/approved-ветки выше — оба
+        # edit идемпотентны (тот же текст/reply_markup=None), повтор безопасен. После
+        # исчерпания — mark_notified (строка обязана уйти из next_actionable за конечное
+        # число тиков) + лог + разовый алерт оператору (иначе "запись в лог" никто не увидит).
         tag = "🚫 Отозвано автором"
         if row.get("result"):
             tag += f": {esc(_clean(row['result']))}"
+        card_cleared = True
         if row["message_id"]:
             try:
                 await bot.edit_message_text(
@@ -997,7 +1005,16 @@ async def process_approval(bot: Bot, row):
                     await bot.edit_message_reply_markup(
                         chat_id=row["chat_id"], message_id=row["message_id"], reply_markup=None)
                 except Exception:  # noqa: BLE001
-                    log.warning("withdraw: не смог погасить карточку qid=%s", qid)
+                    card_cleared = False
+        if not card_cleared:
+            if attempts < APPR_MAX_ATTEMPTS:
+                return  # retry: backoff and try both edits again (idempotent)
+            log.warning("withdraw: не смог погасить карточку qid=%s за %s попыток — кнопки остаются живыми",
+                        qid, attempts)
+            await alert_operator(
+                bot, f"⚠️ Не смог погасить карточку по отозванной заявке (#{qid}) за {attempts} попыток "
+                     f"— кнопки на ней остаются рабочими (нажатие безопасно отобьётся SQLite), но сама "
+                     f"карточка не показывает причину отзыва. Проверь вручную.")
         rnr_db.mark_notified(qid)
         return
 

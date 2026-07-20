@@ -5,8 +5,11 @@
 #     реконструированной через render_approval — в схеме approvals нет card_html);
 #   - если правка текста упала — fallback на снятие клавиатуры (edit_message_reply_markup);
 #   - НЕ инжектить исход воркеру (он сам отозвал — сообщать ему нечего);
-#   - выставить notified_at ВСЕГДА (даже если оба edit-пути упали) — иначе next_actionable
-#     крутил бы строку вечно.
+#   - M8: если ОБА edit-пути упали — ограниченный ретрай на attempts/APPR_MAX_ATTEMPTS
+#     (тот же счётчик, что denied/approved-ветки), notified_at НЕ ставится, пока попытки
+#     не исчерпаны (иначе кнопки остаются живыми навсегда без единого шанса на дозагрузку).
+#     После исчерпания — notified_at (строка обязана уйти из next_actionable за конечное
+#     число тиков) + лог + alert_operator (оператор иначе не узнает про мусорную карточку).
 # Также проверяет, что 'withdrawn' попал в статус-фильтр next_actionable (rnr_db.py).
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +34,7 @@ class FakeBot:
         self.markup_fails = markup_fails
         self.text_calls = []
         self.markup_calls = []
+        self.sent_messages = []  # M8: alert_operator(bot, text) -> bot.send_message(OPERATOR, text)
     async def edit_message_text(self, **kw):
         self.text_calls.append(kw)
         if self.text_fails:
@@ -40,6 +44,9 @@ class FakeBot:
         self.markup_calls.append(kw)
         if self.markup_fails:
             raise RuntimeError("boom-markup")
+        return True
+    async def send_message(self, chat_id, text):
+        self.sent_messages.append((chat_id, text))
         return True
 
 def mk_row(qid, event_id, message_id, reason):
@@ -82,13 +89,54 @@ if bot2.markup_calls:
 row2_after = rnr_db.get_appr_by_qid("q2")
 check(row2_after["notified_at"] is not None, "notified_at не выставлен после fallback-гашения")
 
-# 3) оба пути падают -> notified_at ВСЁ РАВНО выставляется (иначе вечный цикл в exec_loop)
+# 3) M8: оба пути падают ОДИН РАЗ -> notified_at НЕ ставится (ретрай), строка остаётся
+#    actionable — до фикса notified_at ставился безусловно даже на первой же неудаче.
 row3 = mk_row("q3", "evt_3_cccc", 4444, "третья причина")
 bot3 = FakeBot(text_fails=True, markup_fails=True)
 asyncio.run(bot_mod.process_approval(bot3, row3))
 row3_after = rnr_db.get_appr_by_qid("q3")
-check(row3_after["notified_at"] is not None,
-      "notified_at не выставлен, когда оба edit-пути упали — строка зациклится в exec_loop")
+check(row3_after["notified_at"] is None,
+      "M8: notified_at выставлен после ОДНОЙ неудачной попытки — ретрай не сработал")
+check(row3_after["attempts"] == 1, f"M8: attempts не инкрементирован после попытки: {row3_after['attempts']}")
+check(len(bot3.sent_messages) == 0, "M8: alert_operator не должен звать на первой неудаче (рано)")
+actionable3 = rnr_db.next_actionable(limit=50)
+check("q3" in {r['qid'] for r in actionable3},
+      "M8: строка после одной неудачной попытки должна остаться в next_actionable (ретрай)")
+
+# 3b) M8: попытки исчерпаны (APPR_MAX_ATTEMPTS) -> notified_at ставится, лог + alert_operator,
+#     строка обязана уйти из next_actionable за конечное число тиков (не вечный цикл)
+row3b = mk_row("q3b", "evt_3b_gggg", 4747, "исчерпание ретраев")
+bot3b = FakeBot(text_fails=True, markup_fails=True)
+for i in range(bot_mod.APPR_MAX_ATTEMPTS):
+    asyncio.run(bot_mod.process_approval(bot3b, row3b))
+row3b_after = rnr_db.get_appr_by_qid("q3b")
+check(row3b_after["attempts"] == bot_mod.APPR_MAX_ATTEMPTS,
+      f"M8: attempts={row3b_after['attempts']}, ожидался {bot_mod.APPR_MAX_ATTEMPTS}")
+check(row3b_after["notified_at"] is not None,
+      "M8: notified_at НЕ выставлен после исчерпания попыток — строка зациклится в exec_loop навечно")
+check(len(bot3b.sent_messages) == 1, f"M8: alert_operator ожидался ровно 1 раз, вызван {len(bot3b.sent_messages)}")
+if bot3b.sent_messages:
+    _, alert_text = bot3b.sent_messages[0]
+    check("q3b" in alert_text, "M8: алерт оператору не содержит qid проблемной карточки")
+    check(str(bot_mod.APPR_MAX_ATTEMPTS) in alert_text, "M8: алерт не упоминает число попыток")
+actionable3b = rnr_db.next_actionable(limit=50)
+check("q3b" not in {r['qid'] for r in actionable3b},
+      "M8: строка обязана покинуть next_actionable после исчерпания попыток (не вечный цикл)")
+
+# 3c) M8: восстановление ДО исчерпания — несколько неудач, потом успех -> notified_at
+#     ставится СРАЗУ на успешной попытке, alert_operator НЕ зовётся (не «исчерпание»)
+row3c = mk_row("q3c", "evt_3c_hhhh", 4848, "восстановилось")
+bot3c = FakeBot(text_fails=True, markup_fails=True)
+for i in range(3):
+    asyncio.run(bot_mod.process_approval(bot3c, row3c))
+row3c_mid = rnr_db.get_appr_by_qid("q3c")
+check(row3c_mid["notified_at"] is None, "M8: notified_at выставлен раньше времени (до восстановления)")
+bot3c.text_fails = False  # Telegram снова доступен
+asyncio.run(bot_mod.process_approval(bot3c, row3c))
+row3c_after = rnr_db.get_appr_by_qid("q3c")
+check(row3c_after["notified_at"] is not None, "M8: notified_at не выставлен сразу после успешной попытки")
+check(row3c_after["attempts"] == 4, f"M8: attempts после восстановления: {row3c_after['attempts']} (ожидался 4)")
+check(len(bot3c.sent_messages) == 0, "M8: alert_operator не должен звать — заявка восстановилась, не исчерпалась")
 
 # 4) карточка ещё не была отправлена (message_id IS NULL) -> ни один edit не вызывается,
 #    но notified_at всё равно ставится (нечего гасить, не крутить строку вечно)
