@@ -44,7 +44,9 @@ esac
 
 approval="" executor=""
 while [ $# -gt 0 ]; do case "$1" in
-  --approval) approval="${2:-}"; shift 2 ;;
+  # M2 (тот же шаблон, что у соседей-исполнителей): проверка на пусто ДО shift 2 —
+  # иначе флаг без значения при $#=1 не сдвинет $1 и while зациклится навечно.
+  --approval) approval="${2:-}"; [ -n "$approval" ] || die "--approval требует значения"; shift 2 ;;
   --executor) executor="${2:-}"; shift 2 ;;
   *) die "unknown arg $1" ;;
 esac; done

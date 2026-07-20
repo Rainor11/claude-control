@@ -280,6 +280,32 @@ m3_after="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | w
   || fail "M3: гард сработал ПОСЛЕ отправки хотя бы одному воркеру (queued до=$m3_before, после=$m3_after — ожидался die ДО первого send)"
 echo "  planerka-exec: M3 (body-гард > 300 симв. — die до отправки) OK"
 
+# /bug M3: гард обязан мерить в ТЕХ ЖЕ единицах, что режет адаптер. `.slice(0,300)` в JS —
+# UTF-16 code units, а jq `length` — кодовые точки: на не-BMP символах (эмодзи в reason, а
+# reason приходит от человека) они расходятся вдвое. Два прогона с ОДИНАКОВЫМ числом кодовых
+# точек в reason (80) на одном и том же пути: BMP-вариант обязан пройти, эмодзи-вариант —
+# умереть. До фикса умирал НИ ОДИН из них: гард видел 278 точек в обоих и пропускал эмодзи-
+# body (358 units), после чего адаптер молча срезал команду ack — ровно тот отказ, ради
+# которого M3 и вводился.
+# Паддинг 40 центрирует окно теста: база body ≈181 симв. → BMP-вариант 261 (проходит,
+# запас ~39 симв. на более длинный путь чекаута), эмодзи-вариант 341 (умирает, запас ~41).
+PL_POL_U16="$(mktemp -d)/$(printf 'c%.0s' $(seq 1 40))"
+mkdir -p "$PL_POL_U16"
+printf '# правила v9\n' > "$PL_POL_U16/policy-v9.md"
+bmp_reason="$(printf 'о%.0s' $(seq 1 80))"
+emoji_reason="$(python3 -c "print('🙂'*80, end='')")"
+DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_U16" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+  TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$bmp_reason" >/dev/null \
+  || fail "M3/bug: BMP-reason из 80 точек не должен триггерить гард на этом пути (окно теста съехало)"
+u16_before="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
+out_u16="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_U16" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+  TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$emoji_reason" 2>&1)" \
+  && fail "M3/bug: эмодзи-reason (те же 80 точек, но 160 UTF-16 units) пробил гард — адаптер срежет команду ack"
+echo "$out_u16" | command grep -q -- 'UTF-16' || fail "M3/bug: die не объясняет единицы измерения: $out_u16"
+u16_after="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
+[ "$u16_before" = "$u16_after" ] || fail "M3/bug: гард сработал ПОСЛЕ отправки (queued до=$u16_before, после=$u16_after)"
+echo "  planerka-exec: M3/bug (кап меряется в UTF-16 units, как в адаптере) OK"
+
 # M2: --approval / --reason как ПОСЛЕДНИЙ аргумент без значения — die, не hang и не
 # "unbound variable". Регрессия: "${2:-}" сама по себе не спасает — "shift 2" при $#=1
 # молча проваливается (не двигает $1), и while крутится навечно вместо die.

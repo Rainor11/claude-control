@@ -78,9 +78,15 @@ body="Причина: ${reason_short}. Перечитай ${pfile} и выпол
 # (команда ack) молча срежется адаптером шины (channels/event-bridge/adapters/ledger-messages
 # .slice(0,300)) — воркер получит инструкцию без команды, которую выполнить. Runtime-гард
 # ловит это ДО отправки, а не после того как ack не пришёл ни от кого.
-body_len="$(printf '%s' "$body" | jq -Rs 'length')"
+#
+# /bug: мерить надо в ТЕХ ЖЕ единицах, что режет адаптер. `.slice(0,300)` в JS — это
+# UTF-16 code units, а jq `length` — кодовые точки: для не-BMP символов (эмодзи в reason,
+# а reason приходит от человека) они расходятся вдвое. 80 эмодзи в reason_short = 80 точек,
+# но 160 units — гард пропускал body до ~380 units, и адаптер молча срезал команду ack
+# ровно в том случае, ради которого гард и вводился. utf16len = точки + число не-BMP.
+body_len="$(printf '%s' "$body" | jq -Rs '(explode | map(select(. > 65535)) | length) + length')"
 [ "$body_len" -le 300 ] \
-  || die "body планёрки $body_len симв. > 300 — адаптер шины молча обрежет команду ack; сократи путь policy-файла или dept-ledger ($pfile / $DL)"
+  || die "body планёрки $body_len симв. (UTF-16) > 300 — адаптер шины молча обрежет команду ack; сократи путь policy-файла, dept-ledger ($pfile / $DL) или reason"
 
 sent=(); sleeping_list=(); failed=()
 while IFS= read -r w; do

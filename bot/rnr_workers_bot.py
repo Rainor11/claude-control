@@ -972,6 +972,22 @@ async def notify_worker_outcome(bot: Bot, row, approved, ok, detail):
                  qid, row["worker"], approved, ok)
 
 
+def _card_already_clear(e):
+    """True если ошибка правки означает, что карточка УЖЕ в целевом состоянии (или её нет
+    вовсе) — ретраить нечего и алертить оператора не о чем.
+
+    /bug M8: «message is not modified» — это УСПЕХ, а не сбой (та же конвенция, что и в
+    _safe_edit ниже). Реальный сценарий: правка ДОШЛА до Telegram, но ответ потерялся
+    (сетевой флап) — ровно тот случай, ради которого M8 и вводил ретрай. На следующем тике
+    оба edit-пути отвечают «not modified» (текст уже тот, клавиатура уже снята), M8 считал
+    это провалом → 60 холостых тиков (~25 мин, 120 вызовов API) и ЛОЖНЫЙ алерт оператору
+    «кнопки остаются рабочими» про заведомо чистую карточку.
+    «message to edit not found» — карточку удалили: живых кнопок тоже нет, ретрай бесполезен.
+    """
+    s = str(e).lower()
+    return "not modified" in s or "message to edit not found" in s
+
+
 async def process_approval(bot: Bot, row):
     qid, worker, status, action = row["qid"], row["worker"], row["status"], row["action"]
     attempts = rnr_db.record_attempt_appr(qid)
@@ -1000,12 +1016,16 @@ async def process_approval(bot: Bot, row):
                     chat_id=row["chat_id"], message_id=row["message_id"],
                     text=render_approval(row) + f"\n\n{tag}",
                     parse_mode="HTML", reply_markup=None)
-            except Exception:  # noqa: BLE001
-                try:
-                    await bot.edit_message_reply_markup(
-                        chat_id=row["chat_id"], message_id=row["message_id"], reply_markup=None)
-                except Exception:  # noqa: BLE001
-                    card_cleared = False
+            except Exception as e:  # noqa: BLE001
+                # /bug M8: «not modified»/«to edit not found» — карточка уже чистая (правка
+                # дошла, ответ потерялся) либо удалена: живых кнопок нет, fallback и ретрай
+                # бессмысленны. См. _card_already_clear.
+                if not _card_already_clear(e):
+                    try:
+                        await bot.edit_message_reply_markup(
+                            chat_id=row["chat_id"], message_id=row["message_id"], reply_markup=None)
+                    except Exception as e2:  # noqa: BLE001
+                        card_cleared = _card_already_clear(e2)
         if not card_cleared:
             if attempts < APPR_MAX_ATTEMPTS:
                 return  # retry: backoff and try both edits again (idempotent)

@@ -138,6 +138,59 @@ check(row3c_after["notified_at"] is not None, "M8: notified_at не выстав
 check(row3c_after["attempts"] == 4, f"M8: attempts после восстановления: {row3c_after['attempts']} (ожидался 4)")
 check(len(bot3c.sent_messages) == 0, "M8: alert_operator не должен звать — заявка восстановилась, не исчерпалась")
 
+# 3d) /bug M8: «message is not modified» — это УСПЕХ, а не сбой (конвенция _safe_edit).
+#     Реальный сценарий: правка ДОШЛА до Telegram, ответ потерялся (сетевой флап) — ровно
+#     то, ради чего M8 вводил ретрай. На следующем тике оба edit-пути отвечают «not
+#     modified» (текст уже тот, клавиатура уже снята). До фикса это считалось провалом:
+#     60 холостых тиков (~25 мин, 120 вызовов API) и ЛОЖНЫЙ алерт оператору «кнопки
+#     остаются рабочими» про заведомо чистую карточку.
+class NotModifiedBot(FakeBot):
+    async def edit_message_text(self, **kw):
+        self.text_calls.append(kw)
+        raise RuntimeError("Telegram server says - Bad Request: message is not modified")
+    async def edit_message_reply_markup(self, **kw):
+        self.markup_calls.append(kw)
+        raise RuntimeError("Telegram server says - Bad Request: message is not modified")
+
+row3d = mk_row("q3d", "evt_3d_iiii", 4949, "ответ потерялся")
+bot3d = NotModifiedBot()
+asyncio.run(bot_mod.process_approval(bot3d, row3d))
+row3d_after = rnr_db.get_appr_by_qid("q3d")
+check(row3d_after["notified_at"] is not None,
+      "M8/bug: 'not modified' = карточка уже чистая, строка обязана закрыться на ПЕРВОМ тике")
+check(row3d_after["attempts"] == 1, f"M8/bug: лишние попытки на 'not modified': {row3d_after['attempts']}")
+check(len(bot3d.sent_messages) == 0,
+      "M8/bug: ЛОЖНЫЙ алерт оператору про 'живые кнопки' на заведомо чистой карточке")
+check(len(bot3d.markup_calls) == 0,
+      "M8/bug: fallback-снятие клавиатуры вызвано, хотя 'not modified' уже означает снятую клавиатуру")
+check("q3d" not in {r["qid"] for r in rnr_db.next_actionable(limit=50)},
+      "M8/bug: строка осталась в next_actionable, хотя карточка уже чистая")
+
+# 3e) /bug M8: карточку удалили — «message to edit not found». Живых кнопок нет, ретрай
+#     бесполезен: строка обязана закрыться сразу, без алерта про «рабочие кнопки».
+class DeletedCardBot(FakeBot):
+    async def edit_message_text(self, **kw):
+        self.text_calls.append(kw)
+        raise RuntimeError("Telegram server says - Bad Request: message to edit not found")
+    async def edit_message_reply_markup(self, **kw):
+        self.markup_calls.append(kw)
+        raise RuntimeError("Telegram server says - Bad Request: message to edit not found")
+
+row3e = mk_row("q3e", "evt_3e_jjjj", 5050, "карточку удалили")
+bot3e = DeletedCardBot()
+asyncio.run(bot_mod.process_approval(bot3e, row3e))
+row3e_after = rnr_db.get_appr_by_qid("q3e")
+check(row3e_after["notified_at"] is not None,
+      "M8/bug: удалённая карточка — строка обязана закрыться на первом тике")
+check(len(bot3e.sent_messages) == 0, "M8/bug: алерт про 'живые кнопки' у удалённой карточки")
+
+# 3f) регрессия-страховка: НАСТОЯЩИЙ сбой (не 'not modified') по-прежнему уходит в ретрай
+row3f = mk_row("q3f", "evt_3f_kkkk", 5151, "настоящий сбой")
+bot3f = FakeBot(text_fails=True, markup_fails=True)
+asyncio.run(bot_mod.process_approval(bot3f, row3f))
+check(rnr_db.get_appr_by_qid("q3f")["notified_at"] is None,
+      "M8/bug: фикс 'not modified' сломал ретрай на НАСТОЯЩЕМ сбое")
+
 # 4) карточка ещё не была отправлена (message_id IS NULL) -> ни один edit не вызывается,
 #    но notified_at всё равно ставится (нечего гасить, не крутить строку вечно)
 row4 = mk_row("q4", "evt_4_dddd", None, "четвёртая причина")
