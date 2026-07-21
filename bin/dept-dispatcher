@@ -31,6 +31,10 @@ const { memoryFreshnessFromTx } = require('./dept-memory-freshness');
 // repo-layout, и в install-layout (lib/ ставится рядом с bin/), в т.ч. через symlink —
 // node резолвит __dirname по realpath модуля.
 const processControl = require('../lib/process-control.js');
+// T5: корень рантайма — через единый резолвер (lib/runtime-root.js, задача T1). Профиль
+// auto_then_hardcoded воспроизводит прежнюю строку без маркера; под CLAUDE_CONTROL_TEST_ROOT —
+// fail-closed на песочницу. Тот же кэшированный модуль, что уже тянет process-control.js.
+const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
 // Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
@@ -154,7 +158,8 @@ if (argv[0] !== 'tick') {
 }
 const dry = argv.includes('--dry-run');
 
-const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const CC_HOME = resolveRuntimeRoot('auto_then_hardcoded');
+// DEPT остаётся производным от резолвленного CC_HOME (композитный DEPT): DEPT_HOME → CC_HOME/department.
 const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
 const WORKERS_DIR = path.join(CC_HOME, 'workers');
 const BIN = __dirname;

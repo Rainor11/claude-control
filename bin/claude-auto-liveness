@@ -10,8 +10,14 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
+// T5: корень рантайма — через единый резолвер (lib/runtime-root.js, задача T1). Профиль
+// auto_then_hardcoded воспроизводит прежнюю строку (CLAUDE_AUTO_HOME || '/home/rainor/.claude-control')
+// без маркера; под CLAUDE_CONTROL_TEST_ROOT — fail-closed на корень песочницы. require('../lib')
+// верен в repo- и install-layout (node резолвит по realpath модуля, как process-control.js в T4).
+const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
 
-const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const CC_HOME = resolveRuntimeRoot('auto_then_hardcoded');
+// DEPT остаётся производным от резолвленного CC_HOME (композитный DEPT): DEPT_HOME → CC_HOME/department.
 const DEPT = process.env.DEPT_HOME || path.join(CC_HOME, 'department');
 const STATE_FILE = path.join(DEPT, 'watchdog-state.json');
 const BIN = __dirname;

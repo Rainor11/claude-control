@@ -14,11 +14,16 @@ const render = require('./dept-inbox-render.js');
 // __dirname по realpath модуля, поэтому и через symlink путь верный (тот же принцип, что
 // `readlink -f` в bash-обёртках, bin/claude-auto:46).
 const processControl = require('../lib/process-control.js');
+// T5: корень рантайма — через единый резолвер (lib/runtime-root.js, задача T1). Профиль
+// auto_then_hardcoded воспроизводит прежнюю строку (CLAUDE_AUTO_HOME || '/home/rainor/.claude-control')
+// без маркера; под CLAUDE_CONTROL_TEST_ROOT — fail-closed на песочницу. Тот же кэшированный
+// модуль, что уже подтягивает process-control.js выше (не двойная загрузка, лишь доп. ссылка).
+const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
 
 const PORT = Number(process.env.DEPT_INBOX_PORT || 8377);
 const DEFAULT_DL_BIN = path.join(__dirname, 'dept-ledger');
 const DEFAULT_TIMEOUT_MS = 15000;
-const CC_HOME = process.env.CLAUDE_AUTO_HOME || '/home/rainor/.claude-control';
+const CC_HOME = resolveRuntimeRoot('auto_then_hardcoded');
 const WORKERS_DIR = path.join(CC_HOME, 'workers');
 const DEPT_ROLES = new Set(['руководитель', 'мк', 'архивариус', 'тп']);
 
