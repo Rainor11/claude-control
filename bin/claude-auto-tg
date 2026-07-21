@@ -12,8 +12,8 @@
 #     cannot swap it via `PATH=/evil claude-auto-tg ...` or CLAUDE_AUTO_TG=…
 #     (T8: the ONLY way to override it is $TELEGRAM_NOTIFY under a VALID
 #     CLAUDE_CONTROL_TEST_ROOT marker — a sentinel-bearing dir outside the live tree.
-#     Setting that marker also moves the runtime ROOT into the sandbox, so a worker
-#     using it to redirect notifications loses sight of its own live registry.)
+#     WITHOUT that marker nothing at all is read from the environment and nothing is
+#     sourced: the assignment below is a plain literal, see the K1 note there.)
 #
 # Use it for autonomous reminders and escalations to the operator (idle/turn-finish
 # no longer pings — claude-auto-notify only forwards real permission blocks). To reach
@@ -29,20 +29,34 @@ set -u
 # plain env var would be worker-overridable and break the operator-only guarantee.
 OPERATOR_ENV="/home/rainor/server/.env"
 OPERATOR_CHAT_ID="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
-# T8 п.1: путь нотификатора — через шов, ГЕЙТИРОВАННЫЙ тестовым маркером
-# (lib/process-control.sh::process_control_notifier_path). Без CLAUDE_CONTROL_TEST_ROOT
-# функция возвращает БУКВАЛЬНО переданный литерал и не читает env вовсе — гарантия
-# «absolute — NOT $PATH/env» из шапки файла в бою сохраняется дословно. Под ВАЛИДНЫМ
-# маркером (каталог с sentinel вне боевого дерева, проверка T1) допускается заглушка внутри
-# test root — иначе тестовый прогон отправлял бы сообщение живому оператору.
-# Резолв своего каталога — через `readlink -f "$0"`: install.sh симлинкует этот файл в
-# ~/.local/bin, и без разыменования `dirname "$0"/../lib` указывал бы в ~/.local/lib мимо
-# репозитория (тот же приём, что уже в claude-auto-send/claude-auto-run).
-_cat_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-_cat_bindir="$(cd "$(dirname "$_cat_self")" && pwd)"
-# shellcheck disable=SC1091
-. "$_cat_bindir/../lib/process-control.sh"
-TG="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
+# Путь нотификатора: БОЕВОЕ значение — голый литерал, ровно как до T8 («absolute — NOT
+# $PATH/env» из шапки). Тестовый шов (T8 п.1, process_control_notifier_path) живёт ЦЕЛИКОМ
+# внутри маркер-гейта ниже.
+TG="/home/rainor/server/server_monitor/telegram_notify.sh"     # absolute — NOT $PATH/env
+# K1 (ревью T8): гейтируется САМ source библиотеки, а не только вызов функции. Пролог
+# резолва каталога (`readlink`/`dirname`/`cd`/`pwd`) — это ВНЕШНИЕ команды, а bash на старте
+# импортирует функции из окружения (`BASH_FUNC_x%%=…`) и исполняет `$BASH_ENV`. Подменив
+# `readlink` функцией, воркер уводил резолв в свой каталог и подсовывал оттуда СВОЙ
+# lib/process-control.sh со своей process_control_notifier_path — то есть безусловный пролог
+# T8 сделал НЕперекрываемый путь перекрываемым (воспроизведено: без маркера TG уезжал в
+# /tmp/EVIL/telegram_notify.sh; до T8 этот файл библиотеку не подключал вовсе и был иммунен).
+# Теперь в бою не исполняется ни одна внешняя команда и ничего не source'ится — значение
+# остаётся литералом побитово.
+#
+# Условие — ИМЕННО `[[ ]]`, не `[ ]`: `[[` зарезервированное слово, bash отказывается
+# импортировать функцию с таким именем («error importing function definition for `[[`»), а
+# `[` — обычный builtin, и `BASH_FUNC_[%%=() { return 0; }` открыл бы гейт (проверено).
+# Под ВАЛИДНЫМ маркером (каталог с sentinel вне боевого дерева, проверка T1) допускается
+# заглушка внутри test root — иначе тестовый прогон отправлял бы сообщение живому оператору.
+# `readlink -f "$0"`: install.sh симлинкует этот файл в ~/.local/bin, и без разыменования
+# `dirname "$0"/../lib` указывал бы в ~/.local/lib мимо репозитория.
+if [[ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]]; then
+  _cat_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  _cat_bindir="$(cd "$(dirname "$_cat_self")" && pwd)"
+  # shellcheck disable=SC1091
+  . "$_cat_bindir/../lib/process-control.sh"
+  TG="$(process_control_notifier_path "$TG")" || exit 1
+fi
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"              # trusted claude tree
 DB="/opt/projects/active/claude-control/bot/rnr_db.py"          # outbox (reply routing)
 

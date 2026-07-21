@@ -133,10 +133,16 @@ alive="$(
 echo "OK: 5 — вызов без аргумента: отказ через return, вызывающий шелл жив"
 
 # ---------------------------------------------------------------------------------------
-# 6. Проводка всех ПЯТИ точек: каждая зовёт шов и ни одна не держит голого присваивания
-#    боевого литерала. Статическая проверка — потому что четыре из пяти точек невозможно
-#    исполнить в песочнице целиком (супервизор воркера, воркер-идентичность через /proc), а
-#    «забыли перевести шестую точку» — ровно тот регресс, который надо ловить механически.
+# 6. Проводка всех ПЯТИ точек. Форма, обязательная ПОСЛЕ K1 (ревью T8) — см. контракт вызова
+#    в комментарии к process_control_notifier_path:
+#      (а) боевое значение — ОБЫЧНОЕ присваивание литерала на верхнем уровне;
+#      (б) вызов шва — ТОЛЬКО внутри `if [[ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]]`.
+#    Первая редакция T8 звала шов БЕЗУСЛОВНО, а значит безусловно резолвила свой каталог
+#    внешними командами и source'ила библиотеку — воркер, подменивший `readlink`
+#    импортированной из окружения функцией, уводил source в свой каталог и подсовывал СВОЮ
+#    process_control_notifier_path (динамическое доказательство — сценарий 9 ниже).
+#    Статическая проверка нужна отдельно от динамической: она ловит «завели ШЕСТУЮ точку и
+#    написали её по старой форме», которую сценарий 9 (жёсткий список файлов) не увидит.
 # ---------------------------------------------------------------------------------------
 for f in bin/claude-auto-tg bin/claude-auto-ask bin/claude-auto-send bin/claude-auto-run; do
   command grep -q 'process_control_notifier_path' "$DIR/$f" \
@@ -144,13 +150,24 @@ for f in bin/claude-auto-tg bin/claude-auto-ask bin/claude-auto-send bin/claude-
   command grep -qE '^\s*\.\s+.*lib/process-control\.sh' "$DIR/$f" \
     || fail "$f не подключает lib/process-control.sh"
   command grep -qE "^(TG|TG_NOTIFY)=\"$LITERAL\"" "$DIR/$f" \
-    && fail "$f вернул голое присваивание боевого литерала в обход шва"
+    || fail "$f потерял боевое присваивание литерала на верхнем уровне — без маркера значение обязано быть литералом, а не результатом вызова библиотеки (K1)"
+  # Вызов шва обязан быть ОТСТУПЛЕН (внутри гейта) и нигде — на верхнем уровне.
+  command grep -qE '^[[:space:]]+(TG|TG_NOTIFY)="\$\(process_control_notifier_path' "$DIR/$f" \
+    || fail "$f не зовёт шов внутри блока (строка без отступа) — вызов обязан стоять в гейте по CLAUDE_CONTROL_TEST_ROOT (K1)"
+  command grep -qE '^[^[:space:]#].*process_control_notifier_path' "$DIR/$f" \
+    && fail "$f зовёт process_control_notifier_path на ВЕРХНЕМ уровне — гейт обойдён (K1)"
+  # Гейт — ИМЕННО `[[ ]]`: `[` перекрывается импортированной функцией (`BASH_FUNC_[%%`), `[[`
+  # зарезервированное слово, bash отказывается импортировать функцию с таким именем.
+  # shellcheck disable=SC2016  # ищем ЛИТЕРАЛЬНУЮ строку исходника — раскрытие здесь было бы
+  # ошибкой (тот же приём и то же подавление, что в tests/control-scripts.test.sh).
+  command grep -qF 'if [[ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]]; then' "$DIR/$f" \
+    || fail "$f не гейтирует шов двойными скобками (K1: одинарные скобки — обычный builtin, перекрываются импортированной функцией; двойные — зарезервированное слово)"
 done
 command grep -q '_notifier_path("'"$LITERAL"'")' "$DIR/bot/rnr_workers_bot.py" \
   || fail "bot/rnr_workers_bot.py не зовёт _notifier_path — точка выпала из шва"
 command grep -qE "^TG_NOTIFY = \"$LITERAL\"" "$DIR/bot/rnr_workers_bot.py" \
-  && fail "bot/rnr_workers_bot.py вернул голое присваивание боевого литерала в обход шва"
-echo "OK: 6 — все пять точек подключены к шву, голых присваиваний литерала не осталось"
+  && fail "bot/rnr_workers_bot.py вернул голое присваивание литерала в обход шва (python-точка возвращает литерал ВНУТРИ функции, до любого обращения к окружению)"
+echo "OK: 6 — все пять точек в шве, bash-точки держат литерал на верхнем уровне и гейтируют вызов"
 
 # ---------------------------------------------------------------------------------------
 # 7. E2E python-точки: РЕАЛЬНЫЙ импорт bot/rnr_workers_bot.py под песочницей обязан дать
@@ -194,5 +211,91 @@ if [ -r "$OPERATOR_ENV" ] && command grep -qE '^TELEGRAM_CHAT_ID=' "$OPERATOR_EN
 else
   echo "ПРОПУСК: 8 — операторский $OPERATOR_ENV недоступен/без TELEGRAM_CHAT_ID (получатель — не предмет T8), e2e-лег bash-точки пропущен"
 fi
+
+# ---------------------------------------------------------------------------------------
+# 9. K1 (ревью T8) — РЕГРЕСС: БЕЗ маркера путь нотификатора обязан остаться литералом даже
+#    под подменой резолва каталога через окружение.
+#
+#    ЧТО ЭТО ЛОВИТ. Первая редакция T8 звала шов БЕЗУСЛОВНО, а чтобы функция существовала,
+#    надо было найти и заsource'ить lib/process-control.sh — то есть выполнить `readlink`/
+#    `dirname`/`cd`/`pwd`. Bash при старте импортирует функции из окружения
+#    (`BASH_FUNC_x%%=…`) и исполняет `$BASH_ENV`, поэтому подменённый `readlink` уводил
+#    резолв каталога в чужой и подключал ЧУЖУЮ process_control_notifier_path. Итог: путь,
+#    заявленный в шапках как «absolute — NOT $PATH/env», стал перекрываемым — до T8
+#    claude-auto-tg/claude-auto-ask были иммунны (библиотеку не подключали вовсе).
+#
+#    КАК ПРОВЕРЯЕМ. На КОПИЯХ внутри test root: каждый скрипт обрезается сразу ПОСЛЕ
+#    присваивания пути (включая закрывающий `fi` гейта) и печатает значение — дальше
+#    настоящий скрипт не идёт, ни одного вызова наружу. Обрезка ПОСЛЕ гейта принципиальна:
+#    обрезав ДО него, тест стал бы тавтологией.
+# ---------------------------------------------------------------------------------------
+k1="$ROOT/k1"
+mkdir -p "$k1/victim/bin" "$k1/victim/lib" "$k1/evil/bin" "$k1/evil/lib" "$k1/ctl/workers/probe" "$k1/cwd"
+cp "$DIR/lib/process-control.sh" "$DIR/lib/runtime-root.sh" "$k1/victim/lib/"
+: > "$k1/evil/bin/anchor"
+# Чужая библиотека: попадёт в source, если резолв каталога удастся увести. Отдаёт «злой»
+# нотификатор и подменяет resolve_runtime_root (иначе claude-auto-send/run упали бы раньше).
+cat > "$k1/evil/lib/process-control.sh" <<EOF
+process_control_notifier_path() { printf '%s\n' "$k1/evil/telegram_notify.sh"; }
+resolve_runtime_root()          { printf '%s\n' "$k1/ctl"; }
+EOF
+printf '{"session_id":"S","cwd":"%s","permission_mode":"acceptEdits","seeded":true}\n' "$k1/cwd" \
+  > "$k1/ctl/workers/probe/spec.json"
+
+# k1_probe <файл> <имя-переменной> — копия скрипта, обрезанная после ПОСЛЕДНЕГО присваивания
+# переменной (+ закрывающий `fi`, если присваивание отступлено — значит оно внутри гейта).
+k1_probe() {
+  local f="$1" var="$2" ln
+  cp "$DIR/bin/$f" "$k1/victim/bin/$f"
+  ln="$(command grep -nE "^[[:space:]]*$var=" "$k1/victim/bin/$f" | tail -1 | cut -d: -f1)"
+  [ -n "$ln" ] || fail "K1: в bin/$f не найдено присваивание $var"
+  if command sed -n "${ln}p" "$k1/victim/bin/$f" | command grep -q '^[[:space:]]'; then
+    ln=$((ln+1))
+    command sed -n "${ln}p" "$k1/victim/bin/$f" | command grep -qE '^[[:space:]]*fi[[:space:]]*$' \
+      || fail "K1: в bin/$f после отступлённого присваивания $var ожидался закрывающий 'fi' — форма гейта изменилась, обрезка стала бы тавтологичной"
+  fi
+  command sed -n "1,${ln}p" "$k1/victim/bin/$f" > "$k1/victim/bin/probe-$f"
+  printf 'printf "%%s\\n" "$%s"\nexit 0\n' "$var" >> "$k1/victim/bin/probe-$f"
+  chmod +x "$k1/victim/bin/probe-$f"
+}
+k1_probe claude-auto-tg   TG
+k1_probe claude-auto-ask  TG
+k1_probe claude-auto-send TG
+k1_probe claude-auto-run  TG_NOTIFY
+
+# k1_run <attack:0|1> <файл> [аргументы] — прогон пробы БЕЗ маркера (env -u), с песочным
+# CLAUDE_CONTROL_DIR. attack=1 добавляет импортированную функцию `readlink`, уводящую резолв
+# каталога в $k1/evil (плюс подмены `command`/`[`, которыми обходятся «очевидные» защиты).
+k1_run() {
+  local attack="$1" f="$2"; shift 2
+  if [ "$attack" = 1 ]; then
+    env -u CLAUDE_CONTROL_TEST_ROOT -u TELEGRAM_NOTIFY CLAUDE_CONTROL_DIR="$k1/ctl" \
+      "BASH_FUNC_readlink%%=() { printf '%s\n' \"$k1/evil/bin/anchor\"; }" \
+      "BASH_FUNC_command%%=() { printf '%s\n' /k1-evil-command; }" \
+      "BASH_FUNC_[%%=() { return 0; }" \
+      bash "$k1/victim/bin/probe-$f" "$@" 2>/dev/null | command tail -1
+  else
+    env -u CLAUDE_CONTROL_TEST_ROOT -u TELEGRAM_NOTIFY CLAUDE_CONTROL_DIR="$k1/ctl" \
+      bash "$k1/victim/bin/probe-$f" "$@" 2>/dev/null | command tail -1
+  fi
+}
+
+if command -v jq >/dev/null 2>&1; then
+  k1_targets="claude-auto-tg claude-auto-ask claude-auto-send claude-auto-run"
+else
+  # claude-auto-run требует jq ДО присваивания пути; остальные три — нет.
+  k1_targets="claude-auto-tg claude-auto-ask claude-auto-send"
+  echo "ЧАСТИЧНО: 9 — jq не найден, claude-auto-run из K1-лега исключён (остальные три проверяются)"
+fi
+for f in $k1_targets; do
+  arg=""; [ "$f" = claude-auto-run ] && arg=probe
+  got="$(k1_run 0 "$f" $arg)"
+  [ "$got" = "$LITERAL" ] \
+    || fail "K1/паритет: без маркера и без атаки bin/$f дал '$got', ожидался литерал '$LITERAL'"
+  got="$(k1_run 1 "$f" $arg)"
+  [ "$got" = "$LITERAL" ] \
+    || fail "K1: bin/$f под подменой резолва каталога дал '$got' вместо литерала '$LITERAL' — путь нотификатора снова перекрываем через окружение"
+done
+echo "OK: 9 — без маркера путь нотификатора остаётся литералом и под подменой резолва каталога (K1)"
 
 echo "PASS notifier-seam"

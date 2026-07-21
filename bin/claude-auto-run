@@ -108,14 +108,23 @@ say() { echo "$(ts) claude-auto-run[$name]: $*" | tee -a "$log" >&2; }
 # fixed-recipient pattern: operator chat_id + bot token from the operator's server .env,
 # telegram_notify.sh at an absolute path. Used to flag a dropped/malformed MCP subscription.
 OPERATOR_ENV="/home/rainor/server/.env"
-# T8 п.1: путь нотификатора — через гейтированный маркером шов (lib/process-control.sh,
-# process_control_notifier_path; библиотека уже подключена выше для guard'а tmux). Без
-# CLAUDE_CONTROL_TEST_ROOT возвращает БУКВАЛЬНО тот же литерал, что стоял здесь раньше, ни
-# одного чтения env — анти-подмена («absolute — NOT $PATH/env») в бою не слабеет. Под
-# валидным маркером обязана быть заглушка ВНУТРИ test root, иначе явный отказ: без этого
-# тестовый прогон писал бы живому оператору в Telegram. `|| exit 1` — тот же fail-closed,
-# что у resolve_runtime_root выше в этом файле (в бою недостижим: без маркера отказа нет).
-TG_NOTIFY="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
+# Путь нотификатора: БОЕВОЕ значение — голый литерал, ровно как до T8. Тестовый шов (T8 п.1)
+# живёт внутри маркер-гейта ниже.
+TG_NOTIFY="/home/rainor/server/server_monitor/telegram_notify.sh"
+# K1 (ревью T8): вызов шва гейтирован маркером, значение вычисляется НЕ через библиотеку.
+# Библиотека здесь нужна и в бою (guard tmux + resolve_runtime_root выше), поэтому сам source
+# не гейтируется — но путь нотификатора от неё зависеть не должен: пролог резолва каталога
+# исполняет внешние команды (`readlink`/`dirname`/`cd`/`pwd`), а bash на старте импортирует
+# функции из окружения (`BASH_FUNC_x%%=…`) и исполняет `$BASH_ENV` — подменив `readlink`,
+# воркер уводил source в свой каталог и получал СВОЮ process_control_notifier_path (полный
+# разбор и репро — в комментарии claude-auto-tg). Условие ИМЕННО `[[ ]]`: зарезервированное
+# слово, функцией с таким именем не перекрывается (в отличие от builtin'а `[`).
+# Под валидным маркером обязана быть заглушка ВНУТРИ test root, иначе явный отказ — без этого
+# тестовый прогон писал бы живому оператору. `|| exit 1` — тот же fail-closed, что у
+# resolve_runtime_root выше в этом файле (в бою недостижим: без маркера гейт закрыт).
+if [[ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]]; then
+  TG_NOTIFY="$(process_control_notifier_path "$TG_NOTIFY")" || exit 1
+fi
 notify_operator() {
   local text="$1" chat rnr_val; local -a botflag=()
   chat="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"
@@ -278,7 +287,10 @@ else
   # тем же резолвером маркера, что и весь guard (пустой stdout при rc 0 = маркера нет).
   _car_test_root="$(_process_control_test_root)" && _car_resolver_ok=1 || _car_resolver_ok=0
   if [ "$_car_resolver_ok" = 1 ] && [ -z "$_car_test_root" ]; then
+    # shellcheck disable=SC1007  # `TMUX= tmux …` — НАМЕРЕННО: пустое TMUX только для этой
+    # команды (обращение к ДЕФОЛТНОМУ сокету из-под tmux-сессии), а не присваивание.
     if [ "$(TMUX= tmux show-environment -t "$sess" CLAUDE_AUTO_NAME 2>/dev/null)" = "CLAUDE_AUTO_NAME=$name" ]; then
+      # shellcheck disable=SC1007  # то же самое, см. выше
       TMUX= tmux kill-session -t "$sess" 2>/dev/null || true
       say "reaped stale default-socket orphan $sess (pre-per-socket migration)"
     fi

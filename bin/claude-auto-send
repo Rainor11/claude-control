@@ -36,11 +36,22 @@ _t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
 # shellcheck disable=SC1091
 . "$_t5_bindir/../lib/process-control.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
-# T8 п.1: путь нотификатора — через гейтированный маркером шов. Без маркера — БУКВАЛЬНО тот
-# же литерал, что стоял здесь раньше, без единого чтения env (гарантия «absolute — NOT
-# $PATH/env» из шапки не слабеет); под ВАЛИДНЫМ маркером — заглушка внутри test root, иначе
-# явный отказ. Полное обоснование — в комментарии к самой функции (lib/process-control.sh).
-TG="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
+# Путь нотификатора: БОЕВОЕ значение — голый литерал, ровно как до T8. Тестовый шов (T8 п.1)
+# живёт внутри маркер-гейта ниже.
+TG="/home/rainor/server/server_monitor/telegram_notify.sh"   # absolute — NOT $PATH/env
+# K1 (ревью T8): вызов шва гейтирован маркером, значение вычисляется НЕ через библиотеку.
+# Library здесь нужна и в бою (resolve_runtime_root выше), поэтому сам source не гейтируется —
+# но именно поэтому путь нотификатора не должен от неё зависеть: пролог резолва каталога
+# исполняет внешние команды (`readlink`/`dirname`/`cd`/`pwd`), а bash на старте импортирует
+# функции из окружения (`BASH_FUNC_x%%=…`) и исполняет `$BASH_ENV` — подменив `readlink`,
+# воркер уводил source в свой каталог и получал СВОЮ process_control_notifier_path. Для
+# CONTROL_DIR это ровно тот же (пред-T8, с T5) уровень доверия, что и раньше, и он внутри
+# честной границы из шапки; для нотификатора обещано БОЛЬШЕЕ («absolute — NOT $PATH/env»),
+# и гейт это обещание восстанавливает дословно. Условие ИМЕННО `[[ ]]` — зарезервированное
+# слово, функцией с таким именем не перекрывается (в отличие от builtin'а `[`).
+if [[ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]]; then
+  TG="$(process_control_notifier_path "$TG")" || exit 1
+fi
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"            # trusted claude tree (hardcoded)
 
 die() { echo "claude-auto-send: $*" >&2; exit 1; }
