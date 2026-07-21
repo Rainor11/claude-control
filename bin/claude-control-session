@@ -2,6 +2,13 @@
 # claude-control-session: service entrypoint for the always-on "control"
 # remote-control session. It runs claude in the ~/.claude-control directory,
 # so the project-level CLAUDE.md there is loaded as context.
+# ГРАНИЦА ДЛЯ ТЕСТОВ (В2, ревью T8): этот скрипт НАЗНАЧАЕТ СЕБЕ PATH — значит PATH-shadow
+# раннера (tests/run кладёт свой stub_dir первым) сюда НЕ доживает, и голое имя `claude` в
+# `${CLAUDE_BIN:-claude}` ниже искалось бы по ЭТОМУ списку. Поэтому tests/run форсит
+# CLAUDE_BIN на заглушку внутри песочницы (раньше он его просто unset'ил, и тест зависел от
+# того, что настоящий claude лежит в подменённом $HOME/.local/bin — случайность, не граница).
+# Кто добавит сюда ещё один вызов внешнего бинаря голым именем — обязан завести ему такой же
+# явный шов, PATH его не прикроет.
 case "$(uname -s)" in
   Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin" ;;
   *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;

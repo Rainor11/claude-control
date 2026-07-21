@@ -409,6 +409,9 @@ run_one() {
   make_stub "$stub_dir/systemd-run"
   make_stub "$stub_dir/tmux"
   make_stub "$stub_dir/telegram-notify.sh"
+  # В2 (ревью T8): заглушка САМОГО claude — и как PATH-shadow голого имени `claude`, и,
+  # главное, как значение $CLAUDE_BIN (экспорт ниже). См. обоснование там.
+  make_stub "$stub_dir/claude"
 
   local home_dir="$canon_sandbox/home"
   mkdir -p "$home_dir"
@@ -513,7 +516,7 @@ run_one() {
       # только унаследованное, дефолт не трогаем.
       unset ASANA_ACCESS_TOKEN ASANA_PROJECT_NOW_EPOCH ASANA_COMMENTS_MAX_PAGES \
             EB_ASANA_EMIT_ID EVENT_BRIDGE_CONFIG EVENT_BRIDGE_STATE_DIR \
-            CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN CLAUDE_BIN \
+            CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN \
             HTTPS_PROXY RNR_HTTPS_PROXY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PROJECTS_ROOT
 
       # (б) ПОДМЕНЯЕМ на песочницу: у этих швов есть безопасный эквивалент внутри неё.
@@ -528,6 +531,16 @@ run_one() {
       export ASANA_COMMENTS_API_BASE="http://127.0.0.1:1"
       export ASANA_PROJECT_API_BASE="http://127.0.0.1:1"
       export DEPT_POLICY_DIR="$policy_dir"
+      # В2 (ревью T8): CLAUDE_BIN — ФОРСИМ заглушку, а не unset. Он был в списке (а) выше,
+      # но «погасить» его здесь недостаточно: bin/claude-control-session и bin/claude-rc
+      # читают его как `${CLAUDE_BIN:-claude}`, то есть при отсутствии переменной ищут ГОЛОЕ
+      # имя `claude` по PATH — а claude-control-session НАЗНАЧАЕТ СЕБЕ СВОЙ PATH
+      # ($HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin), мимо нашего stub_dir.
+      # Сегодня это безопасно ПО СЛУЧАЙНОСТИ: настоящий claude лежит в
+      # ~/.local/bin/claude, а $HOME подменён песочницей. Появись claude в /usr/local/bin —
+      # тест поднял бы НАСТОЯЩУЮ remote-control-сессию. Явное значение внутри песочницы
+      # закрывает это независимо от того, что и где лежит в системном PATH.
+      export CLAUDE_BIN="$stub_dir/claude"
       # tg-messages: пути АБСОЛЮТНЫЕ и не выводятся из $HOME, подмена HOME их не закрывает —
       # шов заведён в самом адаптере (T8 п.6), дефолт без переменной не изменился.
       export TG_MESSAGES_DB="$tg_dir/messages.db"

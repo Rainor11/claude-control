@@ -91,8 +91,11 @@ esac
 # API-баз — там недостижимый loopback), погашенные обязаны быть НЕ заданы. Проверка
 # механическая: список в раннере правится редко и молча, а его отсутствие означает
 # «забытый override ушёл в живой Asana / личную базу сообщений оператора».
+# CLAUDE_BIN здесь, а не в списке «погашенных» ниже (В2 ревью T8): голое имя `claude`
+# резолвилось бы по PATH, который bin/claude-control-session назначает себе САМ, мимо
+# заглушек раннера — форсированное значение внутри test root это закрывает.
 for v in ASANA_COMMENTS_ENV_FILE ASANA_PROJECT_ENV_FILE CLAUDE_AUTO_OPERATOR_ENV \
-         RNR_ENV_PATH DEPT_POLICY_DIR TG_MESSAGES_DB TG_MESSAGES_CONTACTS; do
+         RNR_ENV_PATH DEPT_POLICY_DIR TG_MESSAGES_DB TG_MESSAGES_CONTACTS CLAUDE_BIN; do
   val="$(eval "printf '%s' \"\${$v:-}\"")"
   [ -n "$val" ] || { echo "toy-migrated: шов $v не подменён раннером"; exit 1; }
   case "$val" in
@@ -107,7 +110,7 @@ for v in ASANA_COMMENTS_API_BASE ASANA_PROJECT_API_BASE; do
     *) echo "toy-migrated: API-база $v='$val' не заменена на недостижимый loopback"; exit 1 ;;
   esac
 done
-for v in ASANA_ACCESS_TOKEN CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN CLAUDE_BIN \
+for v in ASANA_ACCESS_TOKEN CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN \
          HTTPS_PROXY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PROJECTS_ROOT EVENT_BRIDGE_CONFIG; do
   eval "[ -z \"\${$v+set}\" ]" || { echo "toy-migrated: утечка — $v остался задан"; exit 1; }
 done

@@ -159,4 +159,23 @@ case "$out" in
 esac
 echo "OK: 6 — claude-control-session под маркером работает в test root (cd + --debug-file)"
 
+# ---------------------------------------------------------------------------------------
+# 7. В2 (ревью T8): claude-control-session БЕЗ явного CLAUDE_BIN обязан уйти в заглушку
+#    РАННЕРА, а не искать голое имя `claude` по PATH. Скрипт назначает себе СВОЙ PATH
+#    ($HOME/.local/bin:…), поэтому stub_dir раннера из PATH сюда не доживает — единственная
+#    граница здесь это форсированный tests/run::CLAUDE_BIN. Раньше раннер его, наоборот,
+#    unset'ил, и тест спасала лишь случайность (настоящий claude лежит в подменённом
+#    $HOME/.local/bin); появись claude в /usr/local/bin — поднялась бы НАСТОЯЩАЯ
+#    remote-control-сессия. Доказательство — по логу argv заглушки, не по коду возврата.
+# ---------------------------------------------------------------------------------------
+before=0; [ -f "$STUB_LOG" ] && before="$(wc -l < "$STUB_LOG")"
+out="$("$DIR/bin/claude-control-session" 2>&1)" \
+  || fail "claude-control-session без явного CLAUDE_BIN завершился ошибкой: $out"
+after=0; [ -f "$STUB_LOG" ] && after="$(wc -l < "$STUB_LOG")"
+[ "$after" -gt "$before" ] \
+  || fail "заглушка claude не вызвана — CLAUDE_BIN не форсирован раннером, голое имя ушло в PATH скрипта"
+command grep -qE "^claude$(printf '\t')remote-control" "$STUB_LOG" \
+  || fail "в логе заглушки нет вызова claude remote-control: $(cat "$STUB_LOG")"
+echo "OK: 7 — claude-control-session без явного CLAUDE_BIN уходит в заглушку раннера (В2)"
+
 echo "PASS control-scripts"
