@@ -42,7 +42,12 @@ done
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"
 RR="$BINDIR/dept-request-render"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на корень песочницы.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 
 # роль из реестра, пусто если воркер не найден. НЕ через `registry-get | jq` напрямую:
 # под set -euo pipefail «$DL» exit 1 (не найден) распространяется через pipefail и рвёт

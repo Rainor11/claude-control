@@ -14,7 +14,12 @@ set -u
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на корень песочницы.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 die() { echo "dept-sleep-exec: $*" >&2; exit 1; }
 
 approval="" worker="" reason=""
