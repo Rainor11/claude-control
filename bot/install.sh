@@ -8,7 +8,13 @@ set -euo pipefail
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$BOT_DIR/venv"
 UNIT_DIR="$HOME/.config/systemd/user"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на корень песочницы (иначе прогон установщика создал бы LOGDIR и вписал бы
+# боевой CONTROL_DIR в unit-файл). bot/ — подкаталог репозитория, поэтому ../lib верен всегда.
+# shellcheck disable=SC1091
+. "$BOT_DIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 LOGDIR="$CONTROL_DIR/rnr-bot"
 PROXY="${RNR_HTTPS_PROXY:-http://127.0.0.1:1081}"
 
