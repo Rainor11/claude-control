@@ -23,7 +23,12 @@ set -u
 SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CLAUDE_AUTO="$SELF_DIR/claude-auto"               # absolute sibling (not via PATH)
 ADAPTERS_DIR="$(cd "$SELF_DIR/.." 2>/dev/null && pwd)/channels/event-bridge/adapters"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на корень песочницы.
+# shellcheck disable=SC1091
+. "$SELF_DIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 # Trusted claude install tree. HARDCODED on purpose (NOT $HOME / NOT an env var):
 # identity is accepted only when the ancestor's real exe lives here, so a worker

@@ -23,7 +23,12 @@ name="${1:?usage: event-bridge-watch <name>}"
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 INJECT="$BIN_DIR/session-inject"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на корень песочницы. Путь ../lib верен в repo- и install-layout (в т.ч. symlink).
+# shellcheck disable=SC1091
+. "$BIN_DIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 home="$CONTROL_DIR/workers/$name"
 config="$home/event-bridge.config.json"
 statedir="$home/state"

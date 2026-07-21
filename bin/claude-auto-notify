@@ -14,7 +14,15 @@ set -u
 
 name="${1:-unknown}"
 [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || name="unknown"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed. Фейл резолва (без маркера — лишь при пустом HOME) НЕ вклинивает воркера: тихий
+# exit 0 (этот hook fail-safe — «any error exits 0», не должен блокировать ход).
+_t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 THROTTLE="${CLAUDE_AUTO_NOTIFY_THROTTLE:-60}"
 statedir="$CONTROL_DIR/workers/$name/state"

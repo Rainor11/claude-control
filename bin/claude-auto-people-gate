@@ -23,10 +23,20 @@
 set -u
 
 NAME="${1:-}"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 HARD_DENY='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"people-gate fail-closed: recipient could not be validated — treat as NOT whitelisted; escalate to the operator via claude-auto-tg and park, do not retry"}}'
 
 emit_hard_deny() { printf '%s\n' "$HARD_DENY"; exit 0; }
+
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed на песочницу. Фейл резолва (без маркера — лишь при пустом HOME) НЕ открывает
+# ворота: emit_hard_deny (контракт «FAIL-CLOSED by emitting a deny JSON»), не тихий exit.
+# Резолвится ПОСЛЕ emit_hard_deny — чтобы фейл мог им воспользоваться.
+_t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || emit_hard_deny
 
 case "$NAME" in ''|*[!a-zA-Z0-9_-]*) emit_hard_deny ;; esac
 ALLOW_FILE="$CONTROL_DIR/workers/$NAME/people-allow"

@@ -20,7 +20,15 @@
 # the timeout, send a WARNING (silence != success). Fail-safe: errors exit 0.
 set -u
 
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed. Фейл резолва (без маркера — лишь при пустом HOME) НЕ роняет oneshot грубо:
+# тихий exit 0 (контракт файла — «Fail-safe: errors exit 0»).
+_t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 TG="${CLAUDE_CONTROL_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 POINTER="${CLAUDE_CONTROL_BRIDGE_POINTER:-$HOME/.claude/projects/-home-rainor--claude-control/bridge-pointer.json}"
 DEBUG_LOG="${CLAUDE_CONTROL_DEBUG_FILE:-$CONTROL_DIR/control.debug.log}"

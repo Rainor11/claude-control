@@ -39,7 +39,15 @@ name="${1:-}"
 [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed. Фейл резолва (без маркера — лишь при пустом HOME) НЕ вклинивает запуск: тихий
+# exit 0, как любой сбой этого hook'а (контракт «SessionStart hook must never wedge launch»).
+_t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 home="$CONTROL_DIR/workers/$name"
 config="$home/event-bridge.config.json"
 logf="$home/logs/identity.log"

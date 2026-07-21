@@ -10,7 +10,15 @@
 # tradeoff; files are only touched when they exceed MAX_BYTES.
 set -u
 
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
+# fail-closed. Ротация best-effort и зовётся watchdog'ом/claude-rc каждый тик — фейл резолва
+# (без маркера — лишь при пустом HOME) не должен беспокоить вызывающего: тихий exit 0.
+_t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 # Honor the same explicit overrides the units already export; otherwise derive
 # everything from CONTROL_DIR (which install.sh fixes at ~/.claude-control on both
 # platforms, regardless of --prefix).
