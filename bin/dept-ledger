@@ -5,8 +5,17 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+// T5: корень отдела — через единый резолвер (lib/runtime-root.js, задача T1), профиль dept_only.
+// Особый случай: dept-ledger был единственным node-файлом с ХАРДКОДОМ /home/rainor вместо $HOME
+// для DEPT-фоллбэка. dept_only без маркера = (DEPT_HOME || $HOME/.claude-control/department): на
+// боевом сервере HOME=/home/rainor → байт-в-байт прежняя строка (проверено паритет-матрицей).
+// Осознанно НЕ auto_then_hardcoded: dept-ledger НИКОГДА не читал CLAUDE_AUTO_HOME (у неё
+// worker-dir семантика — claude-auto-run кладёт туда workers/<name>), и композит
+// «auto_then_hardcoded-корень + /department» принял бы каталог воркера за корень отдела.
+// Под CLAUDE_CONTROL_TEST_ROOT — fail-closed на <песочница>/department.
+const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
 
-const HOME = process.env.DEPT_HOME || '/home/rainor/.claude-control/department';
+const HOME = resolveRuntimeRoot('dept_only');
 const LEDGER = path.join(HOME, 'events.jsonl');
 const LOCK = LEDGER + '.lock';
 const KINDS = new Set(['message', 'message_status', 'approval', 'approval_status',
