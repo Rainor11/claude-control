@@ -25,7 +25,12 @@ set -u
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"
 NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
-DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
+# T5: DEPT_HOME-корень — через единый резолвер (lib/runtime-root.sh, задача T1). Профиль
+# dept_only: DEPT_HOME → $HOME/.claude-control/department. Без маркера CLAUDE_CONTROL_TEST_ROOT
+# возвращает ту же строку, что прежний inline-дефолт; под маркером — fail-closed на <песочница>/department.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/runtime-root.sh"
+DEPT="$(resolve_runtime_root dept_only)" || exit 1
 die() { echo "dept-exec-runner: $*" >&2; exit 1; }
 
 # Числовая защита (зеркало numEnv в dept-dispatcher/liveness/rebase-check): МУСОРНОЕ значение
