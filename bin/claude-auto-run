@@ -108,7 +108,14 @@ say() { echo "$(ts) claude-auto-run[$name]: $*" | tee -a "$log" >&2; }
 # fixed-recipient pattern: operator chat_id + bot token from the operator's server .env,
 # telegram_notify.sh at an absolute path. Used to flag a dropped/malformed MCP subscription.
 OPERATOR_ENV="/home/rainor/server/.env"
-TG_NOTIFY="/home/rainor/server/server_monitor/telegram_notify.sh"
+# T8 п.1: путь нотификатора — через гейтированный маркером шов (lib/process-control.sh,
+# process_control_notifier_path; библиотека уже подключена выше для guard'а tmux). Без
+# CLAUDE_CONTROL_TEST_ROOT возвращает БУКВАЛЬНО тот же литерал, что стоял здесь раньше, ни
+# одного чтения env — анти-подмена («absolute — NOT $PATH/env») в бою не слабеет. Под
+# валидным маркером обязана быть заглушка ВНУТРИ test root, иначе явный отказ: без этого
+# тестовый прогон писал бы живому оператору в Telegram. `|| exit 1` — тот же fail-closed,
+# что у resolve_runtime_root выше в этом файле (в бою недостижим: без маркера отказа нет).
+TG_NOTIFY="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
 notify_operator() {
   local text="$1" chat rnr_val; local -a botflag=()
   chat="$(awk -F= '/^TELEGRAM_CHAT_ID=/{gsub(/[^0-9]/,"",$2);print $2;exit}' "$OPERATOR_ENV" 2>/dev/null)"

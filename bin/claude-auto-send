@@ -16,22 +16,31 @@
 #   * the message is handed to telegram_notify.sh as a SINGLE argv element AFTER `--`,
 #     so a message starting with `--chat-id`/`--bot-token-env` can never be re-parsed
 #     as a flag and redirected;
-#   * the notifier path is ABSOLUTE (not $PATH/env), like claude-auto-tg.
+#   * the notifier path is ABSOLUTE (not $PATH/env), like claude-auto-tg — with the same
+#     single T8 exception: $TELEGRAM_NOTIFY is honored ONLY under a VALID
+#     CLAUDE_CONTROL_TEST_ROOT marker (see claude-auto-tg's header).
 #
 # Usage (worker-facing):  claude-auto-send tg <chat_id> <message…>
 # Allow in a worker by ABSOLUTE path only:
 #   Bash(/opt/projects/active/claude-control/bin/claude-auto-send:*)
 set -u
 
-TG="/home/rainor/server/server_monitor/telegram_notify.sh"   # absolute — NOT $PATH/env
 # T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Без маркера
 # CLAUDE_CONTROL_TEST_ROOT возвращает ту же строку, что прежний inline-дефолт; под маркером —
 # fail-closed на корень песочницы. Путь ../lib верен в repo- и install-layout (в т.ч. symlink).
+# T8 п.1: source'им lib/process-control.sh, а не lib/runtime-root.sh напрямую — первая
+# подтягивает вторую transitively (тот же приём, что в claude-auto-run), а нам нужна ещё и
+# process_control_notifier_path ниже. resolve_runtime_root после этого доступен как прежде.
 _t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 _t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
 # shellcheck disable=SC1091
-. "$_t5_bindir/../lib/runtime-root.sh"
+. "$_t5_bindir/../lib/process-control.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
+# T8 п.1: путь нотификатора — через гейтированный маркером шов. Без маркера — БУКВАЛЬНО тот
+# же литерал, что стоял здесь раньше, без единого чтения env (гарантия «absolute — NOT
+# $PATH/env» из шапки не слабеет); под ВАЛИДНЫМ маркером — заглушка внутри test root, иначе
+# явный отказ. Полное обоснование — в комментарии к самой функции (lib/process-control.sh).
+TG="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"            # trusted claude tree (hardcoded)
 
 die() { echo "claude-auto-send: $*" >&2; exit 1; }

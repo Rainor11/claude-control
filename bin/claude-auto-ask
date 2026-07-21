@@ -7,7 +7,9 @@
 #
 # Operator-only BY CONSTRUCTION (same guarantees as claude-auto-tg):
 #   * recipient (operator chat_id) is read from a FIXED absolute .env, notifier path
-#     is ABSOLUTE — a worker supplies only question text + button LABELS;
+#     is ABSOLUTE — a worker supplies only question text + button LABELS (T8: the sole
+#     override is $TELEGRAM_NOTIFY under a VALID CLAUDE_CONTROL_TEST_ROOT marker, see
+#     claude-auto-tg's header for why that does not weaken the guarantee);
 #   * worker identity comes from the spoof-resistant /proc ancestor (resolve_name),
 #     not from CLAUDE_AUTO_NAME — so the answer routes to the RIGHT session;
 #   * the question is handed to telegram_notify.sh as a SINGLE argv after `--`.
@@ -22,7 +24,17 @@
 #   Bash(/opt/projects/active/claude-control/bin/claude-auto-ask:*)
 set -u
 
-TG="/home/rainor/server/server_monitor/telegram_notify.sh"   # absolute — NOT $PATH/env
+# T8 п.1: путь нотификатора — через шов, ГЕЙТИРОВАННЫЙ тестовым маркером
+# (lib/process-control.sh::process_control_notifier_path) — полное обоснование и разбор
+# «почему анти-подмена не слабеет» в комментарии к самой функции и в шапке claude-auto-tg.
+# Без CLAUDE_CONTROL_TEST_ROOT возвращается БУКВАЛЬНО этот литерал, env не читается.
+# `readlink -f "$0"` — файл может вызываться через symlink, `dirname "$0"/../lib` тогда
+# промахнулся бы мимо репозитория (тот же приём, что в claude-auto-send/claude-auto-run).
+_caa_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_caa_bindir="$(cd "$(dirname "$_caa_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_caa_bindir/../lib/process-control.sh"
+TG="$(process_control_notifier_path "/home/rainor/server/server_monitor/telegram_notify.sh")" || exit 1
 OPERATOR_ENV="/home/rainor/server/.env"
 CLAUDE_INSTALL="/home/rainor/.local/share/claude"            # trusted claude tree
 DB="/opt/projects/active/claude-control/bot/rnr_db.py"

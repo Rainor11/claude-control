@@ -49,7 +49,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.normpath(os.path.join(HERE, "..", "bin"))
 SESSION_INJECT = os.path.join(BIN, "session-inject")
 CLAUDE_AUTO = os.path.join(BIN, "claude-auto")
-TG_NOTIFY = "/home/rainor/server/server_monitor/telegram_notify.sh"  # absolute
+# T8 п.1: TG_NOTIFY теперь вычисляется НИЖЕ, через _notifier_path (шов, гейтированный
+# тестовым маркером) — присвоение переехало под определение функции, других причин у
+# переноса нет. Путь к bash-библиотеке шва — тот же приём, что _RUNTIME_ROOT_LIB в rnr_db.
+_PROCESS_CONTROL_LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "process-control.sh"))
 
 # T5: единый резолвер корня рантайма. lib/runtime-root.sh (задача T1) — ЕДИНСТВЕННОЕ место,
 # где решается, валиден ли тестовый корень (sentinel, пересечение с боевым деревом, утечка
@@ -84,6 +87,43 @@ def _runtime_root(legacy_default):
     return rnr_db.runtime_root(legacy_default)
 
 
+def _notifier_path(hardcoded):
+    """Путь к telegram_notify.sh — шов, ГЕЙТИРОВАННЫЙ тестовым маркером (T8 п.1).
+
+    Без CLAUDE_CONTROL_TEST_ROOT возвращает hardcoded БЕЗ единого чтения env и без запуска
+    подпроцесса — побитовый паритет с прежней строкой `TG_NOTIFY = "/home/rainor/..."`,
+    гарантия «absolute» из комментария там не слабеет. Под маркером решение принимает
+    ОДНА реализация — process_control_notifier_path в lib/process-control.sh (та же логика,
+    что у четырёх bash-точек); питон её НЕ дублирует, иначе граница разъехалась бы с
+    bash-половиной при первой же правке — ровно тот довод, по которому _runtime_root выше
+    тоже делегирует в bash.
+
+    Отказ = sys.exit, а НЕ тихий фолбэк на боевой путь: тихий фолбэк означал бы «бот из
+    тестового прогона написал живому человеку в Telegram», ради чего точку и мигрировали.
+    Перехват OSError — как в rnr_db.runtime_root: без bash в PATH процесс иначе умер бы
+    трейсбеком вместо задуманного явного сообщения.
+    """
+    if "CLAUDE_CONTROL_TEST_ROOT" not in os.environ:
+        return hardcoded
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", '. "$1" && process_control_notifier_path "$2"',
+             "_", _PROCESS_CONTROL_LIB, hardcoded],
+            capture_output=True, text=True,
+        )
+    except OSError as exc:
+        sys.exit(f"rnr_workers_bot: не смог запустить резолвер шва нотификатора "
+                 f"({_PROCESS_CONTROL_LIB}): {exc}. Под маркером CLAUDE_CONTROL_TEST_ROOT "
+                 "фолбэк на боевой telegram_notify.sh запрещён.")
+    path = proc.stdout.strip()
+    if proc.returncode != 0 or not path:
+        reason = proc.stderr.strip() or (
+            f"process_control_notifier_path вернул rc={proc.returncode} и пустой путь")
+        sys.exit(f"rnr_workers_bot: {reason}")
+    return path
+
+
+TG_NOTIFY = _notifier_path("/home/rainor/server/server_monitor/telegram_notify.sh")
 CONTROL_DIR = _runtime_root(os.environ.get("CLAUDE_CONTROL_DIR",
                             os.path.join(os.path.expanduser("~"), ".claude-control")))
 WORKERS_DIR = os.path.join(CONTROL_DIR, "workers")

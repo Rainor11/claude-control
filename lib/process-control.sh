@@ -421,3 +421,57 @@ process_control_check_unit_dir() {
   fi
   return 0
 }
+
+# process_control_notifier_path <захардкоженный-абсолютный-путь> — печатает путь к
+# telegram_notify.sh для ПЯТИ точек, которые держат его абсолютным и НЕперекрываемым
+# НАМЕРЕННО (bin/claude-auto-tg, bin/claude-auto-ask, bin/claude-auto-send,
+# bin/claude-auto-run::notify_operator, bot/rnr_workers_bot.py — комментарий в коде:
+# «absolute — NOT $PATH/env», чтобы воркер не мог перенаправить уведомления оператору).
+#
+# ЗАЧЕМ ШОВ (T8, п.1). Из-за неперекрываемости тест не может подставить заглушку — забытый
+# override означает СООБЩЕНИЕ ЖИВОМУ ЧЕЛОВЕКУ. Ровно тот же класс, что systemctl/tmux в
+# шапке файла, только цена ошибки не "испорченный unit", а "воркер написал оператору из
+# тестового прогона".
+#
+# ПОЧЕМУ АНТИ-ПОДМЕНА НЕ СЛАБЕЕТ. Переопределение ($TELEGRAM_NOTIFY) читается ТОЛЬКО при
+# выставленном И валидном маркере — то есть когда resolve_runtime_root (T1) уже подтвердил
+# каталог с sentinel-файлом ВНЕ боевого дерева. Без маркера значение env не читается вовсе,
+# возвращается ровно переданный литерал. Воркер, желающий перенаправить уведомления, обязан
+# был бы выставить валидный маркер — но тогда у него уедет в песочницу и КОРЕНЬ рантайма
+# (реестр воркеров, spec.json, ledger), т.е. атака самоубийственна: он перестаёт видеть свой
+# же боевой контур. Уровень «полностью скомпрометированный воркер того же uid» этим не
+# закрывается и никогда не закрывался (см. честную границу в шапке bin/claude-auto-send).
+#
+# ОДИН КОНТРАКТ — ОДНО ИМЯ. Из трёх имён того же шва, которые сегодня экспортирует
+# tests/run (TELEGRAM_NOTIFY / CLAUDE_CONTROL_TG / CLAUDE_AUTO_TG), здесь читается ТОЛЬКО
+# TELEGRAM_NOTIFY: у остальных двух есть СВОИ живые читатели (bin/claude-auto-notify,
+# bin/claude-control-url-notify, bin/event-bridge-watch, bin/claude-auto-self-probes), где
+# они перекрываются и БЕЗ маркера — это легаси-поведение мы не трогаем. Гейтированные точки
+# сводим к одному имени, чтобы «подставил заглушку» означало ровно одну переменную.
+#
+# ПАРИТЕТА С JS-СТОРОНОЙ ЗДЕСЬ НЕТ СОЗНАТЕЛЬНО (в отличие от checkBinarySeam/tmuxSocketArgv):
+# у node-читателей нотификатора (bin/claude-auto-liveness, bin/dept-rebase-check,
+# bin/dept-dispatcher) шов и так открыт — `process.env.TELEGRAM_NOTIFY || '<путь>'`, гейтить
+# там нечего, и функция-близнец в lib/process-control.js была бы мёртвым кодом. Появится
+# node-точка с НЕперекрываемым путём — добавлять близнеца тогда, а не «на всякий случай».
+process_control_notifier_path() {
+  local hardcoded="${1:-}" test_root value
+  if [ -z "$hardcoded" ]; then
+    echo "process-control: process_control_notifier_path: usage: process_control_notifier_path <захардкоженный-абсолютный-путь>" >&2
+    return 1
+  fi
+  test_root="$(_process_control_test_root)" || return 1
+  if [ -z "$test_root" ]; then
+    # Без маркера — БУКВАЛЬНО переданный литерал, ни одного чтения env: побитовый паритет с
+    # прежней строкой `TG="/home/rainor/server/server_monitor/telegram_notify.sh"`.
+    printf '%s\n' "$hardcoded"
+    return 0
+  fi
+  # Под маркером дефолт — тот же боевой литерал, и он ОБЯЗАН провалить проверку шва (он вне
+  # test root). Это не обходной путь, а ровно тот же приём, что у process_control_preflight
+  # с `${SYSTEMCTL:-systemctl}`: «не переопределён» и «переопределён наружу» дают ОДИН и тот
+  # же явный отказ с уже написанным в T2 текстом причины, без второй реализации проверки.
+  value="${TELEGRAM_NOTIFY:-$hardcoded}"
+  process_control_check_binary_seam TELEGRAM_NOTIFY "$value" || return 1
+  printf '%s\n' "$value"
+}
