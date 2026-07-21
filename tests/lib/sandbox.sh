@@ -37,7 +37,12 @@ if [ -z "${_RUNTIME_ROOT_SENTINEL_NAME:-}" ]; then
   . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/runtime-root.sh"
 fi
 
-# new_test_root <имя-подкаталога> <имя-переменной-пути> <имя-массива-env>
+# ИМЯ. Функция называется make_test_subroot, а НЕ new_test_root: последнее уже занято
+# локальным хелпером в tests/process-control.test.sh (mktemp+sentinel без заглушек, другая
+# сигнатура). Если бы этот файл когда-нибудь подключили и туда, локальное определение молча
+# перекрыло бы общее — разные семантики под одним именем.
+#
+# make_test_subroot <имя-подкаталога> <имя-переменной-пути> <имя-массива-env>
 #
 # Создаёт подкорень <CLAUDE_CONTROL_TEST_ROOT>/<имя-подкаталога> (sentinel + копии заглушек
 # процесс-контроля + пустой department/) и заполняет ДВЕ переменные вызывающего (nameref):
@@ -48,54 +53,54 @@ fi
 #                           переставляет маркер + все три шва процесс-контроля.
 #
 # Использование:
-#   new_test_root planerka PL_ROOT PL_ENV
+#   make_test_subroot planerka PL_ROOT PL_ENV
 #   "${PL_ENV[@]}" "$DIR/bin/dept-ledger" list --kind message
 #   # журнал этого мира — "$PL_ROOT/department/events.jsonl"
-new_test_root() {
-  local _nts_name="${1:-}" _nts_path_var="${2:-}" _nts_env_var="${3:-}" _nts_dir _nts_stubs
-  if [ -z "$_nts_name" ] || [ -z "$_nts_path_var" ] || [ -z "$_nts_env_var" ]; then
-    echo "new_test_root: нужны три аргумента — <имя-подкаталога> <имя-переменной-пути> <имя-массива-env>" >&2
+make_test_subroot() {
+  local _mts_name="${1:-}" _mts_path_var="${2:-}" _mts_env_var="${3:-}" _mts_dir _mts_stubs
+  if [ -z "$_mts_name" ] || [ -z "$_mts_path_var" ] || [ -z "$_mts_env_var" ]; then
+    echo "make_test_subroot: нужны три аргумента — <имя-подкаталога> <имя-переменной-пути> <имя-массива-env>" >&2
     return 1
   fi
-  case "$_nts_name" in
+  case "$_mts_name" in
     */*|.|..|"")
-      echo "new_test_root: имя подкорня '$_nts_name' должно быть ОДНИМ сегментом без '/' (подкорень создаётся строго внутри песочницы раннера)" >&2
+      echo "make_test_subroot: имя подкорня '$_mts_name' должно быть ОДНИМ сегментом без '/' (подкорень создаётся строго внутри песочницы раннера)" >&2
       return 1
       ;;
   esac
   if [ -z "${CLAUDE_CONTROL_TEST_ROOT:-}" ]; then
-    echo "new_test_root: CLAUDE_CONTROL_TEST_ROOT не выставлен — подкорень строится только внутри песочницы раннера (запусти тест через tests/run)" >&2
+    echo "make_test_subroot: CLAUDE_CONTROL_TEST_ROOT не выставлен — подкорень строится только внутри песочницы раннера (запусти тест через tests/run)" >&2
     return 1
   fi
 
-  _nts_dir="$CLAUDE_CONTROL_TEST_ROOT/$_nts_name"
-  mkdir -p "$_nts_dir/department" || return 1
-  : > "$_nts_dir/$_RUNTIME_ROOT_SENTINEL_NAME" || return 1
+  _mts_dir="$CLAUDE_CONTROL_TEST_ROOT/$_mts_name"
+  mkdir -p "$_mts_dir/department" || return 1
+  : > "$_mts_dir/$_RUNTIME_ROOT_SENTINEL_NAME" || return 1
 
   # Копии заглушек процесс-контроля ВНУТРЬ подкорня (см. заголовок файла — почему копии,
   # а не симлинки). Источник — то, что подставил раннер; если шов не выставлен вовсе, тест
   # запущен не через раннер, и подкорень строить незачем.
-  _nts_stubs="$_nts_dir/stubs"
-  mkdir -p "$_nts_stubs" || return 1
-  local _nts_var _nts_bin _nts_src
-  for _nts_var in SYSTEMCTL:systemctl DEPT_SYSTEMD_RUN:systemd-run TMUX_BIN:tmux; do
-    _nts_bin="${_nts_var#*:}"
-    _nts_var="${_nts_var%%:*}"
-    _nts_src="${!_nts_var:-}"
-    if [ -z "$_nts_src" ]; then
-      echo "new_test_root: переменная шва $_nts_var не выставлена — заглушки процесс-контроля подставляет раннер (запусти тест через tests/run)" >&2
+  _mts_stubs="$_mts_dir/stubs"
+  mkdir -p "$_mts_stubs" || return 1
+  local _mts_var _mts_bin _mts_src
+  for _mts_var in SYSTEMCTL:systemctl DEPT_SYSTEMD_RUN:systemd-run TMUX_BIN:tmux; do
+    _mts_bin="${_mts_var#*:}"
+    _mts_var="${_mts_var%%:*}"
+    _mts_src="${!_mts_var:-}"
+    if [ -z "$_mts_src" ]; then
+      echo "make_test_subroot: переменная шва $_mts_var не выставлена — заглушки процесс-контроля подставляет раннер (запусти тест через tests/run)" >&2
       return 1
     fi
-    cp -- "$_nts_src" "$_nts_stubs/$_nts_bin" || return 1
-    chmod +x "$_nts_stubs/$_nts_bin" || return 1
+    cp -- "$_mts_src" "$_mts_stubs/$_mts_bin" || return 1
+    chmod +x "$_mts_stubs/$_mts_bin" || return 1
   done
 
-  declare -n _nts_path_ref="$_nts_path_var"
-  declare -n _nts_env_ref="$_nts_env_var"
-  _nts_path_ref="$_nts_dir"
-  _nts_env_ref=(env -u CLAUDE_CONTROL_DIR -u CLAUDE_AUTO_HOME -u DEPT_HOME
-    "CLAUDE_CONTROL_TEST_ROOT=$_nts_dir"
-    "SYSTEMCTL=$_nts_stubs/systemctl"
-    "DEPT_SYSTEMD_RUN=$_nts_stubs/systemd-run"
-    "TMUX_BIN=$_nts_stubs/tmux")
+  declare -n _mts_path_ref="$_mts_path_var"
+  declare -n _mts_env_ref="$_mts_env_var"
+  _mts_path_ref="$_mts_dir"
+  _mts_env_ref=(env -u CLAUDE_CONTROL_DIR -u CLAUDE_AUTO_HOME -u DEPT_HOME
+    "CLAUDE_CONTROL_TEST_ROOT=$_mts_dir"
+    "SYSTEMCTL=$_mts_stubs/systemctl"
+    "DEPT_SYSTEMD_RUN=$_mts_stubs/systemd-run"
+    "TMUX_BIN=$_mts_stubs/tmux")
 }

@@ -1,8 +1,9 @@
+// T6: обязательный пролог изоляции (tests/lib/bootstrap.mjs) — первым значимым действием файла.
+import './lib/bootstrap.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -14,7 +15,10 @@ const STALE_AFTER = 1800_000; // 30 мин — дефолт CLAUDE_AUTO_STALE_SE
 
 // Песочница: клиентская папка + фейковый транскрипт по схеме ~/.claude/projects/<dir>/<sid>.jsonl
 function sandbox({ files = {}, txAgeMs = 0 }) {
-  const root = mkdtempSync(join(tmpdir(), 'memfresh-'));
+  // T6: песочница сценария — внутри тестового корня раннера (раньше `tmpdir()`), чтобы
+  // раннер убрал её за собой. Корнем рантайма этот каталог не является (это brain-путь
+  // клиента + фейковый ~/.claude/projects), резолвер T1 его не проверяет.
+  const root = mkdtempSync(join(process.env.CLAUDE_CONTROL_TEST_ROOT, 'memfresh-'));
   const brain = join(root, 'клиент');
   mkdirSync(brain, { recursive: true });
   const now = Date.now();

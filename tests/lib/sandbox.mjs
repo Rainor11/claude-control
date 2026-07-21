@@ -27,7 +27,7 @@ const SEAMS = [
   ['TMUX_BIN', 'tmux'],
 ];
 
-// newTestRoot(prefix) → { root, dept, env }
+// makeTestSubroot(prefix) → { root, dept, env }
 //   root — абсолютный путь свежего подкорня внутри песочницы раннера (mkdtemp — имена не
 //          сталкиваются, можно звать в цикле по одному на каждый тест-кейс);
 //   dept — <root>/department, то, что вернёт резолвер для профиля dept_only (журнал отдела
@@ -35,10 +35,10 @@ const SEAMS = [
 //   env  — патч окружения для запуска боевой команды под ЭТИМ подкорнем. Легаси-переменные
 //          гасятся (undefined в spread'е поверх process.env оставил бы старое значение —
 //          поэтому execFileSync-обёртки обязаны раскладывать env через buildEnv ниже).
-export function newTestRoot(prefix = 'root-') {
+export function makeTestSubroot(prefix = 'root-') {
   const base = process.env.CLAUDE_CONTROL_TEST_ROOT;
   if (!base) {
-    throw new Error('newTestRoot: CLAUDE_CONTROL_TEST_ROOT не выставлен — подкорень строится только внутри песочницы раннера (запусти тест через tests/run)');
+    throw new Error('makeTestSubroot: CLAUDE_CONTROL_TEST_ROOT не выставлен — подкорень строится только внутри песочницы раннера (запусти тест через tests/run)');
   }
   const root = mkdtempSync(join(base, prefix));
   writeFileSync(join(root, SENTINEL_NAME), '');
@@ -51,7 +51,7 @@ export function newTestRoot(prefix = 'root-') {
   for (const [varName, binName] of SEAMS) {
     const src = process.env[varName];
     if (!src) {
-      throw new Error(`newTestRoot: переменная шва ${varName} не выставлена — заглушки процесс-контроля подставляет раннер (запусти тест через tests/run)`);
+      throw new Error(`makeTestSubroot: переменная шва ${varName} не выставлена — заглушки процесс-контроля подставляет раннер (запусти тест через tests/run)`);
     }
     const dst = join(stubs, binName);
     // КОПИЯ, не симлинк: T2 канонизирует шов через realpath перед containment-проверкой,

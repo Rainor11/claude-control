@@ -91,7 +91,7 @@ echo "$out3b" | command grep -q 'зарезервировано' || fail "отк
 #         скрипту нужен REPO=bin/.. с настоящими examples/department/*.template.*) ----------
 # Свой подкорень: рендер льёт missions/render в СВОЙ department, не мешаясь с журналом
 # основного сценария (раньше эту роль играл отдельный `mktemp -d` в DEPT_HOME).
-new_test_root render RENDER_ROOT RENDER_ENV
+make_test_subroot render RENDER_ROOT RENDER_ENV
 RENDER_DEPT_HOME="$RENDER_ROOT/department"
 BRAIN_CLIENTS_TEST="$RENDER_ROOT/brain-clients"
 mkdir -p "$BRAIN_CLIENTS_TEST"
@@ -216,7 +216,7 @@ echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об
 # Свой подкорень: у планёрки собственный реестр отдела и собственный autonomous.json
 # (раньше — три отдельных `mktemp -d`), смешивать их с основным сценарием нельзя: exec
 # рассылает policy_refresh ВСЕМ active-воркерам из autonomous.json и перезаписывает его.
-new_test_root planerka PL_ROOT PL_ENV
+make_test_subroot planerka PL_ROOT PL_ENV
 PL_DEPT="$PL_ROOT/department"; PL_CTRL="$PL_ROOT"; PL_POL="$PL_ROOT/policy"
 mkdir -p "$PL_POL" "$PL_CTRL/workers"
 printf '# правила v9\n' > "$PL_POL/policy-v9.md"

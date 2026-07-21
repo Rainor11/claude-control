@@ -1,7 +1,7 @@
+import './lib/bootstrap.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -101,8 +101,17 @@ test('EXEC_KINDS_INBOX (dept-inbox) синхронен с EXEC_KINDS dispatcher'
 // тест через реальный dept-ledger (зеркало 'pickExecutable через реальный ledger' в
 // dept-dispatcher.test.mjs) — dispatcherWill не экспортируется отдельно.
 test('collectApprovalsPage: liveness_restart от watchdog — фаза approved, не approved_foreign', async (t) => {
-  const home = mkdtempSync(join(tmpdir(), 'dept-inbox-'));
-  const polDir = mkdtempSync(join(tmpdir(), 'dept-inbox-pol-'));
+  // T6: каталоги — в песочнице раннера, а НЕ в `mkdtempSync(tmpdir())`. Под маркером
+  // резолвер T1 отвергает DEPT_HOME, указывающий наружу корня, а collectApprovalsPage
+  // работает ВНУТРИ этого процесса (bin/dept-inbox уже загружен с корнем-песочницей) —
+  // значит журнал обязан лежать ровно там, куда его положит резолвер: <корень>/department.
+  // Отдельный подкорень здесь не нужен: это единственный сценарий файла, который вообще
+  // трогает журнал, смешиваться не с чем.
+  const root = process.env.CLAUDE_CONTROL_TEST_ROOT;
+  const home = join(root, 'department');
+  const polDir = join(root, 'policy');
+  mkdirSync(home, { recursive: true });
+  mkdirSync(polDir, { recursive: true });
   writeFileSync(join(polDir, 'policy-v1.md'), '# правила v1\n');
   const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
   const env = { ...process.env, DEPT_HOME: home, DEPT_POLICY_DIR: polDir };

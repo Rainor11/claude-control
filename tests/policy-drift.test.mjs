@@ -1,3 +1,6 @@
+// T6: обязательный пролог изоляции (tests/lib/bootstrap.mjs) — первым значимым действием
+// файла, до любого импорта bin/*: модули отдела резолвят корень рантайма уже на загрузке.
+import './lib/bootstrap.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';

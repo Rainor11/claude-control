@@ -79,14 +79,7 @@ declare -A LEGACY_ALLOWLIST=(
   [tests/rnr-bot-withdraw.test.sh]=1
   [tests/rnr-db-sanitize.test.sh]=1
   [tests/runtime-root.test.sh]=1
-  [tests/dept-dispatcher.test.mjs]=1
-  [tests/dept-inbox.test.mjs]=1
-  [tests/dept-ledger.test.mjs]=1
-  [tests/dept-memory-freshness.test.mjs]=1
-  [tests/liveness-decide.test.mjs]=1
-  [tests/policy-drift.test.mjs]=1
   [tests/process-control.test.mjs]=1
-  [tests/rebase-check-decide.test.mjs]=1
   [tests/runtime-root.test.mjs]=1
 )
 

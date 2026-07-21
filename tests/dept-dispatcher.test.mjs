@@ -1,15 +1,17 @@
+import './lib/bootstrap.mjs';
+import { makeTestSubroot, buildEnv } from './lib/sandbox.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 const { pickExecutable, newProbeLines, decideSleep, EXEC_KINDS, stuckExecuting, runnerArgv, humanApproval, staleOpenApprovals, openReminderLabel } = createRequire(import.meta.url)('../bin/dept-dispatcher');
 
 const LEDGER = new URL('../bin/dept-ledger', import.meta.url).pathname;
-const led = (home, args) => execFileSync(LEDGER, args, { env: { ...process.env, DEPT_HOME: home }, encoding: 'utf8' });
+// T6: журнал сценария живёт в СВОЁМ подкорне (makeTestSubroot), а не в `mkdtempSync(tmpdir())`
+// — под маркером резолвер T1 считает корень единственным источником правды и законно
+// отвергает DEPT_HOME, указывающий наружу песочницы. Первый аргумент — объект подкорня.
+const led = (w, args) => execFileSync(LEDGER, args, { env: buildEnv(w.env), encoding: 'utf8' });
 
 test('EXEC_KINDS: только исполняемые диспетчером kind_of', () => {
   assert.deepEqual([...EXEC_KINDS].sort(), ['liveness_restart', 'mission_change', 'planerka', 'sleep', 'worker_spawn']);
@@ -85,14 +87,14 @@ test('newProbeLines: пустые строки игнорируются', () => 
 // CLI + pickExecutable), а не только чистую функцию — иначе регрессия в effectiveStatus
 // осталась бы незамеченной юнит-тестом на синтетических данных.
 test('pickExecutable через реальный ledger: заявка со статусом executing не попадает в approved-выборку', () => {
-  const home = mkdtempSync(join(tmpdir(), 'dept-'));
+  const w = makeTestSubroot('dept-');
   const roleOf = (n) => ({ 'dept-head': 'руководитель' }[n]);
-  const a = JSON.parse(led(home, ['approval-open', '--kind-of', 'worker_spawn', '--summary', 's', '--actor', 'dept-head']));
-  const b = JSON.parse(led(home, ['approval-open', '--kind-of', 'planerka', '--summary', 's2', '--actor', 'dept-head']));
-  led(home, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
-  led(home, ['approval-resolve', b.event_id, '--status', 'approved', '--actor', 'operator']);
-  led(home, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']); // "другой тик уже взял"
-  const approvedRows = led(home, ['list', '--kind', 'approval', '--status', 'approved'])
+  const a = JSON.parse(led(w, ['approval-open', '--kind-of', 'worker_spawn', '--summary', 's', '--actor', 'dept-head']));
+  const b = JSON.parse(led(w, ['approval-open', '--kind-of', 'planerka', '--summary', 's2', '--actor', 'dept-head']));
+  led(w, ['approval-resolve', a.event_id, '--status', 'approved', '--actor', 'operator']);
+  led(w, ['approval-resolve', b.event_id, '--status', 'approved', '--actor', 'operator']);
+  led(w, ['approval-exec', a.event_id, '--status', 'executing', '--actor', 'dispatcher']); // "другой тик уже взял"
+  const approvedRows = led(w, ['list', '--kind', 'approval', '--status', 'approved'])
     .trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const executable = pickExecutable(approvedRows, roleOf);
   assert.deepEqual(executable.map((r) => r.event_id), [b.event_id]); // только b, a уже executing
