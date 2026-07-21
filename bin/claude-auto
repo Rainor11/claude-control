@@ -52,7 +52,12 @@ REPO_DIR="$(cd "$BIN_DIR/.." && pwd)"
 # symlink — $BIN_DIR уже разрешён readlink -f выше.
 # shellcheck disable=SC1091
 . "$BIN_DIR/../lib/process-control.sh"
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), уже
+# подгруженный transitively из process-control.sh выше. Без маркера CLAUDE_CONTROL_TEST_ROOT
+# возвращает ту же строку, что прежний inline-дефолт (${CLAUDE_CONTROL_DIR:-$HOME/.claude-control});
+# под маркером — fail-closed на корень песочницы. DEPT в cmd_mission_update ниже остаётся
+# производным от этого CONTROL_DIR (композитный DEPT), поэтому тоже уходит в песочницу.
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 WORKERS_DIR="$CONTROL_DIR/workers"
 REGISTRY="$CONTROL_DIR/autonomous.json"
 EB_DIR="$REPO_DIR/channels/event-bridge"
