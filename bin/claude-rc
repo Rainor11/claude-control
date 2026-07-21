@@ -3,12 +3,35 @@
 # for a project listed in ~/.claude-control/projects.yaml.
 set -euo pipefail
 
-PROJECTS_FILE="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
+# T8 п.3: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), как у
+# остальных 18 control_only-точек после T5. До этого файл резолвил $HOME/.claude-control
+# сам, мимо резолвера: под тестовым маркером его спасала ТОЛЬКО подмена HOME раннером, то
+# есть случайность, а не проверяемая граница.
+#
+# РЕЗОЛВ СВОЕГО ПУТИ — ОБЯЗАТЕЛЬНО ЧЕРЕЗ `readlink -f "$0"`. install.sh кладёт этот файл в
+# ~/.local/bin СИМЛИНКОМ на репозиторий (проверено на живом сервере), а ~/.local/lib пуст —
+# без разыменования `dirname "$0"/../lib` указывал бы в пустой ~/.local/lib и source упал бы.
+#
+# Переменная `self_dir` НИЖЕ (резолв соседних claude-control-* хелперов) НАМЕРЕННО остаётся
+# без readlink: у неё ДРУГАЯ семантика — «хелпер из ТОГО ЖЕ install'а, что и запущенный
+# claude-rc» (см. комментарий на месте), и она попадает в командную строку tmux. Разыменовав
+# её заодно, мы поменяли бы поведение установки, а не только резолв корня.
+_t8_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t8_bindir="$(cd "$(dirname "$_t8_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t8_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
+
+# Вызовы tmux в этом файле СОЗНАТЕЛЬНО НЕ переведены на process_control_tmux (guard T2):
+# claude-rc адресует ДЕФОЛТНЫЙ tmux-сокет (голый `tmux`, без -L/-S), а guard без маркера
+# даёт `-L claude-<name>` — это ДРУГОЙ сокет, то есть не паритет, а смена поведения живых
+# сессий. Под маркером голый `tmux` всё равно уходит в заглушку раннера через PATH-shadow.
+PROJECTS_FILE="${CLAUDE_RC_PROJECTS_FILE:-$CONTROL_DIR/projects.yaml}"
 CAPACITY="${CLAUDE_RC_CAPACITY:-5}"
 # Per-project log dir. tmux keeps pane output only in its in-memory scrollback;
 # we mirror it to a file so a session's fate (de-register 403 / reconnect flap /
 # clean exit) is visible after the fact - and as a future heartbeat source.
-LOG_DIR="${CLAUDE_RC_LOG_DIR:-$HOME/.claude-control/sessions}"
+LOG_DIR="${CLAUDE_RC_LOG_DIR:-$CONTROL_DIR/sessions}"
 
 usage() {
   cat <<EOF

@@ -19,11 +19,27 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-cd "$HOME/.claude-control" || exit 1
+# T8 п.3: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), как у
+# остальных control_only-точек после T5; до этого файл резолвил $HOME/.claude-control сам,
+# мимо резолвера. Source стоит ПОСЛЕ загрузки ENV_FILE выше — намеренно: если оператор
+# положил в env-файл CLAUDE_CONTROL_DIR, резолвер обязан его увидеть (control_only это и
+# значит). Библиотека НЕ ставит `set -u` (см. её шапку), поэтому подключение в скрипт без
+# `set -u` ничего ему не навязывает.
+#
+# `readlink -f "$0"` ОБЯЗАТЕЛЕН: install.sh кладёт этот файл в ~/.local/bin СИМЛИНКОМ на
+# репозиторий (проверено на живом сервере), а ~/.local/lib пуст — без разыменования
+# `dirname "$0"/../lib` промахнулся бы и ExecStart юнита claude-control.service упал бы.
+_t8_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t8_bindir="$(cd "$(dirname "$_t8_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t8_bindir/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
+
+cd "$CONTROL_DIR" || exit 1
 # --debug-file gives the watchdog a real liveness signal: it records actual
 # network/poll activity, unlike control.log which only updates on TUI redraws and
 # so looks identical when healthy-idle vs frozen ("zombie-Connected" after a 403
 # flap). The watchdog heartbeats on this file's mtime. logrotate caps its growth.
-DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$HOME/.claude-control/control.debug.log}"
+DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$CONTROL_DIR/control.debug.log}"
 exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1 \
   --debug-file "$DEBUG_FILE"

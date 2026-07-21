@@ -39,9 +39,25 @@ case "$OS_KIND" in
   *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;
 esac
 
-LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
-DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$HOME/.claude-control/control.debug.log}"
-WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
+# T8 п.3: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), как у
+# остальных control_only-точек после T5; до этого файл резолвил $HOME/.claude-control сам,
+# мимо резолвера. Из той же библиотеки (transitively через process-control.sh) берётся guard
+# процесс-контроля для kick() ниже.
+#
+# `readlink -f "$0"` ОБЯЗАТЕЛЕН: install.sh кладёт этот файл в ~/.local/bin СИМЛИНКОМ на
+# репозиторий (проверено на живом сервере), а ~/.local/lib пуст — без разыменования
+# `dirname "$0"/../lib` промахнулся бы и source упал. Переменная `self_dir` ниже (резолв
+# соседнего claude-control-logrotate) НАМЕРЕННО остаётся без readlink: у неё другая
+# семантика — «хелпер из ТОГО ЖЕ install'а», см. комментарий на месте.
+_t8_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+_t8_bindir="$(cd "$(dirname "$_t8_self")" && pwd)"
+# shellcheck disable=SC1091
+. "$_t8_bindir/../lib/process-control.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
+
+LOG="${CLAUDE_CONTROL_LOG:-$CONTROL_DIR/control.log}"
+DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$CONTROL_DIR/control.debug.log}"
+WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$CONTROL_DIR/watchdog.log}"
 # Default LABEL depends on supervisor: launchd uses reverse-DNS, systemd
 # uses a fixed unit name.
 case "$OS_KIND" in
@@ -68,7 +84,7 @@ fi
 STALE_SECONDS="${CLAUDE_CONTROL_STALE_SECONDS:-150}"
 MAX_STALE_SECONDS="${CLAUDE_CONTROL_MAX_STALE_SECONDS:-900}"
 MISS_THRESHOLD="${CLAUDE_CONTROL_MISS_THRESHOLD:-2}"
-MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$HOME/.claude-control/.watchdog-misses}"
+MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$CONTROL_DIR/.watchdog-misses}"
 # ARM gates the actual kick. Default 0 = dry run (log the verdict, never restart),
 # so the detector can be calibrated against real traffic before it's allowed to
 # kill a session. Set to 1 to arm.
@@ -84,10 +100,21 @@ esc=$'\033'
 strip_ansi() { sed -E "s/${esc}\\[[0-9;?]*[a-zA-Z]//g"; }
 
 # kick the supervisor to restart the control unit.
+#
+# T8 п.3: linux-ветка идёт через guard процесс-контроля (process_control_systemctl, T2), а не
+# голым `systemctl`. Это была ЕДИНСТВЕННАЯ оставшаяся точка, где боевой systemctl вызывался в
+# обход шва: под маркером её прикрывала только PATH-заглушка раннера, то есть
+# defense-in-depth вместо проверки. Паритет: без маркера guard делает
+# `"${SYSTEMCTL:-systemctl}" "$@"` — при невыставленной SYSTEMCTL это буквально прежняя
+# строка (тот же переопределяемый шов, что уже у bin/dept-liveness-exec).
+#
+# Darwin-ветка (`launchctl kickstart`) НЕ переведена: guard'а класса launchctl не существует,
+# а выдумывать его ради ветки, недостижимой на этом сервере, — новая непроверяемая
+# поверхность. Зафиксировано как известная граница, а не забыто.
 kick() {
   case "$OS_KIND" in
     Darwin) launchctl kickstart -k "gui/$UID/$LABEL" ;;
-    *)      systemctl --user restart "$LABEL" ;;
+    *)      process_control_systemctl --user restart "$LABEL" ;;
   esac
 }
 

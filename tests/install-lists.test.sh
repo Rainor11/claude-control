@@ -48,10 +48,11 @@ done
 
 # Юниты: КАЖДЫЙ *_UNIT, который install.sh рендерит/включает, обязан упоминаться в
 # uninstall.sh (там он и disable'ится, и удаляется — оба цикла ходят по одному набору имён).
-for unit in $(command grep -oE '^[A-Z_]+_UNIT="[a-z0-9.-]+"' "$DIR/install.sh" | cut -d'"' -f2 | sort -u); do
+while IFS= read -r unit; do
+  [ -n "$unit" ] || continue
   command grep -q "\"$unit\"" "$DIR/uninstall.sh" \
     || fail "юнит '$unit' install.sh ставит, а uninstall.sh про него не знает — после сноса останется включённый юнит с ExecStart на удалённый бинарь"
   echo "OK: юнит $unit снимается"
-done
+done < <(command grep -oE '^[A-Z_]+_UNIT="[a-z0-9.-]+"' "$DIR/install.sh" | cut -d'"' -f2 | sort -u)
 
 echo "PASS install-lists"
