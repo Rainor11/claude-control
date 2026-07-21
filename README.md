@@ -83,6 +83,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`examples/`](./examples/) - стартовые `projects.yaml`, `CLAUDE.md`, `settings.local.json` для `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) - схема: что где живет, как взаимодействует.
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) - типовые поломки (сессия гаснет на простое, пустой watchdog-лог, сон Mac'а).
+- [`docs/testing.md`](./docs/testing.md) - как гонять `tests/*` (только через `tests/run`) и почему нельзя напрямую.
 - [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh) - установка и снос.
 
 ## Что лежит после установки
@@ -91,8 +92,9 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-run, claude-control-logrotate
-  claude-control-session, claude-control-watchdog
+  claude-rc, claude-auto, claude-auto-self-probes, claude-auto-tg
+  claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog, claude-control-url-notify
 
 ~/Library/LaunchAgents/
   com.<user>.claude-control.plist
@@ -112,8 +114,9 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-run, claude-control-logrotate
-  claude-control-session, claude-control-watchdog
+  claude-rc, claude-auto, claude-auto-self-probes, claude-auto-tg
+  claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog, claude-control-url-notify
 
 ~/.config/systemd/user/
   claude-control.service

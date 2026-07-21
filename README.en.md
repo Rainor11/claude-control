@@ -82,7 +82,9 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
+  claude-rc, claude-auto, claude-auto-self-probes, claude-auto-tg
+  claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog, claude-control-url-notify
 
 ~/Library/LaunchAgents/
   com.<user>.claude-control.plist
@@ -101,7 +103,9 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
+  claude-rc, claude-auto, claude-auto-self-probes, claude-auto-tg
+  claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog, claude-control-url-notify
 
 ~/.config/systemd/user/
   claude-control.service

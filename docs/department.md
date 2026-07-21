@@ -8,9 +8,15 @@ autonomous-слоя (`docs/autonomous.md`; там же — headless-механи
 
 ## Ledger
 
-`~/.claude-control/department/events.jsonl` (override `DEPT_HOME`) —
-append-only JSONL, единственный писатель `bin/dept-ledger` (lockfile,
-живёт ≤10с на запись). Конверт: `{v, event_id, seq, ts, actor, kind, data}`.
+`~/.claude-control/department/events.jsonl` — append-only JSONL, единственный
+писатель `bin/dept-ledger` (lockfile, живёт ≤10с на запись). Путь резолвится
+по профилю `dept_only` (`lib/runtime-root.sh`): override `DEPT_HOME`, иначе
+`<CONTROL_DIR>/department` — но это НЕ единый override для всего отдела,
+другие части (`dept-inbox`, `dept-dispatcher`, `claude-auto-liveness`,
+`dept-rebase-check`) резолвят корень отдельным профилем
+(`auto_then_hardcoded` — override `CLAUDE_AUTO_HOME`, иначе фиксированный
+боевой путь), `DEPT_HOME` на них не влияет. Полная таблица профилей —
+`lib/runtime-root.sh`. Конверт: `{v, event_id, seq, ts, actor, kind, data}`.
 `kind` ∈ `message, message_status, approval, approval_status, incident,
 incident_status, agent_run, registry_change, policy_ack`. Статусные
 `*_status` ссылаются на исходное событие через `data.ref = event_id` — сам
