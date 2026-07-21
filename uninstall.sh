@@ -52,6 +52,10 @@ WATCHDOG_SERVICE_UNIT="claude-control-watchdog.service"
 WATCHDOG_TIMER_UNIT="claude-control-watchdog.timer"
 LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
+# T8 п.2: install.sh рендерит и `systemctl --user enable` ЕЩЁ и этот юнит (boot-time oneshot,
+# см. install.sh URL_NOTIFY_UNIT), а снос его не знал вовсе — после uninstall оставался
+# включённый юнит, чей ExecStart указывает на уже удалённый bin/claude-control-url-notify.
+URL_NOTIFY_UNIT="claude-control-url-notify.service"
 
 BIN_DIR="$PREFIX/bin"
 # LIB_DIR sibling of BIN_DIR — зеркалит install.sh (T1: .superpowers/sdd/iso-t1-brief.md),
@@ -91,7 +95,7 @@ else  # linux
 
   # Tolerant of missing units: --no-watchdog installs leave only the control
   # service; old installs may not have all units.
-  for unit in "$LOGROTATE_TIMER_UNIT" "$LOGROTATE_SERVICE_UNIT" \
+  for unit in "$URL_NOTIFY_UNIT" "$LOGROTATE_TIMER_UNIT" "$LOGROTATE_SERVICE_UNIT" \
               "$WATCHDOG_TIMER_UNIT" "$WATCHDOG_SERVICE_UNIT" "$SERVICE_UNIT"; do
     if systemctl --user list-unit-files "$unit" 2>/dev/null | grep -q "^$unit"; then
       say "Stop+disable $unit"
@@ -99,7 +103,7 @@ else  # linux
     fi
   done
 
-  for f in "$UNIT_DIR/$LOGROTATE_TIMER_UNIT" "$UNIT_DIR/$LOGROTATE_SERVICE_UNIT" \
+  for f in "$UNIT_DIR/$URL_NOTIFY_UNIT" "$UNIT_DIR/$LOGROTATE_TIMER_UNIT" "$UNIT_DIR/$LOGROTATE_SERVICE_UNIT" \
            "$UNIT_DIR/$WATCHDOG_TIMER_UNIT" "$UNIT_DIR/$WATCHDOG_SERVICE_UNIT" "$UNIT_DIR/$SERVICE_UNIT"; do
     if [[ -e "$f" ]]; then
       say "Remove $f"
@@ -111,8 +115,14 @@ else  # linux
 
 fi
 
-for script in claude-rc claude-control-run claude-control-logrotate \
-              claude-control-session claude-control-watchdog; do
+# T8 п.2: список ОБЯЗАН совпадать со списком install.sh (там их девять — см. цикл
+# `for script in claude-rc claude-auto ...` в install.sh). Раньше здесь было пять, и после
+# uninstall в $BIN_DIR оставались claude-auto, claude-auto-self-probes, claude-auto-tg,
+# claude-control-url-notify — в режиме --link ещё и висячими symlink'ами. Предсуществующий
+# дефект чистоты сноса, к изоляции тестов отношения не имеет.
+for script in claude-rc claude-auto claude-auto-self-probes claude-auto-tg claude-control-run \
+              claude-control-logrotate claude-control-session claude-control-watchdog \
+              claude-control-url-notify; do
   target="$BIN_DIR/$script"
   if [[ -e "$target" || -L "$target" ]]; then
     say "Remove $target"
