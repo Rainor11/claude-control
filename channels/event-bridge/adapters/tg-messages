@@ -52,8 +52,16 @@ try:
 except Exception:
     pass
 
-DEFAULT_DB = "/home/rainor/server/services/rainor_ai_business/messages.db"
-DEFAULT_CONTACTS = "/home/rainor/server/services/rainor_ai_business/contacts.json"
+# T8 п.6: тест-швы того же класса, что ASANA_COMMENTS_ENV_FILE/ASANA_PROJECT_API_BASE у
+# соседних адаптеров. Пути АБСОЛЮТНЫЕ и не выводятся из $HOME, поэтому подмена HOME
+# раннером (tests/run) их НЕ закрывает: тест, забывший передать --db/--contacts, читал бы
+# ЛИЧНУЮ базу сообщений оператора. Оба значения по умолчанию не меняются ни на байт —
+# переменные в боевом контуре не выставлены, а явные --db/--contacts, как и раньше,
+# побеждают. tests/run выставляет их в песочницу принудительно, для всех тестов сразу.
+DEFAULT_DB = os.environ.get("TG_MESSAGES_DB",
+                            "/home/rainor/server/services/rainor_ai_business/messages.db")
+DEFAULT_CONTACTS = os.environ.get("TG_MESSAGES_CONTACTS",
+                                  "/home/rainor/server/services/rainor_ai_business/contacts.json")
 STATE_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
 
 SELECT_COLS = ("id, chat_id, message_id, date, sender_name, sender_username, "

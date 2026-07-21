@@ -87,6 +87,30 @@ esac
 [ -n "${TELEGRAM_NOTIFY:-}" ] || { echo "toy-migrated: TELEGRAM_NOTIFY не выставлен"; exit 1; }
 [ -n "${RNR_ASKS_DB:-}" ] || { echo "toy-migrated: RNR_ASKS_DB не выставлен"; exit 1; }
 [ "$HOME" != "/home/rainor" ] || { echo "toy-migrated: HOME указывает на боевой домашний каталог"; exit 1; }
+# T8 п.6: список швов «наружу». Подменённые обязаны указывать ВНУТРЬ test root (кроме
+# API-баз — там недостижимый loopback), погашенные обязаны быть НЕ заданы. Проверка
+# механическая: список в раннере правится редко и молча, а его отсутствие означает
+# «забытый override ушёл в живой Asana / личную базу сообщений оператора».
+for v in ASANA_COMMENTS_ENV_FILE ASANA_PROJECT_ENV_FILE CLAUDE_AUTO_OPERATOR_ENV \
+         RNR_ENV_PATH DEPT_POLICY_DIR TG_MESSAGES_DB TG_MESSAGES_CONTACTS; do
+  val="$(eval "printf '%s' \"\${$v:-}\"")"
+  [ -n "$val" ] || { echo "toy-migrated: шов $v не подменён раннером"; exit 1; }
+  case "$val" in
+    "$CLAUDE_CONTROL_TEST_ROOT"/*) ;;
+    *) echo "toy-migrated: шов $v='$val' указывает ВНЕ test root"; exit 1 ;;
+  esac
+done
+for v in ASANA_COMMENTS_API_BASE ASANA_PROJECT_API_BASE; do
+  val="$(eval "printf '%s' \"\${$v:-}\"")"
+  case "$val" in
+    http://127.0.0.1:*) ;;
+    *) echo "toy-migrated: API-база $v='$val' не заменена на недостижимый loopback"; exit 1 ;;
+  esac
+done
+for v in ASANA_ACCESS_TOKEN CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN CLAUDE_BIN \
+         HTTPS_PROXY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PROJECTS_ROOT EVENT_BRIDGE_CONFIG; do
+  eval "[ -z \"\${$v+set}\" ]" || { echo "toy-migrated: утечка — $v остался задан"; exit 1; }
+done
 echo "toy-migrated: OK"
 EOF
 

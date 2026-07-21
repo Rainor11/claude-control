@@ -424,6 +424,16 @@ run_one() {
   local brain_clients_dir="$canon_sandbox/brain-clients"
   mkdir -p "$brain_clients_dir"
 
+  # T8 п.6 — подложки для швов «наружу» (сам список экспортов ниже, там же обоснование).
+  # Пустой «операторский .env»: адаптеры, которые тянут из него токен, обязаны упасть на
+  # «токен пуст», а не прочитать НАСТОЯЩИЙ /home/rainor/server/.env с живым ключом Asana.
+  local fake_operator_env="$canon_sandbox/operator.env"
+  : > "$fake_operator_env"
+  local policy_dir="$canon_sandbox/policy"
+  mkdir -p "$policy_dir"
+  local tg_dir="$canon_sandbox/tg"
+  mkdir -p "$tg_dir"
+
   local rc out
   # `{ ...; } 2>&1` ВНУТРИ command substitution — сливает stderr в stdout ДЛЯ ВСЕГО блока
   # (включая exec bash/node ниже, которые заменяют образ процесса, но наследуют уже
@@ -471,6 +481,59 @@ run_one() {
       # переменную явно (как tests/dept-requests.test.sh) — переопределение форсированного
       # env-присвоения того же имени в команде побеждает наш export, ничего не ломает.
       export BRAIN_CLIENTS="$brain_clients_dir"
+
+      # ---------------------------------------------------------------------------------
+      # T8 п.6: ЕДИНЫЙ ЯВНЫЙ СПИСОК известных швов «наружу».
+      #
+      # Полная изоляция сети (network namespace / контейнер) — за рамками: раннер не может
+      # ни отобрать у теста сокеты, ни перехватить обращение к боевому файлу по
+      # АБСОЛЮТНОМУ пути, зашитому в код без переменной. Здесь делается достижимая часть:
+      # каждый шов, который МОЖНО перенаправить переменной окружения, перенаправляется в
+      # песочницу или гасится — механически, для всех тестов сразу, а не «пусть каждый тест
+      # не забудет».
+      #
+      # ЭТОТ СПИСОК ЗАВЕДОМО НЕ ПОЛОН, и это не оплошность. Не покрыты три класса:
+      #  1) АБСОЛЮТНЫЕ пути без переменной (bin/claude-auto-tg::OPERATOR_ENV,
+      #     rnr_workers_bot::_CONTACTS_PATH, ACCOUNTS-пути gmail-messages при явном
+      #     --token-file) — их закрывает не раннер, а отдельный шов в самом коде, когда
+      #     цена ошибки того стоит (так сделан нотификатор в T8 п.1);
+      #  2) параметры, которые передаются АРГУМЕНТАМИ, а не окружением (--db/--contacts/
+      #     --state-dir адаптеров): раннер их не видит в принципе;
+      #  3) исходящая сеть как таковая — тест, который сам позовёт curl на внешний адрес,
+      #     ничем здесь не остановлен.
+      # Швы, выведенные из $HOME (например CFG=~/.config/google-workspace-mcp в
+      # adapters/gmail-messages), закрыты ВЫШЕ подменой HOME и здесь не дублируются.
+
+      # (а) ГАСИМ унаследованное: значения без осмысленной песочной замены. Оператор мог
+      # экспортировать любую из них в своей сессии — тогда она молча утекла бы в тест
+      # (шов на боевой бинарь, боевой конфиг, живой токен, прокси наружу).
+      # CLAUDE_PROJECTS_ROOT здесь по ДРУГОЙ причине: его дефолт выведен из $HOME, то есть
+      # УЖЕ в песочнице, и подставлять свой каталог нельзя — тесты ставят транскрипты именно
+      # в "$HOME/.claude/projects" и на этом дефолте проверяются (проверено эмпирически:
+      # принудительный экспорт ломает tests/claude-auto-mission-update.test.sh). Гасим
+      # только унаследованное, дефолт не трогаем.
+      unset ASANA_ACCESS_TOKEN ASANA_PROJECT_NOW_EPOCH ASANA_COMMENTS_MAX_PAGES \
+            EB_ASANA_EMIT_ID EVENT_BRIDGE_CONFIG EVENT_BRIDGE_STATE_DIR \
+            CLAUDE_AUTO_BIN RNR_DB_BIN DEPT_LEDGER_BIN CLAUDE_BIN \
+            HTTPS_PROXY RNR_HTTPS_PROXY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PROJECTS_ROOT
+
+      # (б) ПОДМЕНЯЕМ на песочницу: у этих швов есть безопасный эквивалент внутри неё.
+      # Тест, которому нужно своё значение, переопределяет переменную явно — его export
+      # (или env-префикс на вызове) выполняется ПОЗЖЕ и побеждает, как и с BRAIN_CLIENTS.
+      export ASANA_COMMENTS_ENV_FILE="$fake_operator_env"   # иначе — боевой .env с ключом Asana
+      export ASANA_PROJECT_ENV_FILE="$fake_operator_env"
+      export CLAUDE_AUTO_OPERATOR_ENV="$fake_operator_env"  # bin/event-bridge-watch, dept-liveness-request
+      export RNR_ENV_PATH="$fake_operator_env"              # bot/rnr_workers_bot.py: токен + chat_id оператора
+      # Недостижимый адрес, а не боевой app.asana.com: забытый override упрётся в отказ
+      # соединения (адаптеры на это fail-open'ятся), а не сходит в живой Asana.
+      export ASANA_COMMENTS_API_BASE="http://127.0.0.1:1"
+      export ASANA_PROJECT_API_BASE="http://127.0.0.1:1"
+      export DEPT_POLICY_DIR="$policy_dir"
+      # tg-messages: пути АБСОЛЮТНЫЕ и не выводятся из $HOME, подмена HOME их не закрывает —
+      # шов заведён в самом адаптере (T8 п.6), дефолт без переменной не изменился.
+      export TG_MESSAGES_DB="$tg_dir/messages.db"
+      export TG_MESSAGES_CONTACTS="$tg_dir/contacts.json"
+      # ---------------------------------------------------------------------------------
 
       # Defense-in-depth ПОВЕРХ обязательных seam-переменных (не замена им): stub_dir
       # ПЕРЕД остальным PATH — код, который (как СЕГОДНЯШНИЙ bin/claude-auto, см.
