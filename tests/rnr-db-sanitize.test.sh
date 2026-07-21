@@ -42,4 +42,30 @@ python3 "$DB_PY" insert-approval --qid q3 --worker w --tmux-target t --chat-id 1
 python3 "$DB_PY" get-appr-by-qid --qid q3 | grep -q 'обычный русский текст — ёж, §, 🚀' \
   || { echo 'FAIL: чистый юникод искажён'; exit 1; }
 
+# ---------------------------------------------------------------------------------------
+# T6: дефолт пути БД (когда RNR_ASKS_DB НЕ задана) обязан идти через резолвер корня.
+# До T6 он был захардкожен на ~/.claude-control/rnr-bot/asks.db, и изоляция держалась ТОЛЬКО
+# на том, что раннер экспортирует RNR_ASKS_DB. Но rnr_db.py зовут ПОДПРОЦЕССОМ bash-обёртки
+# (dept-liveness-request, dept-withdraw) — вызов под маркером, но без унаследованной
+# переменной, писал бы в БОЕВУЮ sqlite оператора. Здесь снимаем переменную ЯВНО и проверяем,
+# что запись легла в песочницу, а «боевой» каталог (относительно HOME, который раннер тоже
+# подменил на песочницу) не появился вовсе.
+# ---------------------------------------------------------------------------------------
+fake_prod_db="$HOME/.claude-control/rnr-bot/asks.db"
+[ -e "$fake_prod_db" ] && { echo "FAIL: боевая БД существует ДО проверки — тест собран неверно"; exit 1; }
+env -u RNR_ASKS_DB python3 "$DB_PY" insert-approval --qid q4 --worker w --tmux-target t \
+  --chat-id 1 --action dept-approval --arg-kind event_id --arg-value evt_3_cccc \
+  --payload 'проверка дефолтного пути БД' \
+  || { echo 'FAIL: insert-approval без RNR_ASKS_DB упал'; exit 1; }
+[ -f "$CLAUDE_CONTROL_TEST_ROOT/rnr-bot/asks.db" ] \
+  || { echo 'FAIL: без RNR_ASKS_DB БД не появилась в песочнице — дефолт мимо резолвера'; exit 1; }
+[ -e "$fake_prod_db" ] \
+  && { echo "FAIL: без RNR_ASKS_DB запись ушла в боевой путь ($fake_prod_db) — резолвер обойдён"; exit 1; }
+env -u RNR_ASKS_DB python3 "$DB_PY" get-appr-by-qid --qid q4 | grep -q '"qid": *"q4"' \
+  || { echo 'FAIL: строка не читается из БД в песочнице'; exit 1; }
+# И обратная сторона: q4 писался в ДРУГУЮ БД, чем q1-q3 (RNR_ASKS_DB от раннера) — иначе
+# проверка выше ничего бы не доказывала.
+python3 "$DB_PY" get-appr-by-qid --qid q4 2>/dev/null | grep -q '"qid"' \
+  && { echo 'FAIL: q4 виден и в БД раннера — значит дефолт и RNR_ASKS_DB указывают в одно место'; exit 1; }
+
 echo PASS

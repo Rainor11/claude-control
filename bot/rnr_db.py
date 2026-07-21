@@ -26,12 +26,71 @@ import datetime
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 
-DB_PATH = os.environ.get(
-    "RNR_ASKS_DB",
-    os.path.join(os.path.expanduser("~"), ".claude-control", "rnr-bot", "asks.db"),
-)
+# --- корень рантайма (T6 изоляции тестов от боевого рантайма) -----------------------------
+# Единственный резолвер — lib/runtime-root.sh (T1). Питон эту логику НЕ дублирует и НЕ читает
+# CLAUDE_CONTROL_TEST_ROOT сам ради значения: иначе граница разъехалась бы с bash/node
+# половиной при первой же правке (тот же довод, что в bot/rnr_workers_bot.py).
+#
+# ПОЧЕМУ ЭТО ЖИВЁТ ЗДЕСЬ. rnr_db.py — единственный stdlib-only модуль, который используют ОБЕ
+# python-точки бота: его импортирует rnr_workers_bot.py И его же дёргают подпроцессом
+# bash-обёртки (claude-auto-ask, dept-liveness-request, dept-withdraw). Общая реализация +
+# общий кэш здесь дают ОДИН запуск резолвера на процесс; отдельный третий файл ради двух
+# десятков строк не заводим.
+#
+# ЧТО ЭТО ЧИНИТ. До T6 дефолт БД был захардкожен на ~/.claude-control/rnr-bot/asks.db, и
+# изоляция держалась ТОЛЬКО на том, что tests/run экспортирует RNR_ASKS_DB. Любой вызов
+# rnr_db.py под маркером, но МИМО раннера (а bash-обёртки зовут его подпроцессом), писал в
+# БОЕВУЮ sqlite оператора.
+_RUNTIME_ROOT_LIB = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "runtime-root.sh"))
+_PROG = os.path.basename(sys.argv[0] or "rnr_db.py")
+_runtime_root_cache = None
+
+
+def runtime_root(legacy_default):
+    """Корень рантайма: legacy_default без маркера, резолвер — под маркером.
+
+    Без CLAUDE_CONTROL_TEST_ROOT возвращает legacy_default БЕЗ единого нового чтения env и
+    без запуска подпроцесса — побитовый паритет с прежним поведением на живом контуре.
+    Под маркером зовёт resolve_runtime_root; отказ резолвера = выход, а НЕ тихий фолбэк на
+    боевой путь (тихий фолбэк — ровно та «боевая sqlite под тестом», ради которой точку и
+    мигрировали).
+
+    Результат кэшируется на процесс: маркер за время жизни процесса не меняется, а без кэша
+    каждый вызывающий платил бы отдельным `bash -c`.
+    """
+    if "CLAUDE_CONTROL_TEST_ROOT" not in os.environ:
+        return legacy_default
+    global _runtime_root_cache
+    if _runtime_root_cache is None:
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", '. "$1" && resolve_runtime_root control_only', "_", _RUNTIME_ROOT_LIB],
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            # Без bash в PATH (или при нехватке ресурсов на fork) subprocess.run бросает
+            # OSError/FileNotFoundError — без этого перехвата процесс умирал бы трейсбеком
+            # вместо задуманного явного сообщения.
+            sys.exit(f"{_PROG}: не смог запустить резолвер корня ({_RUNTIME_ROOT_LIB}): {exc}. "
+                     "Под маркером CLAUDE_CONTROL_TEST_ROOT фолбэк на боевой путь запрещён.")
+        root = proc.stdout.strip()
+        if proc.returncode != 0 or not root:
+            reason = proc.stderr.strip() or f"resolve_runtime_root вернул rc={proc.returncode} и пустой корень"
+            sys.exit(f"{_PROG}: {reason}")
+        _runtime_root_cache = root
+    return _runtime_root_cache
+
+
+# RNR_ASKS_DB, если ЗАДАНА, побеждает как и раньше (её выставляет tests/run, ею же
+# пользуются моки в тестах) — проверяем именно «задана», а не «непуста», чтобы не менять
+# поведение для пустого значения. Если не задана — дефолт теперь идёт через резолвер.
+_explicit_db = os.environ.get("RNR_ASKS_DB")
+DB_PATH = _explicit_db if _explicit_db is not None else os.path.join(
+    runtime_root(os.path.join(os.path.expanduser("~"), ".claude-control")), "rnr-bot", "asks.db")
 
 
 def now_iso():

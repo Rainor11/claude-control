@@ -55,7 +55,15 @@ TG_NOTIFY = "/home/rainor/server/server_monitor/telegram_notify.sh"  # absolute
 # где решается, валиден ли тестовый корень (sentinel, пересечение с боевым деревом, утечка
 # легаси-переменных). Питон эту логику НЕ дублирует и НЕ читает CLAUDE_CONTROL_TEST_ROOT сам
 # ради значения — иначе граница разъехалась бы с bash/node половиной при первой же правке.
-_RUNTIME_ROOT_LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "runtime-root.sh"))
+# T6: путь к самой библиотеке и запуск резолвера переехали в rnr_db (_RUNTIME_ROOT_LIB
+# больше не нужен здесь) — см. _runtime_root ниже.
+
+
+# rnr_db импортируется ДО первого вызова _runtime_root (см. ниже — тело резолвера живёт
+# там). Раньше импорт стоял на два десятка строк ниже, после CONTROL_DIR; порядок изменён
+# ровно для этого, никакой другой зависимости от места импорта нет (модуль stdlib-only).
+sys.path.insert(0, HERE)
+import rnr_db  # noqa: E402  (stdlib-only DB helper, same dir)
 
 
 def _runtime_root(legacy_default):
@@ -66,18 +74,14 @@ def _runtime_root(legacy_default):
     воркеров). Под маркером зовёт resolve_runtime_root из lib/runtime-root.sh; отказ
     резолвера = выход, а НЕ тихий фолбэк на боевой путь: тихий фолбэк — это ровно тот
     «замок/каталог в боевом дереве под тестом», ради которого точку и мигрировали.
+
+    T6: тело переехало в rnr_db.runtime_root — ОДНА реализация и ОДИН кэш на процесс. Эта
+    функция звалась ДВАЖДЫ (CONTROL_DIR + lockdir синглтона), то есть под маркером бот
+    платил двумя запусками `bash -c`; после переезда дефолта БД карточек на резолвер
+    (rnr_db, T6) копий стало бы три. Там же перехват OSError: без bash в PATH прежняя
+    версия умирала бы трейсбеком вместо задуманного явного sys.exit.
     """
-    if "CLAUDE_CONTROL_TEST_ROOT" not in os.environ:
-        return legacy_default
-    proc = subprocess.run(
-        ["bash", "-c", '. "$1" && resolve_runtime_root control_only', "_", _RUNTIME_ROOT_LIB],
-        capture_output=True, text=True,
-    )
-    root = proc.stdout.strip()
-    if proc.returncode != 0 or not root:
-        reason = proc.stderr.strip() or f"resolve_runtime_root вернул rc={proc.returncode} и пустой корень"
-        sys.exit(f"rnr-workers-bot: {reason}")
-    return root
+    return rnr_db.runtime_root(legacy_default)
 
 
 CONTROL_DIR = _runtime_root(os.environ.get("CLAUDE_CONTROL_DIR",
@@ -90,9 +94,6 @@ BTN_ATTACH = "🔗 Терминал"         # legacy (folded into the worker ca
 BTN_WHITELIST = "🤖 Воркеры"
 BTN_CMDS = "📟 Команды"
 TG_LIMIT = 3900  # safe chunk size under Telegram's 4096
-
-sys.path.insert(0, HERE)
-import rnr_db  # noqa: E402  (stdlib-only DB helper, same dir)
 
 # --- delivery tunables ---
 POLL_SEC = 5          # delivery loop tick
