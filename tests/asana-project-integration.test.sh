@@ -3,21 +3,24 @@
 # normalization (--state-dir forcing), duplicate-project rejection, sleep
 # baseline warning, rename .seen migration, removal state cleanup.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CA="$DIR/bin/claude-auto"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-# T4: control-dir ВНУТРЬ test root, когда тест идёт через tests/run. cmd_sleep теперь
-# обёрнут guard'ом процесс-контроля (T4) — под маркером CLAUDE_CONTROL_TEST_ROOT легаси-
-# переменная, указывающая НАРУЖУ test root, справедливо fail-closed'ится резолвером (T1:
-# «утечка боевого окружения в тест»), и `sleep testw` не дошёл бы до заглушки. Кладём cc
-# внутрь маркера → guard резолвит шов в заглушку раннера (внутри root) и `systemctl
-# disable`/`tmux kill` уходят в неё, а не в настоящий бинарь. Вне раннера (маркера нет) —
-# прежний $TMP (тест так же запускается standalone).
-export CLAUDE_CONTROL_DIR="${CLAUDE_CONTROL_TEST_ROOT:-$TMP}/cc"
-W="$CLAUDE_CONTROL_DIR/workers/testw"
+TMP="$CLAUDE_CONTROL_TEST_ROOT/scratch"
+mkdir -p "$TMP"
+# T6: контрольный каталог — САМ тестовый корень, без подкаталога. В T4 здесь стояло
+# `CLAUDE_CONTROL_DIR="${CLAUDE_CONTROL_TEST_ROOT:-$TMP}/cc"`: путь внутрь маркера T1
+# принимает (не «утечка боевого окружения»), но под маркером ЗНАЧЕНИЕ легаси-переменной
+# ИГНОРИРУЕТСЯ — резолвер отдаёт claude-auto сам корень, а фикстура воркера лежала в
+# <корень>/cc. Отсюда прежнее падение «claude-auto: no worker 'testw'»: тест и боевой код
+# смотрели в разные каталоги. Теперь тест не переопределяет корень вовсе и знает, что
+# control_only под маркером = сам корень; guard процесс-контроля (T4) по-прежнему уводит
+# `systemctl disable`/`tmux kill` из cmd_sleep в заглушку раннера внутри этого корня.
+CC="$CLAUDE_CONTROL_TEST_ROOT"
+W="$CC/workers/testw"
 mkdir -p "$W/state" "$W/logs"
-echo '{"workers":{"testw":{"state":"stopped"}}}' > "$CLAUDE_CONTROL_DIR/autonomous.json"
+echo '{"workers":{"testw":{"state":"stopped"}}}' > "$CC/autonomous.json"
 echo '{"session_id":"x","cwd":"/tmp","permission_mode":"auto"}' > "$W/spec.json"
 STATE="$W/state"
 

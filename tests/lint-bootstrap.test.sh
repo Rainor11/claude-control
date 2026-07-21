@@ -73,10 +73,8 @@ declare -A EXPECTED_LEGACY_ALLOWLIST_T3=(
 # без синхронной правки эталона больше не проходит незаметно.
 declare -A LEGACY_ALLOWLIST=(
   [tests/asana-comments.test.sh]=1
-  [tests/asana-project-integration.test.sh]=1
   [tests/asana-project.test.sh]=1
   [tests/dept-exec-runner.test.sh]=1
-  [tests/dept-requests.test.sh]=1
   [tests/process-control.test.sh]=1
   [tests/rnr-bot-withdraw.test.sh]=1
   [tests/rnr-db-sanitize.test.sh]=1

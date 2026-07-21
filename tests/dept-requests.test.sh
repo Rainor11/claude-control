@@ -3,11 +3,33 @@
 # исполнители: worker-only турникет, канонический detail↔request рендер (anti-forge),
 # рендер-смок dept-spawn-exec с фейковым claude-auto. Никаких боевых карточек оператору
 # (claude-auto-request мокается PATH-соседкой в SANDBOX, как в tests/dept-approve.test.sh).
+#
+# T6 — здесь присутствовали ОБЕ причины падения под границей изоляции:
+#   1. свои корни во временных каталогах (DEPT_HOME/CLAUDE_CONTROL_DIR = `mktemp -d`) —
+#      СНАРУЖИ тестового корня, резолвер T1 законно отказывал;
+#   2. плоская копия bin/ (dept-ledger, dept-*-request …) в `mktemp -d` — оттуда
+#      `require('../lib/runtime-root.js')` искал /tmp/lib/… (MODULE_NOT_FOUND).
+# Лечение: корень задаёт раннер (control_only → сам корень, dept_only → <корень>/department),
+# bin-песочница ПОВТОРЯЕТ раскладку репозитория (bin/ + симлинк lib/). Двум сценариям
+# (рендер dept-spawn-exec и планёрка) по смыслу нужен СВОЙ несмешивающийся мир — им выдаются
+# подкорни через tests/lib/sandbox.sh (полноценные тестовые корни внутри той же песочницы;
+# почему это не ослабление границы — см. заголовок того файла).
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-export DEPT_HOME="$(mktemp -d)"
-export DEPT_POLICY_DIR="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sandbox.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Экспортируем ИМЕННО те значения, которые вернёт резолвер: сам он их под маркером
+# игнорирует, но их читают напрямую и node -e-фрагменты этого теста, и композитный
+# `DEPT = process.env.DEPT_HOME || <корень>/department` в node-компонентах отдела.
+export DEPT_HOME="$CLAUDE_CONTROL_TEST_ROOT/department"
+export CLAUDE_CONTROL_DIR="$CLAUDE_CONTROL_TEST_ROOT"
+export DEPT_POLICY_DIR="$CLAUDE_CONTROL_TEST_ROOT/policy"
+mkdir -p "$DEPT_HOME" "$DEPT_POLICY_DIR" "$CLAUDE_CONTROL_DIR/workers"
 printf '# правила v1\n' > "$DEPT_POLICY_DIR/policy-v1.md"
+SCRATCH="$CLAUDE_CONTROL_TEST_ROOT/scratch"
+mkdir -p "$SCRATCH"
 
 DL="$DIR/bin/dept-ledger"
 
@@ -17,7 +39,9 @@ fail() { echo "FAIL: $1"; exit 1; }
 # СВОЕМУ $BINDIR (соседний каталог), значит мок claude-auto-request тоже должен быть
 # соседом ИМЕННО в этой копии (dept-approve зовёт "$BINDIR/claude-auto-request" — PATH-мок
 # не сработает). Тот же приём, что в tests/dept-approve.test.sh.
-SANDBOX="$(mktemp -d)"
+SANDBOX="$CLAUDE_CONTROL_TEST_ROOT/sandbox/bin"
+mkdir -p "$SANDBOX"
+ln -sfn "$DIR/lib" "$CLAUDE_CONTROL_TEST_ROOT/sandbox/lib"
 cp "$DIR/bin/dept-ledger" "$DIR/bin/dept-approve" "$DIR/bin/dept-request-render" \
    "$DIR/bin/dept-spawn-request" "$DIR/bin/dept-mission-request" \
    "$DIR/bin/dept-planerka-request" "$DIR/bin/dept-sleep-request" "$SANDBOX/"
@@ -28,8 +52,6 @@ EOF
 chmod +x "$SANDBOX/claude-auto-request"
 export MOCK_LOG="$SANDBOX/log"
 
-export CLAUDE_CONTROL_DIR="$(mktemp -d)"
-mkdir -p "$CLAUDE_CONTROL_DIR/workers"
 jq -n '{workers:{}}' > "$CLAUDE_CONTROL_DIR/autonomous.json"
 
 # ---- 1) не-руководитель отвергается --------------------------------------------------
@@ -67,8 +89,12 @@ echo "$out3b" | command grep -q 'зарезервировано' || fail "отк
 
 # ---- 4) dept-spawn-exec: рендер-часть с фейковым claude-auto (реальный bin/, не SANDBOX —
 #         скрипту нужен REPO=bin/.. с настоящими examples/department/*.template.*) ----------
-RENDER_DEPT_HOME="$(mktemp -d)"
-BRAIN_CLIENTS_TEST="$(mktemp -d)"
+# Свой подкорень: рендер льёт missions/render в СВОЙ department, не мешаясь с журналом
+# основного сценария (раньше эту роль играл отдельный `mktemp -d` в DEPT_HOME).
+new_test_root render RENDER_ROOT RENDER_ENV
+RENDER_DEPT_HOME="$RENDER_ROOT/department"
+BRAIN_CLIENTS_TEST="$RENDER_ROOT/brain-clients"
+mkdir -p "$BRAIN_CLIENTS_TEST"
 cat > "$BRAIN_CLIENTS_TEST/_template.md" <<'EOF'
 ---
 title: <Название клиента>
@@ -80,8 +106,8 @@ created: YYYY-MM-DD
 
 ## Кратко
 EOF
-FAKE_CA_LOG="$(mktemp)"
-FAKE_CA="$(mktemp -d)/fake-claude-auto"
+FAKE_CA_LOG="$RENDER_ROOT/fake-ca.log"
+FAKE_CA="$RENDER_ROOT/fake-claude-auto"
 cat > "$FAKE_CA" <<EOF
 #!/bin/bash
 echo "CA_CALLED \$*" >> "$FAKE_CA_LOG"
@@ -89,7 +115,7 @@ exit 0
 EOF
 chmod +x "$FAKE_CA"
 
-CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
+"${RENDER_ENV[@]}" CLAUDE_AUTO_BIN="$FAKE_CA" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
   "$DIR/bin/dept-spawn-exec" --client rendertest --name mk-render --asana-gid 1112223 \
   --asana-url 'https://app.asana.com/0/0/1112223' --note 'клиент любит скорость' \
   || fail "dept-spawn-exec (прямые флаги) упал"
@@ -110,7 +136,7 @@ grep -q -- '--kickoff-file' "$FAKE_CA_LOG" || fail "fake claude-auto не пол
 
 # повторный прогон (идемпотентность bootstrap): скелет НЕ пересоздаётся, шаблоны
 # перерендериваются без ошибок, fake claude-auto вызывается снова без падения
-CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
+"${RENDER_ENV[@]}" CLAUDE_AUTO_BIN="$FAKE_CA" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
   "$DIR/bin/dept-spawn-exec" --client rendertest --name mk-render --asana-gid 1112223 \
   --asana-url 'https://app.asana.com/0/0/1112223' --note 'клиент любит скорость' \
   || fail "повторный dept-spawn-exec (идемпотентность) упал"
@@ -119,7 +145,7 @@ CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_C
 # ---- 4b) M6: dept-spawn-exec (прямые флаги, второй забор после dept-spawn-request) —
 #         имя 'watchdog' отвергается ДО любых побочных эффектов (fake claude-auto НЕ звался) --
 : > "$FAKE_CA_LOG"
-out4b="$(CLAUDE_AUTO_BIN="$FAKE_CA" DEPT_HOME="$RENDER_DEPT_HOME" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
+out4b="$("${RENDER_ENV[@]}" CLAUDE_AUTO_BIN="$FAKE_CA" BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" \
   "$DIR/bin/dept-spawn-exec" --client rendertest --name watchdog --asana-gid 1112224 2>&1)" \
   && fail "dept-spawn-exec создал воркера 'watchdog' (зарезервировано системой)"
 echo "$out4b" | command grep -q 'зарезервировано' || fail "dept-spawn-exec: отказ по 'watchdog' без пояснения"
@@ -187,10 +213,14 @@ echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об
 # --- dept-planerka-exec: рассылка policy_refresh вместо ребейза (фаза 4) ---
 # Было: exec звал claude-auto rebase по флоту, busy → ретраи, STALE → 🔴-сегмент.
 # Стало: exec шлёт policy_refresh активным, спящих пропускает, claude-auto не зовёт вовсе.
-PL_DEPT="$(mktemp -d)"; PL_CTRL="$(mktemp -d)"; PL_POL="$(mktemp -d)"
+# Свой подкорень: у планёрки собственный реестр отдела и собственный autonomous.json
+# (раньше — три отдельных `mktemp -d`), смешивать их с основным сценарием нельзя: exec
+# рассылает policy_refresh ВСЕМ active-воркерам из autonomous.json и перезаписывает его.
+new_test_root planerka PL_ROOT PL_ENV
+PL_DEPT="$PL_ROOT/department"; PL_CTRL="$PL_ROOT"; PL_POL="$PL_ROOT/policy"
+mkdir -p "$PL_POL" "$PL_CTRL/workers"
 printf '# правила v9\n' > "$PL_POL/policy-v9.md"
-mkdir -p "$PL_CTRL/workers"
-DL_PL() { DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" "$DIR/bin/dept-ledger" "$@"; }
+DL_PL() { "${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL" "$DIR/bin/dept-ledger" "$@"; }
 DL_PL registry-set dept-head   --role руководитель >/dev/null
 DL_PL registry-set mk-act-p    --role мк --client cli-a >/dev/null
 DL_PL registry-set mk-sleep-p  --role мк --client cli-b >/dev/null
@@ -200,14 +230,14 @@ jq -n '{workers:{"dept-head":{state:"active"},"mk-act-p":{state:"active"},"mk-sl
   > "$PL_CTRL/autonomous.json"
 
 # claude-auto НЕ должен быть вызван вообще — мок падает, если его позвали
-PL_CA="$(mktemp -d)/fake-ca-planerka"
+PL_CA="$PL_ROOT/fake-ca-planerka"
 cat > "$PL_CA" <<'EOF'
 #!/bin/bash
 echo "CLAUDE_AUTO_CALLED $*" >> "$MOCK_LOG"
 exit 99
 EOF
 chmod +x "$PL_CA"
-export PL_NOTIFY_LOG="$(mktemp)"; PL_NOTIFY="$(mktemp -d)/fake-notify"
+export PL_NOTIFY_LOG="$PL_ROOT/notify.log"; PL_NOTIFY="$PL_ROOT/fake-notify"
 cat > "$PL_NOTIFY" <<'EOF'
 #!/bin/bash
 echo "NOTIFY $*" >> "$PL_NOTIFY_LOG"
@@ -215,7 +245,7 @@ EOF
 chmod +x "$PL_NOTIFY"
 
 pl_start="$(date +%s)"
-out8="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+out8="$("${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL" \
   CLAUDE_AUTO_BIN="$PL_CA" MOCK_LOG="$MOCK_LOG" TELEGRAM_NOTIFY="$PL_NOTIFY" \
   "$DIR/bin/dept-planerka-exec" --reason 'смок рассылки')" \
   || fail "dept-planerka-exec упал: $out8"
@@ -256,7 +286,7 @@ subj_len="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | j
 DL_PL registry-set mk-long-p --role мк --client cli-c >/dev/null
 jq '.workers["mk-long-p"] = {state:"active"}' "$PL_CTRL/autonomous.json" > "$PL_CTRL/a.tmp" && mv "$PL_CTRL/a.tmp" "$PL_CTRL/autonomous.json"
 long_reason="$(printf 'о%.0s' $(seq 1 400))"
-DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+"${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL" \
   TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$long_reason" >/dev/null \
   || fail "exec упал на длинном reason"
 long_len="$(DL_PL list --kind message --filter 'to=mk-long-p' --status queued | jq -r '.data.body' | head -1 | wc -m)"
@@ -267,11 +297,11 @@ echo "  planerka-exec: рассылка OK"
 # (переезд/рефактор) вырастет настолько, что body > 300, адаптер шины молча срежет хвост
 # (команду ack). Runtime-гард обязан поймать это ДО отправки: die, ни одно сообщение не уходит
 # (частичная/подмененная рассылка — не лучше полного отказа, см. "частичная рассылка — НЕ успех").
-PL_POL_LONG="$(mktemp -d)/$(printf 'a%.0s' $(seq 1 200))/$(printf 'b%.0s' $(seq 1 200))"
+PL_POL_LONG="$CLAUDE_CONTROL_TEST_ROOT/L/$(printf 'a%.0s' $(seq 1 200))/$(printf 'b%.0s' $(seq 1 200))"
 mkdir -p "$PL_POL_LONG"
 printf '# правила v9\n' > "$PL_POL_LONG/policy-v9.md"
 m3_before="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
-out_m3="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_LONG" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+out_m3="$("${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL_LONG" \
   TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason 'смок гарда M3' 2>&1)" \
   && fail "dept-planerka-exec прошёл при body > 300 (длинный policy-путь) — M3-гард не сработал"
 echo "$out_m3" | command grep -q -- '> 300' || fail "M3: die не объясняет причину (нет '> 300'): $out_m3"
@@ -289,16 +319,19 @@ echo "  planerka-exec: M3 (body-гард > 300 симв. — die до отпра
 # которого M3 и вводился.
 # Паддинг 40 центрирует окно теста: база body ≈181 симв. → BMP-вариант 261 (проходит,
 # запас ~39 симв. на более длинный путь чекаута), эмодзи-вариант 341 (умирает, запас ~41).
-PL_POL_U16="$(mktemp -d)/$(printf 'c%.0s' $(seq 1 40))"
+# T6: каталог переехал в песочницу, но под КОРОТКИМ префиксом /U — длина пути входит в
+# измеряемое тестом окно (см. расчёт выше), и обычный `mktemp -d` внутри песочницы сдвинул
+# бы его сильнее, чем прежний /tmp/tmp.XXXXXXXXXX.
+PL_POL_U16="$CLAUDE_CONTROL_TEST_ROOT/U/$(printf 'c%.0s' $(seq 1 40))"
 mkdir -p "$PL_POL_U16"
 printf '# правила v9\n' > "$PL_POL_U16/policy-v9.md"
 bmp_reason="$(printf 'о%.0s' $(seq 1 80))"
 emoji_reason="$(python3 -c "print('🙂'*80, end='')")"
-DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_U16" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+"${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL_U16" \
   TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$bmp_reason" >/dev/null \
   || fail "M3/bug: BMP-reason из 80 точек не должен триггерить гард на этом пути (окно теста съехало)"
 u16_before="$(DL_PL list --kind message --filter 'to=mk-act-p' --status queued | wc -l)"
-out_u16="$(DEPT_HOME="$PL_DEPT" DEPT_POLICY_DIR="$PL_POL_U16" CLAUDE_CONTROL_DIR="$PL_CTRL" \
+out_u16="$("${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL_U16" \
   TELEGRAM_NOTIFY="$PL_NOTIFY" "$DIR/bin/dept-planerka-exec" --reason "$emoji_reason" 2>&1)" \
   && fail "M3/bug: эмодзи-reason (те же 80 точек, но 160 UTF-16 units) пробил гард — адаптер срежет команду ack"
 echo "$out_u16" | command grep -q -- 'UTF-16' || fail "M3/bug: die не объясняет единицы измерения: $out_u16"
@@ -309,7 +342,7 @@ echo "  planerka-exec: M3/bug (кап меряется в UTF-16 units, как �
 # M2: --approval / --reason как ПОСЛЕДНИЙ аргумент без значения — die, не hang и не
 # "unbound variable". Регрессия: "${2:-}" сама по себе не спасает — "shift 2" при $#=1
 # молча проваливается (не двигает $1), и while крутится навечно вместо die.
-m2err="$(mktemp)"
+m2err="$SCRATCH/m2-err"
 if timeout 5 "$DIR/bin/dept-planerka-exec" --approval 2>"$m2err"; then
   fail "dept-planerka-exec прошёл с --approval без значения"
 fi
@@ -328,12 +361,12 @@ echo "  planerka-exec: M2 (arg без значения — die, не hang) OK"
 # dept-liveness-request НЕ worker-only (сторож — systemd, не сессия) — не нужен
 # DEPT_APPROVE_TEST_ACTOR/SANDBOX-копия, зовём реальный bin/ напрямую. Карточка — мок
 # rnr_db.py (RNR_DB_BIN), той же схемой, что tests/dept-withdraw.test.sh мокает dept-withdraw.
-LIV_ENV_FILE="$(mktemp)"
+LIV_ENV_FILE="$SCRATCH/liveness-operator.env"
 printf 'TELEGRAM_CHAT_ID=999999999\n' > "$LIV_ENV_FILE"
 export CLAUDE_AUTO_OPERATOR_ENV="$LIV_ENV_FILE"
 
-export LIV_RNR_LOG="$(mktemp)"
-LIV_RNR_DB="$(mktemp -d)/fake-rnr-db.py"
+export LIV_RNR_LOG="$SCRATCH/liveness-rnr.log"
+LIV_RNR_DB="$SCRATCH/fake-rnr-db.py"
 cat > "$LIV_RNR_DB" <<'EOF'
 import os, sys
 open(os.environ['LIV_RNR_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\n')
@@ -426,8 +459,11 @@ if (!found) throw new Error("event не найден для подмены detai
 fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
 '
 "$DL" approval-resolve "$liv_eid" --status approved --actor operator >/dev/null
-FAKE_SYSTEMCTL="$(mktemp -d)/fake-systemctl"
-FAKE_SYSTEMCTL_LOG="$(mktemp)"
+# Фейковый systemctl — ВНУТРИ тестового корня: под маркером guard процесс-контроля (T2)
+# требует, чтобы шов SYSTEMCTL резолвился в файл внутри корня (снаружи — законный отказ
+# «тест дотягивается до настоящего бинаря»).
+FAKE_SYSTEMCTL="$SCRATCH/fake-systemctl"
+FAKE_SYSTEMCTL_LOG="$SCRATCH/fake-systemctl.log"
 cat > "$FAKE_SYSTEMCTL" <<EOF
 #!/bin/bash
 echo "SYSTEMCTL \$*" >> "$FAKE_SYSTEMCTL_LOG"
@@ -484,7 +520,7 @@ out11a="$("$DIR/bin/dept-liveness-request" --worker test-liveness-w --frozen-min
 liv_eid3="$(echo "$out11a" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))')"
 "$DL" approval-resolve "$liv_eid3" --status approved --actor operator >/dev/null
 "$DL" approval-exec "$liv_eid3" --status executing --actor dispatcher >/dev/null
-FAKE_SYSTEMCTL_FAIL="$(mktemp -d)/fake-systemctl-fail"
+FAKE_SYSTEMCTL_FAIL="$SCRATCH/fake-systemctl-fail"
 cat > "$FAKE_SYSTEMCTL_FAIL" <<'EOF'
 #!/bin/bash
 echo "Unit claude-auto@test-liveness-w.service not found." >&2
