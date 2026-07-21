@@ -13,7 +13,7 @@ const execFileP = promisify(execFile);
 const CLI = new URL('../bin/dept-ledger', import.meta.url).pathname;
 
 // T6 (изоляция тестов от боевого рантайма). Раньше каждый сценарий брал свой журнал через
-// `deptHome()` и передавал его в DEPT_HOME. Под маркером
+// mkdtempSync(join(tmpdir(), 'dept-')) и передавал его в DEPT_HOME. Под маркером
 // CLAUDE_CONTROL_TEST_ROOT так больше нельзя: резолвер T1 считает тестовый корень
 // ЕДИНСТВЕННЫМ источником правды и законно отвергает DEPT_HOME, указывающий наружу
 // песочницы («утечка боевого окружения в тест»).
