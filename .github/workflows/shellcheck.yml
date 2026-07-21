@@ -27,21 +27,15 @@ jobs:
           sudo install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
           shellcheck --version
       - name: Run shellcheck
+        # T8 п.5: перечисление файлов заменено на выборку — жёсткий список сам становится
+        # местом, где забудут (ровно так и вышло: половина tests/*.sh в него не входила и
+        # накопила замечания, а десятки директив `# shellcheck disable=` ни разу не
+        # проверялись линтером). Теперь берём ВСЕ *.sh репозитория + tests/run (он без
+        # расширения, но это bash) — новый .sh попадает под линт автоматически.
+        #
+        # bin/* и channels/*/adapters/* без расширения СОЗНАТЕЛЬНО не добавлены: у них есть
+        # предсуществующие замечания (SC2012/SC2015/SC2181/SC1007 — намеренные конструкции
+        # вроде `TMUX= tmux`), разбирать их — отдельная задача, не «изоляция тестов».
         run: |
-          shellcheck \
-            bin/claude-rc \
-            bin/claude-control-session \
-            bin/claude-control-watchdog \
-            install.sh \
-            uninstall.sh \
-            lib/runtime-root.sh \
-            tests/runtime-root.test.sh \
-            lib/process-control.sh \
-            tests/process-control.test.sh \
-            tests/run \
-            tests/lib/bootstrap.sh \
-            tests/lib/bootstrap-detect.sh \
-            tests/bootstrap.test.sh \
-            tests/bootstrap-detect.test.sh \
-            tests/run.test.sh \
-            tests/lint-bootstrap.test.sh
+          mapfile -t sh_files < <(git ls-files '*.sh')
+          shellcheck "${sh_files[@]}" tests/run

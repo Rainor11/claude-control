@@ -48,10 +48,14 @@ PY
 SRV_PID=$!
 for _ in $(seq 1 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
 [ -s "$WORK/port" ] || { echo 'FAIL: mock server did not start'; exit 1; }
-export ASANA_PROJECT_API_BASE="http://127.0.0.1:$(cat "$WORK/port")"
+# SC2155: присваивание и export раздельно — иначе код возврата `cat` маскируется.
+ASANA_PROJECT_API_BASE="http://127.0.0.1:$(cat "$WORK/port")"
+export ASANA_PROJECT_API_BASE
 export ASANA_PROJECT_ENV_FILE="$ENVF"
 
 STATE="$WORK/state"; mkdir -p "$STATE"
+# shellcheck disable=SC2120  # аргументы у run() НЕОБЯЗАТЕЛЬНЫЕ: часть сценариев зовёт
+# её без них, часть — с флагами. Директива заодно гасит парные SC2119 на вызовах.
 run() { "$AP" --project 4242 --state-dir "$STATE" "$@"; }
 
 t1='{"gid":"101","name":"Первая задача","completed":false,"due_on":null,"due_at":null,"modified_at":"2026-01-01T00:00:00.000Z","created_at":"2026-01-01T00:00:00.000Z","assignee":{"name":"Вова"}}'
@@ -68,7 +72,7 @@ echo "{\"tasks\":[$t1,$t2]}" > "$FIX"
 out="$(run)"
 echo "$out" | grep -q 'Новая задача «Вторая задача» (task=102' || { echo "FAIL: no task_new: $out"; exit 1; }
 [ "$(printf '%s\n' "$out" | wc -l)" = 1 ] || { echo "FAIL: expected exactly 1 event line: $out"; exit 1; }
-printf '%s' "$out" | od -An -c | head -1 | grep -q '^ *036' || { echo 'FAIL: no leading \x1e ebid marker'; exit 1; }
+printf '%s' "$out" | od -An -c | head -1 | grep -q '^ *036' || { printf '%s\n' 'FAIL: no leading \x1e ebid marker'; exit 1; }
 out2="$(run)"
 [ "$out" = "$out2" ] || { echo "FAIL: journal replay not byte-identical"; exit 1; }
 

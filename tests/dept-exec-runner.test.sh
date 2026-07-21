@@ -56,7 +56,9 @@ a="$("$DL" approval-open --kind-of sleep --summary "смок sleep" --actor dept
 eid="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event_id))' <<<"$a")"
 "$DL" approval-resolve "$eid" --status approved --actor operator >/dev/null
 
-FAKE_EXEC_SLEEP=3 out1="$(FAKE_EXEC_SLEEP=3 "$DISPATCHER" tick 2>&1)"
+# SC2034: внешний префикс был не префиксом команды, а вторым присваиванием в текущем
+# шелле (нигде не читается) — значение и так передаётся подстановке явно.
+out1="$(FAKE_EXEC_SLEEP=3 "$DISPATCHER" tick 2>&1)"
 echo "$out1" | grep -q "раннер запущен transient-юнитом" || fail "тик 1 не запустил раннер: $out1"
 
 # тик 2 — СРАЗУ, пока раннер тика 1 ещё спит 3с (проверено ниже: раннер завершится позже)
@@ -66,7 +68,7 @@ echo "$out2" | grep -q "раннер запущен transient-юнитом" && f
 
 # ждём завершения раннера тика 1 (до 10с, опрашиваем effective status)
 executed=""
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   st="$("$DL" list --kind approval --status executed | grep -c "$eid" || true)"
   if [ "$st" -ge 1 ]; then executed=1; break; fi
   sleep 0.5
@@ -87,7 +89,7 @@ runner_logs="$(find "$DEPT_HOME" -maxdepth 1 -name "runner-${eid}.log" | wc -l)"
 # (summary + from из ledger), а не голый event_id — алерт читается без похода в ledger.
 # Notify пишется сразу ПОСЛЕ approval-exec executed — даём до 5с на гонку записи лога.
 human_ok=""
-for i in $(seq 1 10); do
+for _ in $(seq 1 10); do
   if grep -q "✅ Исполнено: смок sleep — заявка dept-head ($eid)" "$NOTIFY_LOG" 2>/dev/null; then human_ok=1; break; fi
   sleep 0.5
 done

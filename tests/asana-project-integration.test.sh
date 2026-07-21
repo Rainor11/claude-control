@@ -105,7 +105,9 @@ touch "$STATE/.asana-project-111.journal.jsonl" "$STATE/.dispatcher-lastrun-proj
       "$STATE/.asana-project-111.lock"
 echo '{"probes":[]}' > "$TMP/p5.json"
 "$CA" set-probes testw "$TMP/p5.json" >/dev/null
-leftovers="$(ls -A "$STATE" | grep -E 'asana-project-(111|222)|proj-renamed|proj-c' | grep -v '\.lock$' || true)"
+# SC2010: `find -printf '%f'` вместо `ls -A` — имена файлов состояния приходят из
+# конфигов, парсить вывод ls небезопасно по построению (пробелы/переводы строк).
+leftovers="$(find "$STATE" -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -E 'asana-project-(111|222)|proj-renamed|proj-c' | grep -v '\.lock$' || true)"
 [ -z "$leftovers" ] || { echo "FAIL: state leftovers after removal: $leftovers"; exit 1; }
 [ -f "$STATE/.asana-project-111.lock" ] || { echo 'FAIL: lock must survive cleanup (single-flight inode)'; exit 1; }
 

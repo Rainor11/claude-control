@@ -49,11 +49,15 @@ PY
 SRV_PID=$!
 for _ in $(seq 1 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
 [ -s "$WORK/port" ] || { echo 'FAIL: mock server did not start'; exit 1; }
-export ASANA_COMMENTS_API_BASE="http://127.0.0.1:$(cat "$WORK/port")"
+# SC2155: присваивание и export раздельно — иначе код возврата `cat` маскируется.
+ASANA_COMMENTS_API_BASE="http://127.0.0.1:$(cat "$WORK/port")"
+export ASANA_COMMENTS_API_BASE
 export ASANA_COMMENTS_ENV_FILE="$ENVF"
 export EB_ASANA_EMIT_ID=1
 
 STATE="$WORK/state"; mkdir -p "$STATE"
+# shellcheck disable=SC2120  # аргументы у run() НЕОБЯЗАТЕЛЬНЫЕ: часть сценариев зовёт
+# её без них, часть — с `--author`. Директива заодно гасит парные SC2119 на вызовах.
 run() { "$AC" --task 4242 --state-dir "$STATE" "$@"; }
 FPR="$STATE/.asana-comments-4242.fingerprints"
 

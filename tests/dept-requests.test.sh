@@ -242,7 +242,8 @@ echo "$out7" | grep -q 'уже спит' || fail "нет сообщения об
 # (раньше — три отдельных `mktemp -d`), смешивать их с основным сценарием нельзя: exec
 # рассылает policy_refresh ВСЕМ active-воркерам из autonomous.json и перезаписывает его.
 make_test_subroot planerka PL_ROOT PL_ENV
-PL_DEPT="$PL_ROOT/department"; PL_CTRL="$PL_ROOT"; PL_POL="$PL_ROOT/policy"
+# SC2034: PL_DEPT нигде не читался (в отличие от PL_CTRL/PL_POL ниже) — удалён.
+PL_CTRL="$PL_ROOT"; PL_POL="$PL_ROOT/policy"
 mkdir -p "$PL_POL" "$PL_CTRL/workers"
 printf '# правила v9\n' > "$PL_POL/policy-v9.md"
 DL_PL() { "${PL_ENV[@]}" DEPT_POLICY_DIR="$PL_POL" "$DIR/bin/dept-ledger" "$@"; }

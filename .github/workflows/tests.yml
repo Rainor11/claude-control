@@ -1,0 +1,53 @@
+name: tests
+
+# T8 п.5(б): забор изоляции тестов от боевого рантайма (задачи T1-T8) проверяется
+# автоматически, а не только руками на сервере. До этого CI гонял ТОЛЬКО shellcheck, и
+# регресс забора (тест без пролога, ослабленный резолвер, шов, ушедший мимо заглушки)
+# ловился бы лишь на живой машине.
+#
+# ПОЧЕМУ ЯВНЫЙ СПИСОК, А НЕ `tests/run` БЕЗ АРГУМЕНТОВ. Полный набор частично привязан к
+# машине оператора: тесты бота импортируют bot/rnr_workers_bot.py (нужен aiogram из
+# bot/venv), adapters-тесты и dept-* поднимают локальные моки и опираются на данные
+# конкретного окружения. Здесь перечислено то, что проверяет САМ ЗАБОР и портируемо:
+# резолвер корня (T1), guard процесс-контроля (T2), раннер и пролог (T3), линт подключения
+# пролога, негативный сценарий побега из песочницы (T6), шов нотификатора и три
+# control-скрипта (T8). Расширять — дописав имя в список ниже.
+#
+# Прогон идёт ЧЕРЕЗ tests/run: это единственный санкционированный способ запуска (он и
+# строит песочницу), поэтому CI проверяет заодно и сам раннер.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install bot deps (optional)
+        # Нужны ТОЛЬКО одному сценарию tests/notifier-seam.test.sh (реальный импорт
+        # bot/rnr_workers_bot.py). Без них сценарий печатает явный ПРОПУСК и не падает —
+        # поэтому шаг не обязан быть зелёным и не должен ронять прогон.
+        continue-on-error: true
+        run: python3 -m pip install --user -r bot/requirements.txt
+      - name: Run isolation-fence tests
+        run: |
+          ./tests/run \
+            tests/runtime-root.test.sh \
+            tests/runtime-root.test.mjs \
+            tests/process-control.test.sh \
+            tests/process-control.test.mjs \
+            tests/bootstrap.test.sh \
+            tests/bootstrap.test.mjs \
+            tests/bootstrap-detect.test.sh \
+            tests/run.test.sh \
+            tests/lint-bootstrap.test.sh \
+            tests/sandbox-escape.test.sh \
+            tests/notifier-seam.test.sh \
+            tests/control-scripts.test.sh \
+            tests/install-lists.test.sh
