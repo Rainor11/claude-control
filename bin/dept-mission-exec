@@ -13,11 +13,16 @@
 # data.request через dept-request-render и сверяется байт-в-байт с data.detail записи
 # ledger — расхождение (заявка подделана/повреждена) → exit 1 до любых побочных эффектов.
 set -u
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"   # для partial_ok-гарда (Codex M-3)
 BINDIR="$(cd "$(dirname "$0")" && pwd)"
+# T5: оба корня рантайма (control_only для partial_ok-гарда и dept_only для DEPT) — через
+# единый резолвер (lib/runtime-root.sh, задача T1). Без маркера CLAUDE_CONTROL_TEST_ROOT
+# возвращают те же строки, что прежние inline-дефолты; под маркером — fail-closed на песочницу.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1   # для partial_ok-гарда (Codex M-3)
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"
-DEPT="${DEPT_HOME:-$HOME/.claude-control/department}"
+DEPT="$(resolve_runtime_root dept_only)" || exit 1
 die() { echo "dept-mission-exec: $*" >&2; exit 1; }
 
 approval="" worker="" mission_file="" reason=""
