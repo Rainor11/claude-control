@@ -72,6 +72,12 @@ NAME_CAP = 80
 EXCERPT_CAP = 200
 LINE_CAP = 650             # visible part; keeps the one-line event frame sane
 ALL_EVENTS = ("task_new", "task_gone", "due", "completed", "reopened", "comments")
+# Формат РАЗБОРА отметок времени (%f берёт от 1 до 6 цифр — читаются и старые записи с
+# литеральными ".000Z", и любые будущие). Пишем мы миллисекунды (см. iso_from_epoch):
+# ровно та ширина, что у Asana в created_at и что адаптер писал всегда, — сравнения
+# водяных знаков комментов остаются однородными строковыми, как были.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+NOW_ENV = "ASANA_PROJECT_NOW_EPOCH"
 
 def die(msg, code=1):
     sys.stderr.write("asana-project: %s\n" % msg)
@@ -80,8 +86,64 @@ def die(msg, code=1):
 def log_err(msg):
     sys.stderr.write("asana-project: %s\n" % msg)
 
-def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+def now_epoch():
+    """ЕДИНСТВЕННЫЙ источник времени адаптера: от него считаются и отметка ts записи
+    журнала, и граница окна реплея (cutoff), и TTL self-ledger'а.
+
+    ПОЧЕМУ единый. Раньше источников было два разных класса: время записи форматировалось
+    strftime'ом, который ОТБРАСЫВАЛ дробную часть секунды и подставлял литеральные ".000",
+    а cutoff считался time.time() с полной точностью. Запись, созданную «прямо сейчас»,
+    это задним числом старило на величину до целой секунды — при окне реплея короче секунды
+    она объявлялась то свежей, то протухшей в зависимости от того, в какую миллисекунду
+    секунды стартовал прогон (флак tests/asana-project.test.sh кейс 9: 8/8 падений при старте
+    в фазе 0.60 секунды против 0/8 в фазах 0.00/0.30/0.90 — см. .superpowers/sdd/iso-t7-report.md).
+    В бою при окне по умолчанию 168 ч эффект незаметен, но это тот же дефект: возраст события
+    считался по одним часам, а записывался по другим.
+
+    Тест-шов ASANA_PROJECT_NOW_EPOCH (unix epoch, секунды) — того же класса, что
+    ASANA_PROJECT_API_BASE/ASANA_PROJECT_ENV_FILE выше: позволяет тесту ЗАМОРОЗИТЬ время и
+    проверять окно реплея арифметикой, а не sleep'ом. Мусор в переменной — явный отказ, а не
+    тихий откат на настоящие часы: иначе сломанный шов давал бы «зелёный» тест.
+
+    Шов ПРИВЯЗАН к тестовому транспорту (loopback-переопределение API): против НАСТОЯЩЕГО
+    Asana сдвинутые часы — не безобидная опечатка, а порча состояния (правдоподобное время
+    из будущего разом объявляет протухшими ещё не доставленные записи журнала и записывает
+    будущие as_of/comment_wm, которые потом надолго глушат реальные комменты). Поэтому
+    переменная, выставленная в боевом контуре, — явный отказ, а не тихое применение."""
+    raw = os.environ.get(NOW_ENV, "")
+    if not raw:
+        return time.time()
+    if not api_base_override():
+        die("%s is a test-only seam: it is honored ONLY together with a loopback "
+            "ASANA_PROJECT_API_BASE; refusing to shift the clock against the real API" % NOW_ENV)
+    try:
+        v = float(raw)
+    except ValueError:
+        die("%s=%r is not a number (unix epoch seconds)" % (NOW_ENV, raw))
+    # Отрицательное, нулевое, NaN и inf отсекаются этим же сравнением (любое сравнение с
+    # NaN ложно → not False → отказ). Верхняя граница — 2100-01-01, чтобы опечатка в
+    # миллисекундах (в 1000 раз больше) не проехала молча.
+    if not (0 < v < 4102444800):
+        die("%s=%r out of range (0, 4102444800)" % (NOW_ENV, raw))
+    return v
+
+def iso_from_epoch(sec):
+    """Пишем МИЛЛИСЕКУНДЫ, а не микросекунды (%f дал бы 6 цифр). Причина не в точности:
+    отметка as_of становится comment_wm, а он сравнивается со СТРОКАМИ created_at из Asana
+    (там всегда 3 цифры) лексикографически. Разная ширина ломает такое сравнение —
+    "…00.123456Z" лексикографически МЕНЬШЕ "…00.123Z" (после '.123' сравниваются '4' и 'Z'),
+    хотя во времени больше; коммент той же миллисекунды выглядел бы новее водяного знака и
+    откатывал бы его назад. Ширина 3 — та же, что писал адаптер всегда, так что домен
+    сравнения не меняется вовсе. Для окна реплея точность роли не играет: cutoff считается
+    round-trip'ом ИМЕННО этой строки (см. main), а не независимыми часами."""
+    dt = datetime.fromtimestamp(sec, timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
+
+def epoch_from_iso(ts):
+    """Обратная операция к iso_from_epoch. Принимает и то, что пишем мы (3 знака), и любую
+    запись с 1..6 знаками — %f у strptime берёт от 1 до 6 цифр. ValueError на мусоре —
+    вызывающие на него и рассчитывают (строгая загрузка журнала, fresh())."""
+    return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc).timestamp()
 
 def parse_args(argv):
     args = {"project": "", "state_dir": "", "events": ",".join(ALL_EVENTS),
@@ -146,11 +208,13 @@ def read_token():
         pass
     die("ASANA_ACCESS_TOKEN missing in %s" % env_file)
 
-def api_base():
+def api_base_override():
     # Test-only override, pinned to loopback so a hostile env var can never
     # redirect the real Bearer token to an external host. Parsed STRUCTURALLY:
     # a prefix check alone would pass http://localhost:80@attacker.example
     # (userinfo trick — the real host is attacker.example).
+    # Возвращает "" когда переопределения нет ИЛИ оно отвергнуто — это же значение
+    # служит признаком «мы на тестовом транспорте» для шва времени (см. now_epoch).
     base = os.environ.get("ASANA_PROJECT_API_BASE", "")
     if base:
         try:
@@ -160,7 +224,10 @@ def api_base():
                 return base.rstrip("/")
         except ValueError:
             pass
-    return API_BASE_DEFAULT
+    return ""
+
+def api_base():
+    return api_base_override() or API_BASE_DEFAULT
 
 class Budget:
     def __init__(self, limit):
@@ -311,7 +378,7 @@ def load_journal(path):
                         and isinstance(e.get("line"), str) and e["line"]
                         and isinstance(e.get("ts"), str)):
                     return None
-                datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                epoch_from_iso(e["ts"])
                 out.append(e)
     except (OSError, ValueError):
         return None
@@ -335,10 +402,11 @@ def self_story_gids(state_dir):
     return set(g for g in read_ledger_lines(os.path.join(state_dir, ".asana-self-stories"))
                if re.fullmatch(r"[0-9]{1,32}", g))
 
-def self_task_gids(state_dir):
+def self_task_gids(state_dir, now):
     """.asana-self-tasks lines: '<epoch>\t<gid>'. Entries expire after
-    SELF_TASK_TTL so a legitimate later remove/re-add is not suppressed."""
-    out, now = set(), time.time()
+    SELF_TASK_TTL so a legitimate later remove/re-add is not suppressed.
+    `now` приходит снаружи — от единого времени прогона (см. now_epoch)."""
+    out = set()
     for line in read_ledger_lines(os.path.join(state_dir, ".asana-self-tasks")):
         parts = line.split("\t")
         if len(parts) != 2:
@@ -392,7 +460,16 @@ def main():
             % (snap_path, snap.get("schema")), 0)
 
     budget = Budget(args["request_budget"])
-    crawl_start = now_iso()
+    # ОДИН момент времени на весь прогон, зафиксированный ДО обхода: от него берутся и
+    # as_of снимка/водяные знаки комментов, и ts записей журнала, и cutoff окна реплея.
+    # now_sec — round-trip той же строки обратно в число: cutoff считается от ТОЙ ЖЕ
+    # округлённой величины, что записана в ts, поэтому запись, созданная в этом прогоне,
+    # проходит окно ТОЧНО при любом положительном --replay-hours, а не «почти всегда», и
+    # точность формата на это не влияет вовсе. Раньше ts и cutoff брались из разных часов
+    # с разной точностью — см. now_epoch().
+    now_ts = iso_from_epoch(now_epoch())
+    now_sec = epoch_from_iso(now_ts)
+    crawl_start = now_ts
     try:
         raw = fetch_all_pages(token, budget, "/projects/%s/tasks" % proj, {
             "limit": 100,
@@ -439,7 +516,7 @@ def main():
     pending_gone = snap.get("pending_gone") or {}
     comment_queue = set(snap.get("comment_queue") or [])
     want = args["events"]
-    ts = now_iso()
+    ts = now_ts
     events = []  # (id, type, visible_text)
 
     def eid(task_gid, kind, payload=""):
@@ -448,7 +525,7 @@ def main():
         core = "ap:%s:%s:%s:%s" % (proj, base_as_of, task_gid, kind)
         return core + ((":" + payload) if payload else "")
 
-    self_tasks = self_task_gids(sdir) if "task_new" in want else set()
+    self_tasks = self_task_gids(sdir, now_sec) if "task_new" in want else set()
 
     # ---- new tasks
     for gid in cur:
@@ -559,11 +636,11 @@ def main():
             continue
         journal.append({"id": evid, "ts": ts, "type": kind, "line": visible_line(ts, text)})
         known.add(evid)
-    cutoff = time.time() - args["replay_hours"] * 3600
+    # Те же часы, что у ts выше (now_epoch → now_ts → now_sec), а не отдельный time.time().
+    cutoff = now_sec - args["replay_hours"] * 3600
     def fresh(e):
         try:
-            return datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-                tzinfo=timezone.utc).timestamp() >= cutoff
+            return epoch_from_iso(e["ts"]) >= cutoff
         except (KeyError, ValueError):
             return False
     journal = [e for e in journal if fresh(e)]
