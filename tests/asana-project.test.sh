@@ -2,9 +2,14 @@
 # asana-project adapter: snapshot-diff, journal replay, self-ledger suppression,
 # two-crawl gone confirmation, events filter, corrupt-snapshot fail-closed.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AP="$DIR/channels/event-bridge/adapters/asana-project"
-WORK="$(mktemp -d)"
+# T6: рабочий каталог — внутри песочницы раннера (раньше `mktemp -d` в $TMPDIR),
+# раннер уберёт её целиком. Корнем рантайма он не является — резолвер его не смотрит.
+WORK="$CLAUDE_CONTROL_TEST_ROOT/work"
+mkdir -p "$WORK"
 SRV_PID=""
 trap '[ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
 

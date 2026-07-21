@@ -12,10 +12,14 @@
 #     число тиков) + лог + alert_operator (оператор иначе не узнает про мусорную карточку).
 # Также проверяет, что 'withdrawn' попал в статус-фильтр next_actionable (rnr_db.py).
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$DIR/bot/venv/bin/python3"
 [ -x "$PY" ] || PY="python3"
-export RNR_ASKS_DB="$(mktemp -d)/asks.db"
+# T6: путь к БД карточек подставляет раннер (RNR_ASKS_DB внутри песочницы) — свой
+# `mktemp -d` тут больше не нужен и только скрывал бы, кто на самом деле отвечает за
+# изоляцию боевой sqlite.
 
 "$PY" <<PYEOF
 import asyncio, os, sys

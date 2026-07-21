@@ -5,9 +5,14 @@
 # legacy byte-compat (no EB_ASANA_EMIT_ID -> no markers, no fingerprint state),
 # fetch fail-open.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AC="${AC_OVERRIDE:-$DIR/channels/event-bridge/adapters/asana-comments}"
-WORK="$(mktemp -d)"
+# T6: рабочий каталог — внутри песочницы раннера (раньше `mktemp -d` в $TMPDIR),
+# раннер уберёт её целиком. Корнем рантайма он не является — резолвер его не смотрит.
+WORK="$CLAUDE_CONTROL_TEST_ROOT/work"
+mkdir -p "$WORK"
 SRV_PID=""
 trap '[ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
 

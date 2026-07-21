@@ -8,7 +8,9 @@
 # CLAUDE_CONTROL_TEST_ROOT это ЕДИНСТВЕННОЕ место, где решение "отказать" принимается,
 # и оно fail-closed по умолчанию.
 set -u
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$DIR/lib/runtime-root.sh"
 FIXTURE="$DIR/tests/fixtures/runtime-root-cases.json"
 fail() { echo "FAIL: $1"; exit 1; }
@@ -36,8 +38,17 @@ resolve() {
   ) 2>&1
 }
 
-new_home() { mktemp -d; }
-new_root() { mktemp -d; }
+# T6: фикстурные корни этого файла ЖИВУТ ВНЕ песочницы раннера — намеренно. Файл строит
+# заведомо ВРАЖДЕБНЫЕ корни (без sentinel, sentinel-каталогом, равные $HOME, вложенные в
+# боевое дерево, содержащие боевой корень целиком); класть их ВНУТРЬ корня, который раннер
+# выдал самому тесту, значило бы смешать «корень под испытанием» с «корнем, в котором мы
+# работаем», и получить случайные containment-совпадения между ними. Зато теперь они
+# складываются в один TMP_BASE и убираются по trap'у (раньше каждый `mktemp -d` оставался
+# в $TMPDIR навсегда).
+TMP_BASE="$(mktemp -d)"
+trap 'rm -rf "$TMP_BASE"' EXIT
+new_home() { mktemp -d "$TMP_BASE/home-XXXXXX"; }
+new_root() { mktemp -d "$TMP_BASE/root-XXXXXX"; }
 mark_sentinel() { : > "$1/$SENTINEL"; }
 
 # ---------------------------------------------------------------------------
@@ -93,7 +104,7 @@ out="$(resolve dept_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$root1")" \
 [ "$out" = "$canon_root1/department" ] || fail "маркер dept_only: получили '$out', ожидали '$canon_root1/department'"
 
 # symlink на test root — резолвится в канонический (реальный) путь
-link1="$(mktemp -u)"
+link1="$(mktemp -u "$TMP_BASE/link-XXXXXX")"
 ln -s "$root1" "$link1"
 out="$(resolve control_only "HOME=$home1" "CLAUDE_CONTROL_TEST_ROOT=$link1")" \
   || { rm -f "$link1"; fail "маркер через symlink упал: $out"; }
@@ -179,7 +190,7 @@ out="$(resolve control_only "HOME=$home_k1" "CLAUDE_CONTROL_TEST_ROOT=$home_k1/.
 echo "$out" | command grep -qi "боев" || fail "test root внутри боевого дерева: сообщение не объясняет причину: $out"
 
 # symlink на test root ВНУТРИ $HOME-боевого дерева — отказ после разыменования
-link_k1="$(mktemp -u)"
+link_k1="$(mktemp -u "$TMP_BASE/link-XXXXXX")"
 ln -s "$home_k1/.claude-control/inner" "$link_k1"
 out="$(resolve control_only "HOME=$home_k1" "CLAUDE_CONTROL_TEST_ROOT=$link_k1")"
 rc_k1=$?

@@ -4,9 +4,13 @@
 # sqlite3 отказывается биндить строки с lone surrogates (UnicodeEncodeError),
 # и до фикса и запрос-approval, и ask падали целиком.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DB_PY="$DIR/bot/rnr_db.py"
-export RNR_ASKS_DB="$(mktemp -d)/asks.db"
+# T6: путь к БД карточек подставляет раннер (RNR_ASKS_DB внутри песочницы) — свой
+# `mktemp -d` тут больше не нужен и только скрывал бы, кто на самом деле отвечает за
+# изоляцию боевой sqlite.
 
 # payload с расколотым посередине кириллическим символом (как после cut -c1-2001)
 broken="$(python3 -c "print('я'*1500)" | cut -c1-2001)"

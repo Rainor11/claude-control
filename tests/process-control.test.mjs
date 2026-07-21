@@ -2,6 +2,12 @@
 // процесс-контроля). JS-сторона lib/process-control.js: см. .superpowers/sdd/iso-t2-brief.md.
 // Переиспользует lib/runtime-root.js (resolveRuntimeRoot, contained) — не дублирует ни
 // логику маркера, ни containment.
+// T6: обязательный пролог изоляции — первой значимой строкой файла. Сами сценарии
+// ниже передают корни/швы ЯВНЫМИ аргументами (checkBinarySeam(var, value, root),
+// preflight(cls, env)), поэтому подставленные раннером SYSTEMCTL/TMUX_BIN/
+// DEPT_SYSTEMD_RUN на них не влияют — в отличие от bash-стороны, где их пришлось
+// гасить (см. tests/process-control.test.sh).
+import './lib/bootstrap.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
