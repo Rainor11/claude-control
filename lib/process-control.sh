@@ -173,7 +173,19 @@ process_control_systemd_run_setenv_argv() {
 # lib/process-control.js). Если понадобится по-настоящему унифицировать сигнатуры — делать
 # явно и одним шагом для обеих сторон, не полагаясь на комментарий как на гарантию совместимости.
 process_control_check_binary_seam() {
-  local var_name="$1" value="$2" test_root resolved
+  # М4 (bughunt Б1, 21.07): было `local var_name="$1" value="$2" ...` — под `set -u` (его
+  # ставят ВСЕ боевые bash-обёртки) вызов без обоих аргументов давал unbound variable, а это
+  # УБИВАЕТ ВЕСЬ ВЫЗЫВАЮЩИЙ ШЕЛЛ (не только функцию — библиотека source'ится в чужой процесс
+  # через `.`), т.к. функция публичная (с В6-фикса выше). Тот же класс дыры, что уже чинили в
+  # М3 для process_control_tmux и process_control_check_unit_dir (см. комментарии там), но эту
+  # функцию пропустили. Явная проверка + `return 1` — тот же die-путь, каким уже оформлены ВСЕ
+  # ОСТАЛЬНЫЕ отказы этого файла; проверка безусловна (до резолва test_root), как у обоих
+  # функций-прецедентов.
+  local var_name="${1:-}" value="${2:-}" test_root resolved
+  if [ -z "$var_name" ] || [ -z "$value" ]; then
+    echo "process-control: process_control_check_binary_seam: usage: process_control_check_binary_seam <var_name> <value>" >&2
+    return 1
+  fi
   test_root="$(_process_control_test_root)" || return 1
   [ -n "$test_root" ] || return 0
 

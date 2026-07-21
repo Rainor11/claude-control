@@ -92,6 +92,16 @@ fi
 dir="$BRAIN_CLIENTS/$client"
 # 1. Скелет папки (решение оператора №2: код делает скелет, ingest — первое задание МК)
 if [ ! -d "$dir" ]; then
+  # Б3 (bughunt, 21.07): было — mkdir "$dir" СРАЗУ, потом sed читал _template.md. Файл идёт
+  # под `set -u`, но БЕЗ `set -e` — при отсутствующем шаблоне `sed` падал (bad input file), но
+  # редирект `> "$dir/CLAUDE.md"` уже успел создать ПУСТОЙ файл, и исполнение ПРОДОЛЖАЛОСЬ:
+  # timeline.md/decisions.md создавались, печаталось "скелет папки создан" — частичный,
+  # повреждённый скелет молча выдавался за успех. Стало достижимо: раннер (tests/run) создаёт
+  # каталог BRAIN_CLIENTS (`mkdir -p "$brain_clients_dir"`), но шаблон в него не кладёт —
+  # тест/вызывающий, забывший положить свой _template.md, раньше получил бы именно эту тихую
+  # порчу. Явная проверка ДО mkdir — fail-closed, ни mkdir, ни один из трёх файлов не создаются,
+  # если шаблона нет вовсе.
+  [ -f "$BRAIN_CLIENTS/_template.md" ] || die "шаблон клиента не найден: $BRAIN_CLIENTS/_template.md — без него скелет собрать нельзя (CLAUDE.md остался бы пустым, а timeline.md/decisions.md создались бы без него — частичный скелет). Положите _template.md в BRAIN_CLIENTS или укажите верный путь."
   mkdir -p "$dir"
   sed -e "s/<Название клиента>/$client/g" -e "s/<slug>/$client/g" -e "s/YYYY-MM-DD/$(date +%F)/g" \
     "$BRAIN_CLIENTS/_template.md" > "$dir/CLAUDE.md"

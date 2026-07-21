@@ -46,6 +46,38 @@ fi
 . "$_RUN_REPO_DIR/lib/runtime-root.sh"
 SENTINEL_NAME="$_RUNTIME_ROOT_SENTINEL_NAME"
 
+# -----------------------------------------------------------------------------------------
+# Б2 (bughunt, 21.07): база песочницы (TMPDIR или /tmp) канонизируется и проверяется на
+# пересечение с известными живыми деревьями ЗДЕСЬ, ОДИН РАЗ ДО первого mktemp -d (не внутри
+# run_one — не гонять containment на каждый тест из набора, и не оставлять окно между первым
+# тестом и обнаружением враждебного TMPDIR). Резолвер T1 сам по себе покрывает containment
+# ТОЛЬКО для боевых корней claude-control (CLAUDE_CONTROL_DIR/CLAUDE_AUTO_HOME/DEPT_HOME/
+# hardcoded prod, см. resolve_runtime_root) — но НЕ для ДРУГИХ живых деревьев вне его
+# профилей: живой Мозг (~/brain, синкается Obsidian и авто-коммитится Stop-хуком), сам
+# репозиторий claude-control (иначе bughunt-песочница могла бы поселиться в тестируемом
+# репо), ~/server. Унаследованный или явно выставленный TMPDIR, указывающий в одно из этих
+# деревьев, поместил бы туда песочницу И новый дефолт BRAIN_CLIENTS (см. К1 ниже в run_one) —
+# тестовые записи и итоговая уборка (`rm -rf`) ушли бы внутрь синкаемого/боевого каталога.
+#
+# Переиспользуем ГОТОВЫЙ containment-хелпер _runtime_root_reject_if_entangled_with_prod (T1,
+# lib/runtime-root.sh, sourced строкой выше) — та же логика "совпадает / вложен в него /
+# содержит его целиком, в ОБЕ стороны", не третья реализация. Собственный текст ошибки (не
+# дефолтный из хелпера — тот упоминает "CLAUDE_CONTROL_TEST_ROOT", а здесь на этом шаге ещё
+# TMPDIR, до mktemp; хелпер печатает точнее для СВОЕГО контекста resolve_test_marker, для
+# этого — нет, поэтому глушим его stderr и печатаем свой).
+_TESTS_RUN_SANDBOX_BASE_RAW="${TMPDIR:-/tmp}"
+TESTS_RUN_SANDBOX_BASE="$(realpath -e "$_TESTS_RUN_SANDBOX_BASE_RAW" 2>/dev/null)" || {
+  echo "tests/run: TMPDIR='$_TESTS_RUN_SANDBOX_BASE_RAW' не резолвится realpath (каталог не существует или недоступен) — укажите существующий каталог для тестовой песочницы" >&2
+  exit 1
+}
+for _tests_run_prod_tree in "$HOME/brain" "$_RUN_REPO_DIR" "$HOME/.claude-control" "$_RUNTIME_ROOT_HARDCODED_PROD" "$HOME/server"; do
+  _runtime_root_reject_if_entangled_with_prod "$TESTS_RUN_SANDBOX_BASE" "$_tests_run_prod_tree" 2>/dev/null || {
+    echo "tests/run: база песочницы TMPDIR='$_TESTS_RUN_SANDBOX_BASE_RAW' (→ '$TESTS_RUN_SANDBOX_BASE') пересекается с живым деревом '$_tests_run_prod_tree' (совпадает с ним / вложена в него / содержит его целиком) — тестовая песочница и BRAIN_CLIENTS попали бы внутрь синкаемого/боевого каталога, а не в изолированный temp. Укажите TMPDIR вне боевых деревьев, например: TMPDIR=/tmp $0 ..." >&2
+    exit 1
+  }
+done
+unset _tests_run_prod_tree
+
 # detect_bootstrap_connection (uses_bootstrap ниже — тонкая обёртка) — общий с
 # tests/lint-bootstrap.test.sh детектор, см. tests/lib/bootstrap-detect.sh (К1 ревью T3: там
 # же — почему "первая значимая строка", а не substring по всему файлу). Источник — от
@@ -347,7 +379,11 @@ run_one() {
   fi
 
   local sandbox canon_sandbox
-  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/claude-control-test.XXXXXX")" || {
+  # Б2 (bughunt, 21.07): база — уже канонизированный и проверенный на containment
+  # TESTS_RUN_SANDBOX_BASE (см. блок проверки выше, сразу после source lib/runtime-root.sh),
+  # НЕ голый "${TMPDIR:-/tmp}" — тот брался без всякой валидации и мог указывать внутрь
+  # живого Мозга/репозитория/~/server, если TMPDIR унаследован враждебным.
+  sandbox="$(mktemp -d "$TESTS_RUN_SANDBOX_BASE/claude-control-test.XXXXXX")" || {
     echo "FAIL: $rel — mktemp -d не смог создать песочницу"
     RUN_ONE_STATUS=1
     return 0
