@@ -164,20 +164,30 @@ cp "$WORK/journal.bak" "$STATE/.asana-project-4242.journal.jsonl"
 # известную запись, а не накопленное предыдущими кейсами.
 STATE3="$WORK/state3"; mkdir -p "$STATE3"
 T0=1800000000   # произвольная фиксированная точка отсчёта, целые секунды (bash считает только целые)
-# Дробная часть НАМЕРЕННО не нулевая и заметно больше короткого окна ниже — на целых секундах
-# обрубание дробной части неотличимо от точного времени, и регресс прошёл бы незамеченным.
-# Проверено мутациями адаптера (.superpowers/sdd/iso-t7-report.md): при .75 возврат обрубания
+# Дробная часть НАМЕРЕННО не нулевая, не кратна целой миллисекунде и заметно больше короткого
+# окна ниже — на целых секундах И на точных миллисекундах обрубание дробной части неотличимо
+# от точного времени, и регресс прошёл бы незамеченным.
+# Проверено мутациями адаптера (.superpowers/sdd/iso-t7-report.md): при .7504 возврат обрубания
 # вместе с потерей round-trip'а cutoff'а роняет проверку «свежее событие съедено» ниже, а
 # возврат отдельных часов для cutoff (time.time()) роняет последнюю проверку кейса.
-FRAC=".75"
+#
+# М2 (T7 review): .75 (ровно 750мс, кратно миллисекунде) делал round-trip now_sec неотличимым
+# от прямого now_epoch() — iso_from_epoch(epoch_from_iso(X.750)) == X.750 побитово, поэтому
+# снятие round-trip'а НЕ ловилось никаким окном. .7504 — НЕ кратно миллисекунде: округление
+# при записи ts даёт X.750 (потеря 0.4мс), и при окне уже 0.0000001ч (~0.36мс) эта потеря
+# становится больше окна — без round-trip'а cutoff считался бы от неусечённого X.7504 и
+# съедал бы собственное же свежее событие. Проверено экспериментом вне набора (см.
+# .superpowers/sdd/iso-t7-report.md, находка М2): с round-trip — проходит, без — падает.
+FRAC=".7504"
 # runat <epoch> [args...] — прогон адаптера с замороженными часами
 runat() { local at="$1"; shift; ASANA_PROJECT_NOW_EPOCH="$at" "$AP" --project 4242 --state-dir "$STATE3" "$@"; }
 echo '{"tasks":[]}' > "$FIX"
 runat "$T0$FRAC" >/dev/null   # baseline пустого проекта, молча
 echo "{\"tasks\":[$t1]}" > "$FIX"
 # событие СОЗДАНО в этом прогоне: сколь угодно короткое окно не имеет права его съесть
-# (регресс-гард на ту самую рассинхронизацию ts и cutoff)
-out="$(runat "$T0$FRAC" --replay-hours 0.0001)"
+# (регресс-гард на ту самую рассинхронизацию ts и cutoff, включая round-trip — окно намеренно
+# у́же расхождения округления миллисекунды при некратной .7504, см. М2 выше)
+out="$(runat "$T0$FRAC" --replay-hours 0.0000001)"
 echo "$out" | grep -q 'Новая задача «Первая задача» (task=101' || { echo "FAIL: свежее событие съедено собственным окном реплея: $out"; exit 1; }
 # то же время, окно час — запись внутри окна, реплей обязан быть; это контроль к следующей
 # проверке: тишина ниже получается ИМЕННО из-за протухания, а не потому что журнал пуст
@@ -210,11 +220,26 @@ out="$(runat "$((T0 + 7200))$FRAC" --replay-hours 1)"   # два часа спу
 
 # 10) arg validation (+ валидация шва времени из кейса 9: мусор в нём обязан быть явным
 # отказом, а не тихим откатом на настоящие часы — иначе сломанный шов давал бы «зелёный»
-# тест. Проверки безопасны: now_epoch отказывает ДО первого HTTP-запроса и до любой записи)
+# тест. Проверки безопасны: now_epoch отказывает ДО первого HTTP-запроса и до записи
+# снимка/журнала (каталог состояния и lock-файл создаются раньше — это не запись данных,
+# их создание идемпотентно и безвредно повторить)
 for bad in abc -1 0 nan inf 1800000000000; do
   ASANA_PROJECT_NOW_EPOCH="$bad" "$AP" --project 4242 --state-dir "$STATE" 2>/dev/null \
     && { echo "FAIL: ASANA_PROJECT_NOW_EPOCH='$bad' принят"; exit 1; }
 done
+# Привязка шва времени к loopback (now_epoch(): "шов honored только вместе с
+# loopback-переопределением") — тоже проверяемо, БЕЗ сети: страж живёт в чистой функции,
+# а main() при импорте модуля не выполняется ни байта (guard "if __name__ == '__main__'").
+# Идиома «чистую решающую функцию проверяем напрямую» в репозитории уже есть
+# (tests/liveness-decide.test.mjs, tests/policy-drift.test.mjs) — это её python-аналог для
+# отдельного процесса. `-B` обязателен: без него SourceFileLoader насорит __pycache__ прямо
+# в channels/event-bridge/adapters/. `env -u ASANA_PROJECT_API_BASE` снимает loopback-override,
+# который прогон-обёртка экспортировала выше в этом файле, — имитируя боевой контур.
+env -u ASANA_PROJECT_API_BASE ASANA_PROJECT_NOW_EPOCH=1800000000 python3 -B -c '
+import importlib.machinery as M, importlib.util as U, sys
+ldr = M.SourceFileLoader("ap", sys.argv[1]); spec = U.spec_from_loader("ap", ldr)
+m = U.module_from_spec(spec); ldr.exec_module(m); m.now_epoch()' "$AP" 2>/dev/null \
+  && { echo 'FAIL: шов времени honored БЕЗ loopback-переопределения'; exit 1; }
 "$AP" --project abc --state-dir "$STATE" 2>/dev/null && { echo 'FAIL: non-numeric project accepted'; exit 1; }
 "$AP" --project 4242 --state-dir "$STATE" --events bogus 2>/dev/null && { echo 'FAIL: bogus --events accepted'; exit 1; }
 "$AP" --project 4242 --state-dir "$STATE" --request-budget 9999 2>/dev/null && { echo 'FAIL: oversized budget accepted'; exit 1; }
