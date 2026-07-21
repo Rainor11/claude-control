@@ -1,14 +1,29 @@
 #!/bin/bash
+# tests/dept-approve.test.sh — dept-approve: worker-only турникет, policy-ack, передача
+# карточки оператору, строгий парсер.
+#
+# T6, ДВЕ независимые причины падения под границей — вылечены обе:
+#   1. `export DEPT_HOME="$(mktemp -d)"` — корень СНАРУЖИ тестового корня (резолвер T1
+#      законно отказывал). Убрано: под маркером корень задаёт раннер, dept_only резолвится
+#      в <корень>/department.
+#   2. bin-копии лежали ПЛОСКО в "$(mktemp -d)" — `require('../lib/runtime-root.js')` из
+#      dept-ledger искал /tmp/lib/… (MODULE_NOT_FOUND). Теперь песочница ПОВТОРЯЕТ раскладку
+#      репозитория: <sandbox>/bin/<копии> + <sandbox>/lib → симлинк на настоящий lib/, тот же
+#      относительный путь ../lib резолвится корректно (ровно как в install-раскладке).
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-export DEPT_HOME="$(mktemp -d)"
-export DEPT_POLICY_DIR="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export DEPT_POLICY_DIR="$CLAUDE_CONTROL_TEST_ROOT/policy"
+mkdir -p "$DEPT_POLICY_DIR"
 printf '# правила v1\n' > "$DEPT_POLICY_DIR/policy-v1.md"
 CLAUDE_AUTO_NAME=mk-prodmash "$DIR/bin/dept-ledger" policy-ack --version v1 >/dev/null
 
 # sandbox-копия bin, чтобы подменить claude-auto-request по соседству с dept-approve —
 # dept-approve зовёт его по абсолютному пути $BINDIR/claude-auto-request, PATH-мок не сработает.
-SANDBOX="$(mktemp -d)"
+SANDBOX="$CLAUDE_CONTROL_TEST_ROOT/sandbox/bin"
+mkdir -p "$SANDBOX"
+ln -sfn "$DIR/lib" "$CLAUDE_CONTROL_TEST_ROOT/sandbox/lib"
 cp "$DIR/bin/dept-ledger" "$DIR/bin/dept-approve" "$SANDBOX/"
 cat > "$SANDBOX/claude-auto-request" <<'EOF'
 #!/bin/bash

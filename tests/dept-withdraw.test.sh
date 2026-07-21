@@ -1,12 +1,25 @@
 #!/bin/bash
+# tests/dept-withdraw.test.sh — контракт обёртки dept-withdraw: порядок шагов (карточка
+# гасится ПЕРВОЙ) и fail-closed на каждом отказе.
+#
+# T6: тест проходил и до перевода (настоящий dept-ledger здесь подменён bash-заглушкой, до
+# резолвера дело не доходило), но `export DEPT_HOME="$(mktemp -d)"` оставался миной: любой
+# новый шаг, зовущий настоящий bin/*, немедленно получил бы законный отказ T1 «переменная
+# указывает НЕ внутрь тестового корня». Убрано; каталоги — внутри песочницы раннера, свой
+# bin-каталог повторяет раскладку репозитория (bin/ + симлинк lib/) на случай, если сюда
+# добавят копию НАСТОЯЩЕГО node-бинаря, которому нужен ../lib.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-export DEPT_HOME="$(mktemp -d)"
-export DEPT_POLICY_DIR="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export DEPT_POLICY_DIR="$CLAUDE_CONTROL_TEST_ROOT/policy"
+mkdir -p "$DEPT_POLICY_DIR"
 printf '# правила v1\n' > "$DEPT_POLICY_DIR/policy-v1.md"
 fail() { echo "FAIL: $*"; exit 1; }
 
-SANDBOX="$(mktemp -d)"
+SANDBOX="$CLAUDE_CONTROL_TEST_ROOT/sandbox/bin"
+mkdir -p "$SANDBOX"
+ln -sfn "$DIR/lib" "$CLAUDE_CONTROL_TEST_ROOT/sandbox/lib"
 cp "$DIR/bin/dept-withdraw" "$SANDBOX/"
 export MOCK_LOG="$SANDBOX/log"
 

@@ -1,7 +1,13 @@
 #!/bin/bash
+# tests/ledger-messages.test.sh — адаптер шины событий поверх журнала отдела.
+# T6: было `export DEPT_HOME="$(mktemp -d)"` — каталог СНАРУЖИ тестового корня, из-за чего
+# резолвер T1 законно отказывал bin/dept-ledger («утечка боевого окружения в тест»). Корень
+# теперь задаёт раннер, DEPT_HOME тест не выставляет вовсе: под маркером профиль dept_only
+# резолвится в <корень>/department, туда и пишет журнал.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-export DEPT_HOME="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LM="$DIR/channels/event-bridge/adapters/ledger-messages"
 
 "$DIR/bin/dept-ledger" send --type question --to dept-head --subject "тест с
