@@ -29,7 +29,11 @@ _CAR_BIN_DIR="$(cd "$(dirname "$_CAR_SELF")" && pwd)"
 # shellcheck disable=SC1091
 . "$_CAR_BIN_DIR/../lib/process-control.sh"
 
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), уже
+# подгруженный transitively из process-control.sh выше. Без маркера CLAUDE_CONTROL_TEST_ROOT
+# возвращает ту же строку, что прежний inline-дефолт; под маркером — fail-closed на песочницу.
+# Горячий путь (ExecStart юнита): резолвер — чистая функция, без побочных эффектов.
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 WORKERS_DIR="$CONTROL_DIR/workers"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 # Default model for workers: force the 1M-context Opus variant. A forked/resumed
