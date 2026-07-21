@@ -112,6 +112,16 @@ case "$ACTION" in
   *)  die "unknown --action '$ACTION' (closed catalog: whitelist-add|whitelist-remove|one-time-send|mcp-add|dept-approval)" ;;
 esac
 
+# М7 (ревью T8): --subject принимается, но НАМЕРЕННО никуда не идёт — и это НЕ потерянная
+# функциональность. Тему письма мог бы нести только e-mail-вариант one-time-send, а его в
+# закрытом каталоге НЕТ: `--to email:…` отвергается явно ("supports only TG in v1"), у
+# rnr_db.py insert-approval нет ни поля, ни колонки под subject, и ни один вызывающий в
+# репозитории и в живом реестре воркеров --subject не передаёт (проверено). Флаг — остаток
+# исходного коммита фичи; парсинг оставлен, чтобы не отказывать на него `die`-ом, но молчать
+# о том, что значение выброшено, нельзя — предупреждаем. Появится e-mail one-time-send —
+# сюда же и подключать.
+[ -z "$SUBJECT" ] || echo "claude-auto-request: warning: --subject не поддерживается ни одним действием закрытого каталога и ИГНОРИРУЕТСЯ (тема письма нужна только e-mail-варианту one-time-send, которого в v1 нет)" >&2
+
 command -v python3 >/dev/null 2>&1 || die "python3 required"
 [ -f "$DB" ] || die "db helper unavailable ($DB)"
 

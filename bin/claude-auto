@@ -909,9 +909,14 @@ status_memory() {
   # transcript (recovery aid + freshness anchor). Locate by unique session-id
   # filename — Claude Code's project-dir slug replaces every non-[A-Za-z0-9] char
   # with '-', so a Cyrillic deal path can't be derived via a simple s#/#-#.
+  # М7 (ревью T8): tx_mtime здесь БОЛЬШЕ НИКТО НЕ ЧИТАЕТ (отсюда SC2034) — свежесть считает
+  # bin/dept-memory-freshness ниже, по своим часам, а не этот локальный stat. Остаток
+  # оставлен намеренно: править горячий путь ради info-уровня линта в ревью-фиксе не нужно.
+  # Убирать — отдельной уборкой, вместе с историческим упоминанием tx_mtime в ветке rebase.
   local wfile tx_mtime=0
   if [ -n "$sid" ]; then
     wfile="$(ls -1 "$HOME/.claude/projects"/*/"$sid.jsonl" 2>/dev/null | head -1)"
+    # shellcheck disable=SC2034  # см. комментарий выше — присваивание оставлено намеренно
     [ -n "$wfile" ] && { echo "  transcript: $wfile"; tx_mtime="$(stat -c %Y "$wfile" 2>/dev/null || echo 0)"; }
   fi
 

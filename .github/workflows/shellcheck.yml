@@ -33,9 +33,24 @@ jobs:
         # проверялись линтером). Теперь берём ВСЕ *.sh репозитория + tests/run (он без
         # расширения, но это bash) — новый .sh попадает под линт автоматически.
         #
-        # bin/* и channels/*/adapters/* без расширения СОЗНАТЕЛЬНО не добавлены: у них есть
-        # предсуществующие замечания (SC2012/SC2015/SC2181/SC1007 — намеренные конструкции
-        # вроде `TMUX= tmux`), разбирать их — отдельная задача, не «изоляция тестов».
+        # М7 (ревью T8): extensionless bin/* ДОБАВЛЕН — отдельным прогоном на `-S warning`.
+        # На `-S error` он давал 0 замечаний (то есть ничего не ловил), на `-S warning` — 7,
+        # и среди них нашлись два мёртвых флага: `--project` в adapters/asana-comments и
+        # `--subject` в bin/claude-auto-request. Уровень `warning`, а не дефолтный
+        # style/info, — сознательно: у этих файлов есть предсуществующий info-шум
+        # (SC2012 `ls | head`, SC2015), разбирать который — отдельная задача. Namespace
+        # выбирается ПО SHEBANG, а не по имени: в bin/ лежат и node-скрипты
+        # (claude-auto-liveness, dept-ledger, dept-inbox, dept-dispatcher, dept-rebase-check,
+        # dept-memory-freshness), их shellcheck разбирать не должен.
+        # channels/*/adapters/* сюда НЕ входит: там свой предсуществующий шум, отдельно.
         run: |
           mapfile -t sh_files < <(git ls-files '*.sh')
           shellcheck "${sh_files[@]}" tests/run
+          mapfile -t bin_files < <(
+            git ls-files 'bin/*' | while IFS= read -r f; do
+              case "$f" in *.*) continue ;; esac
+              head -1 "$f" | grep -qE '^#!.*(bash|sh)$' && printf '%s\n' "$f"
+            done
+          )
+          echo "bin (shebang bash/sh): ${#bin_files[@]} файлов"
+          shellcheck -S warning "${bin_files[@]}"

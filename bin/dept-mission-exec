@@ -88,6 +88,8 @@ fi
 RETRY_SLEEP="${MISSION_RETRY_SLEEP:-30}"
 case "$RETRY_SLEEP" in ''|*[!0-9]*) RETRY_SLEEP=30 ;; esac
 ok=false
+# shellcheck disable=SC2034  # `i` — только счётчик итераций (ограничитель ретраев), тело
+# цикла его намеренно не читает. Переименование в `_` — правка кода ради линта, не делаем.
 for i in $(seq 1 10); do
   [ "$RETRY_SLEEP" -gt 0 ] && sleep "$RETRY_SLEEP"
   rout="$("$CA" rebase "$worker" --reason "миссия: $reason" 2>&1)"; rrc=$?
