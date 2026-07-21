@@ -57,6 +57,18 @@ REPO_DIR="$(cd "$BIN_DIR/.." && pwd)"
 # возвращает ту же строку, что прежний inline-дефолт (${CLAUDE_CONTROL_DIR:-$HOME/.claude-control});
 # под маркером — fail-closed на корень песочницы. DEPT в cmd_mission_update ниже остаётся
 # производным от этого CONTROL_DIR (композитный DEPT), поэтому тоже уходит в песочницу.
+#
+# T6, почему CONTROL_DIR резолвится EAGER на module-load, а SYSTEMD_USER_DIR (см. ниже,
+# строки про T4) — наоборот, ТОЧЕЧНО: это не противоречие, а разная нужность.
+#   * CONTROL_DIR нужен ПРАКТИЧЕСКИ КАЖДОЙ команде claude-auto (workers/, autonomous.json) —
+#     ленивый резолв просто размазал бы одну и ту же ошибку по десяткам мест, а под
+#     невалидным маркером мы всё равно обязаны умереть ДО первого побочного эффекта.
+#     Ранний отказ здесь — это и есть fail-closed, а не издержка.
+#   * Каталог unit-файлов нужен РОВНО ОДНОЙ команде (cmd_install_units). Eager-резолв его
+#     заставлял бы `claude-auto sleep` под невалидным маркером падать на ресурсе, который
+#     ему не нужен вовсе.
+# Общее правило: резолвим рано то, без чего команда не работает в принципе; точечно — то,
+# что нужно единичному сценарию.
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 WORKERS_DIR="$CONTROL_DIR/workers"
 REGISTRY="$CONTROL_DIR/autonomous.json"

@@ -100,5 +100,12 @@
     "profile": "control_only",
     "env": { "HOME": "/" },
     "expect": { "ok": true, "value": "//.claude-control" }
+  },
+  {
+    "name": "home-empty-b1-divergence",
+    "comment": "T6: HOME ЗАДАН, но ПУСТ — единственное место, где резолвер СОЗНАТЕЛЬНО расходится с легаси-строкой. Прежний inline-код давал ${CLAUDE_CONTROL_DIR:-$HOME/.claude-control} = '/.claude-control' и rc=0 (корень файловой системы принимался бы за корень флота); резолвер отказывает rc=1. На живом контуре недостижимо (HOME везде /home/rainor), но расхождение зафиксировано ФИКСТУРОЙ, чтобы его не переоткрывали как баг паритета.",
+    "profile": "control_only",
+    "env": { "HOME": "" },
+    "expect": { "ok": false, "errorPattern": "HOME" }
   }
 ]
