@@ -18,7 +18,11 @@ _RECONCILER_BIN_DIR="$(cd "$(dirname "$_RECONCILER_SELF")" && pwd)"
 # shellcheck disable=SC1091
 . "$_RECONCILER_BIN_DIR/../lib/process-control.sh"
 
-CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1), уже
+# подгруженный transitively из process-control.sh выше. Без маркера CLAUDE_CONTROL_TEST_ROOT
+# возвращает ту же строку, что прежний inline-дефолт; под маркером — fail-closed на песочницу
+# (reconciler боевой флот тогда не трогает).
+CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 REGISTRY="$CONTROL_DIR/autonomous.json"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "$(ts) reconciler: $*"; }
