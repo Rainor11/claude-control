@@ -50,8 +50,38 @@ BIN = os.path.normpath(os.path.join(HERE, "..", "bin"))
 SESSION_INJECT = os.path.join(BIN, "session-inject")
 CLAUDE_AUTO = os.path.join(BIN, "claude-auto")
 TG_NOTIFY = "/home/rainor/server/server_monitor/telegram_notify.sh"  # absolute
-CONTROL_DIR = os.environ.get("CLAUDE_CONTROL_DIR",
-                             os.path.join(os.path.expanduser("~"), ".claude-control"))
+
+# T5: единый резолвер корня рантайма. lib/runtime-root.sh (задача T1) — ЕДИНСТВЕННОЕ место,
+# где решается, валиден ли тестовый корень (sentinel, пересечение с боевым деревом, утечка
+# легаси-переменных). Питон эту логику НЕ дублирует и НЕ читает CLAUDE_CONTROL_TEST_ROOT сам
+# ради значения — иначе граница разъехалась бы с bash/node половиной при первой же правке.
+_RUNTIME_ROOT_LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "runtime-root.sh"))
+
+
+def _runtime_root(legacy_default):
+    """Корень рантайма для python-стороны бота.
+
+    Без маркера CLAUDE_CONTROL_TEST_ROOT возвращает legacy_default — ПОБИТОВО то же
+    выражение, что стояло здесь до T5 (ни одного нового чтения env, паритет для 19 живых
+    воркеров). Под маркером зовёт resolve_runtime_root из lib/runtime-root.sh; отказ
+    резолвера = выход, а НЕ тихий фолбэк на боевой путь: тихий фолбэк — это ровно тот
+    «замок/каталог в боевом дереве под тестом», ради которого точку и мигрировали.
+    """
+    if "CLAUDE_CONTROL_TEST_ROOT" not in os.environ:
+        return legacy_default
+    proc = subprocess.run(
+        ["bash", "-c", '. "$1" && resolve_runtime_root control_only', "_", _RUNTIME_ROOT_LIB],
+        capture_output=True, text=True,
+    )
+    root = proc.stdout.strip()
+    if proc.returncode != 0 or not root:
+        reason = proc.stderr.strip() or f"resolve_runtime_root вернул rc={proc.returncode} и пустой корень"
+        sys.exit(f"rnr-workers-bot: {reason}")
+    return root
+
+
+CONTROL_DIR = _runtime_root(os.environ.get("CLAUDE_CONTROL_DIR",
+                            os.path.join(os.path.expanduser("~"), ".claude-control")))
 WORKERS_DIR = os.path.join(CONTROL_DIR, "workers")
 ENV_PATH = os.environ.get("RNR_ENV_PATH", "/home/rainor/server/.env")
 BTN_OVERVIEW = "📊 Сводка"
@@ -1851,7 +1881,12 @@ def acquire_singleton():
     token, but the delivery loop runs independently of polling — two processes would
     BOTH inject the same answer (Codex CRIT-1). A flock makes the bot a singleton."""
     global _LOCK_FH
-    lockdir = os.path.join(os.path.expanduser("~"), ".claude-control", "rnr-bot")
+    # T5: замок обязан лежать в резолвленном корне, а не в боевом каталоге всегда. Без
+    # маркера legacy_default = ПРЕЖНЕЕ выражение (~/.claude-control) буквально — заметь, что
+    # это НЕ CONTROL_DIR: singleton-замок и раньше игнорировал CLAUDE_CONTROL_DIR (замок
+    # общий на токен бота, а не на инстанс флота), и T5 эту семантику не меняет.
+    lockdir = os.path.join(
+        _runtime_root(os.path.join(os.path.expanduser("~"), ".claude-control")), "rnr-bot")
     os.makedirs(lockdir, exist_ok=True)
     _LOCK_FH = open(os.path.join(lockdir, "bot.lock"), "w")
     try:
