@@ -177,4 +177,29 @@ out="$(ASANA_COMMENTS_API_BASE="http://127.0.0.1:1" run)" || { echo 'FAIL: fetch
 [ -z "$out" ] || { echo "FAIL: fetch failure emitted: $out"; exit 1; }
 cmp -s "$FPR" "$WORK/fpr.bak" || { echo 'FAIL: fetch failure mutated fingerprints'; exit 1; }
 
+# 13) T8 п.4: baseline первого прогона пишется с НАСТОЯЩИМИ миллисекундами, не обрублен до
+#     ".000". Baseline сравнивается с created_at из Asana ЛЕКСИКОГРАФИЧЕСКИ, поэтому важны
+#     два свойства сразу: (а) ширина ровно 3 знака — иначе домен сравнения разъезжается с
+#     Asana (микросекунды дают строку, лексикографически МЕНЬШУЮ той же миллисекунды, см. T7);
+#     (б) дробная часть настоящая — обрубленная старила отметку задним числом до целой
+#     секунды, и коммент, созданный в ту же секунду позже старта, выдавался повторно.
+#     Проверка детерминированная, без sleep и без сверки с внешними часами: 10 первых
+#     прогонов; «все десять ровно .000» на исправном коде невозможно (1e-30), а на
+#     обрубленном — единственный возможный исход. Первый прогон до HTTP не доходит (пишет
+#     baseline и выходит), так что мок-сервер здесь не участвует.
+ms_nonzero=0
+for i in $(seq 1 10); do
+  STATE_MS="$WORK/state-ms-$i"; mkdir -p "$STATE_MS"
+  "$AC" --task 4242 --state-dir "$STATE_MS" >/dev/null
+  b="$(cat "$STATE_MS/.asana-comments-4242.baseline")"
+  case "$b" in
+    ????-??-??T??:??:??.???Z) ;;
+    *) echo "FAIL: baseline не той формы (ожидались ровно 3 знака дробной части): '$b'"; exit 1 ;;
+  esac
+  ms="${b##*.}"; ms="${ms%Z}"
+  [ "$ms" = "000" ] || ms_nonzero=$((ms_nonzero+1))
+done
+[ "$ms_nonzero" -gt 0 ] \
+  || { echo 'FAIL: все 10 baseline-отметок ровно .000 — отметка времени обрублена до секунды'; exit 1; }
+
 echo "OK: asana-comments adapter tests passed"
