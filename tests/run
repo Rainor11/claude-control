@@ -379,6 +379,14 @@ run_one() {
   mkdir -p "$home_dir"
   local rnr_db_dir="$canon_sandbox/rnr-db"
   mkdir -p "$rnr_db_dir"
+  # К1 (Codex-аудит, финальное ревью изоляции): BRAIN_CLIENTS (bin/dept-spawn-exec) — путь в
+  # СОВСЕМ ДРУГОМ дереве (живой Мозг), не входит ни в один профиль резолвера T1, значит не
+  # покрывается unset/export CLAUDE_CONTROL_DIR/CLAUDE_AUTO_HOME/DEPT_HOME выше. Раньше
+  # единственной защитой было то, что каждый тест вручную подставлял BRAIN_CLIENTS внутрь
+  # своей песочницы — раннер теперь делает это МЕХАНИЧЕСКИ для всех тестов сразу, тест,
+  # забывший свою подстановку, всё равно попадает в песочницу, а не в живой Мозг.
+  local brain_clients_dir="$canon_sandbox/brain-clients"
+  mkdir -p "$brain_clients_dir"
 
   local rc out
   # `{ ...; } 2>&1` ВНУТРИ command substitution — сливает stderr в stdout ДЛЯ ВСЕГО блока
@@ -396,7 +404,7 @@ run_one() {
       # unconditional-ветка `if uses_bootstrap` ниже не помогла бы: она лишь РЕШАЕТ,
       # экспортировать ли НАШЕ значение, но не убирает УЖЕ унаследованное чужое.
       unset CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME CLAUDE_CONTROL_TEST_ROOT \
-            SYSTEMCTL DEPT_SYSTEMD_RUN TMUX_BIN
+            SYSTEMCTL DEPT_SYSTEMD_RUN TMUX_BIN BRAIN_CLIENTS
 
       export CLAUDE_CONTROL_TEST_ROOT="$canon_sandbox"
       export HOME="$home_dir"
@@ -420,6 +428,13 @@ run_one() {
       export CLAUDE_AUTO_TG="$stub_dir/telegram-notify.sh"
       export RNR_ASKS_DB="$rnr_db_dir/asks.db"
       export STUB_LOG="$canon_sandbox/stub-calls.log"
+      # BRAIN_CLIENTS — механическая защита К1 (см. mkdir выше): экспортируется БЕЗУСЛОВНО
+      # (не гейтится uses_bootstrap — dept-spawn-exec не подключён к bootstrap-протоколу
+      # T3, но резолвит BRAIN_CLIENTS через lib/runtime-root.sh под этим же маркером).
+      # Тест, которому нужен СВОЙ шаблон _template.md/BRAIN_CLIENTS, переопределяет эту
+      # переменную явно (как tests/dept-requests.test.sh) — переопределение форсированного
+      # env-присвоения того же имени в команде побеждает наш export, ничего не ломает.
+      export BRAIN_CLIENTS="$brain_clients_dir"
 
       # Defense-in-depth ПОВЕРХ обязательных seam-переменных (не замена им): stub_dir
       # ПЕРЕД остальным PATH — код, который (как СЕГОДНЯШНИЙ bin/claude-auto, см.

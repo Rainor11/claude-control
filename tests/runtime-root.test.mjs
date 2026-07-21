@@ -46,7 +46,12 @@ function resolveViaBash(profile, env) {
     );
     return { ok: true, value: out.replace(/\n$/, '') };
   } catch (e) {
-    return { ok: false, message: `${e.stdout || ''}${e.stderr || ''}` };
+    // М2 (Codex-аудит, финальное ревью изоляции T1-T7): trim трейлингового '\n' — bash `echo`
+    // добавляет его, JS `Error.message` нет; без trim побайтовое сравнение jsResult.message
+    // === bashResult.message ниже расходилось бы ВСЕГДА только из-за перевода строки, а не
+    // из-за реального текста, что сделало бы assert бесполезным (либо вечно красным, либо
+    // пришлось бы слабже — оба хуже явного trim здесь).
+    return { ok: false, message: `${e.stdout || ''}${e.stderr || ''}`.replace(/\n$/, '') };
   }
 }
 
@@ -88,6 +93,17 @@ for (const c of FIXTURE_CASES) {
     assert.equal(jsResult.ok, bashResult.ok, `js/bash разошлись по accept/reject для '${c.name}'`);
     if (jsResult.ok) {
       assert.equal(jsResult.value, bashResult.value, `js/bash разошлись по значению для '${c.name}'`);
+    } else {
+      // М2 (Codex-аудит, финальное ревью изоляции T1-T7): раньше каждая сторона сверялась
+      // ТОЛЬКО с общим c.expect.errorPattern (широкий regex по содержанию, например "HOME"),
+      // а bash/js МЕЖДУ СОБОЙ по ТЕКСТУ сообщения не сверялись вовсе — префикс разъехался
+      // (bash `resolve_runtime_root:`, js `runtime-root:`), 10/10 вердиктов и кодов совпадали,
+      // и errorPattern эту разницу не ловил (он про содержание, не про первое слово). Явное
+      // побайтовое сравнение текста — единственное, что закрывает именно этот класс
+      // регрессии. Побочно проверено: после unификации префикса ОСТАЛЬНОЙ текст сообщений
+      // (после префикса) у bash/js уже был идентичен для всех кейсов фикстуры — расхождение
+      // было ИМЕННО в префиксе, не в содержании.
+      assert.equal(jsResult.message, bashResult.message, `js/bash разошлись по ТЕКСТУ сообщения для '${c.name}'`);
     }
   });
 }

@@ -306,6 +306,33 @@ out="$(HOME="$home_noop" run_env - process_control_check_unit_dir "/some/random/
 
 echo "OK: process_control_check_unit_dir — вне test root отказ, внутри и без маркера ок"
 
+# ---------------------------------------------------------------------------------------
+# М3 (Codex-аудит, финальное ревью изоляции T1-T7): было `${1:?...}` — при пустом/отсутствующем
+# первом аргументе bash `${var:?msg}` печатает сообщение и делает `exit` ВСЕГО ВЫЗЫВАЮЩЕГО
+# ПРОЦЕССА (не `return` из функции) — библиотека source'ится ПРЯМО В ШЕЛЛ вызывающего
+# (bin/claude-auto и др.), значит опечатка/пустая переменная в реальном вызове убивала бы ВЕСЬ
+# вызывающий скрипт, а не только эту функцию. Тест проверяет ИМЕННО это: код ПОСЛЕ вызова с
+# пустым аргументом, В ТОМ ЖЕ ШЕЛЛЕ (без под-subshell'а command substitution вокруг САМОГО
+# вызова — иначе даже старое поведение "убить процесс" было бы незаметно теми же run_env/
+# run_pure, которые сами уже subshell), обязан выполниться и напечатать маркер.
+# ---------------------------------------------------------------------------------------
+
+out="$(
+  unset CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME CLAUDE_CONTROL_TEST_ROOT
+  # shellcheck disable=SC1090
+  . "$LIB"
+  process_control_check_unit_dir "" 2>&1
+  echo "rc=$?"
+  echo "REACHED-AFTER-CALL"
+)"
+echo "$out" | command grep -q "REACHED-AFTER-CALL" \
+  || fail "process_control_check_unit_dir с пустым dir убил ВЕСЬ вызывающий шелл вместо return 1 (М3): $out"
+echo "$out" | command grep -q "^rc=1$" \
+  || fail "process_control_check_unit_dir с пустым dir должен вернуть rc=1: $out"
+echo "$out" | command grep -qi "usage" \
+  || fail "process_control_check_unit_dir с пустым dir: сообщение не объясняет usage: $out"
+echo "OK: process_control_check_unit_dir — пустой dir возвращает 1 (die-путь), НЕ убивает вызывающий процесс (М3)"
+
 # ---- маркер невалиден (нет sentinel) — все функции отказывают, ни один бинарь не звался --
 
 root_bad="$(mktemp -d "$TMP_BASE/root-bad-XXXXXX")"  # БЕЗ sentinel-файла
@@ -443,6 +470,33 @@ echo "$out" | command grep -qi "недопустимые символы" || fail
 [ -s "$fake_log" ] && fail "process_control_tmux с плохим именем: побочный эффект произошёл (лог не пуст): $(cat "$fake_log")"
 
 echo "OK: process_control_tmux — имя со встроенным переводом строки отклонено ДО построения argv, без побочного эффекта (К2)"
+
+# ---------------------------------------------------------------------------------------
+# М3 (Codex-аудит, финальное ревью изоляции T1-T7): было `${1:?...}` — при пустом/отсутствующем
+# первом аргументе bash `${var:?msg}` печатает сообщение и делает `exit` ВСЕГО ВЫЗЫВАЮЩЕГО
+# ПРОЦЕССА (не `return` из функции) — библиотека source'ится ПРЯМО В ШЕЛЛ вызывающего
+# (bin/claude-auto и др.), значит опечатка/пустая переменная в реальном вызове убивала бы ВЕСЬ
+# вызывающий скрипт, а не только эту функцию. Тест проверяет ИМЕННО это: код ПОСЛЕ вызова с
+# пустым именем, В ТОМ ЖЕ ШЕЛЛЕ (без под-subshell'а command substitution вокруг САМОГО вызова —
+# иначе даже старое поведение "убить процесс" было бы незаметно теми же run_env/run_pure,
+# которые сами уже subshell), обязан выполниться и напечатать маркер.
+# ---------------------------------------------------------------------------------------
+
+out="$(
+  unset CLAUDE_CONTROL_DIR CLAUDE_AUTO_HOME DEPT_HOME CLAUDE_CONTROL_TEST_ROOT
+  # shellcheck disable=SC1090
+  . "$LIB"
+  process_control_tmux "" kill-session 2>&1
+  echo "rc=$?"
+  echo "REACHED-AFTER-CALL"
+)"
+echo "$out" | command grep -q "REACHED-AFTER-CALL" \
+  || fail "process_control_tmux с пустым именем убил ВЕСЬ вызывающий шелл вместо return 1 (М3): $out"
+echo "$out" | command grep -q "^rc=1$" \
+  || fail "process_control_tmux с пустым именем должен вернуть rc=1: $out"
+echo "$out" | command grep -qi "usage" \
+  || fail "process_control_tmux с пустым именем: сообщение не объясняет usage: $out"
+echo "OK: process_control_tmux — пустое имя возвращает 1 (die-путь), НЕ убивает вызывающий процесс (М3)"
 
 # ---------------------------------------------------------------------------------------
 # В1 (ревью T2): guard не должен позволять вызывающему подсовывать СВОЙ -L/-S (tmux) или

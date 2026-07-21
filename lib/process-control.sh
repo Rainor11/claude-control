@@ -16,8 +16,20 @@
 #   4. systemd-run НЕ наследует env — CLAUDE_CONTROL_TEST_ROOT, поставленный в окружении
 #      диспетчера, теряется в transient-юните, если явно не прокинуть через --setenv.
 #
-# ЭТА ЗАДАЧА ADDITIVE: guard пишется и тестируется, но НИ К ОДНОМУ файлу в bin/, bot/,
-# channels/ НЕ подключается — подключение отдельная задача (T4). Живой флот не меняется.
+# М1 (Codex-аудит, финальное ревью изоляции T1-T7): строка ниже устарела — T4 ПОДКЛЮЧИЛ guard
+# к живым точкам (bash-сторона): `bin/claude-auto-reconciler` (2× systemctl),
+# `bin/claude-auto` (17× systemctl + 9× tmux + unit-dir + loginctl),
+# `bin/claude-auto-run` (4× tmux, горячий путь) — см. .superpowers/sdd/iso-t4-report.md.
+# Node-сторона (lib/process-control.js) подключена к `bin/dept-inbox` и `bin/dept-dispatcher`
+# тем же T4. Инвариант "без маркера — побитово прежнее поведение" подтверждён отдельно для
+# каждой точки (diff argv фейкового бинаря до/после) и НЕ пострадал от подключения — но
+# формулировка "НИ К ОДНОМУ файлу... НЕ подключается" ниже больше не описывает реальность,
+# оставлена как исторический контекст T2 (когда guard был только написан и протестирован,
+# ещё не подключён нигде).
+#
+# ЭТА ЗАДАЧА (T2) БЫЛА ADDITIVE: guard писался и тестировался, но НИ К ОДНОМУ файлу в bin/,
+# bot/, channels/ НЕ подключался — подключение было отдельной задачей (T4, см. выше — уже
+# сделано). Живой флот в РАМКАХ T2 не менялся.
 #
 # Контракт (буквально из брифа): без маркера CLAUDE_CONTROL_TEST_ROOT — вызывает настоящий
 # бинарь, поведение идентично сегодняшнему (условие раскатки: guard не должен ничего менять
@@ -142,11 +154,24 @@ process_control_systemd_run_setenv_argv() {
 # test root. Без маркера — не проверяет НИЧЕГО (прод-путь, идентичный сегодняшнему —
 # guard не добавляет новых отказов там, где раньше их не было).
 #
-# М3 (ревью T2): публичная (была `_process_control_check_binary_seam`) — паритет с JS-стороной,
-# где `checkBinarySeam` экспортирован из module.exports с самого начала. Для T4-миграции
-# bash-кода, который продолжает сам вычислять свой шов (тот же резон, что у уже публичной
-# `process_control_check_unit_dir` рядом с `process_control_unit_dir`), нужен эквивалент —
-# приватность здесь была не осознанным решением, а случайной асимметрией с JS.
+# М3 (ревью T2): публичная (была `_process_control_check_binary_seam`) — паритет с JS-стороной
+# ТОЛЬКО В ЭКСПОРТИРОВАННОСТИ (`checkBinarySeam` в module.exports с самого начала), НЕ В
+# СИГНАТУРЕ/АРНОСТИ. Для T4-миграции bash-кода, который продолжает сам вычислять свой шов
+# (тот же резон, что у уже публичной `process_control_check_unit_dir` рядом с
+# `process_control_unit_dir`), нужен эквивалент — приватность здесь была не осознанным
+# решением, а случайной асимметрией с JS.
+#
+# В6 (Codex-аудит, финальное ревью изоляции T1-T7): АРНОСТЬ этой функции и JS-стороны
+# СОЗНАТЕЛЬНО РАЗНАЯ, не паритетна — абзац выше говорит про "паритет" ТОЛЬКО в смысле
+# экспортированности/публичности, не сигнатуры, но формулировка приглашала к путанице
+# (Codex прочитал её как "вызов совместим с JS"). Эта функция — ДВУХАРГУМЕНТНАЯ, резолвит
+# test_root САМА (см. `_process_control_test_root` ниже); JS-сторона `checkBinarySeam(varName,
+# value, testRootOrNull)` — ТРЁХаргументная, test root вычисляет и передаёт вызывающий
+# (`preflight`). Мигрант, портирующий bash-вызов на JS "по аналогии" (2 аргумента, ожидая, что
+# JS тоже сам резолвит корень), молча получил бы fail-open под маркером в JS — этот класс
+# дыры закрыт в JS явным отказом на `undefined` третьего аргумента (см. checkBinarySeam в
+# lib/process-control.js). Если понадобится по-настоящему унифицировать сигнатуры — делать
+# явно и одним шагом для обеих сторон, не полагаясь на комментарий как на гарантию совместимости.
 process_control_check_binary_seam() {
   local var_name="$1" value="$2" test_root resolved
   test_root="$(_process_control_test_root)" || return 1
@@ -237,7 +262,19 @@ process_control_systemctl() {
 # Сканируем "$@" ДО вызова бинаря и отказываем явно, а не полагаемся, что вызывающий никогда
 # так не сделает.
 process_control_tmux() {
-  local name="${1:?process_control_tmux: usage: process_control_tmux <name> [tmux-args...]}"
+  # М3 (Codex-аудит, финальное ревью изоляции T1-T7): было `${1:?...}` — при пустом/
+  # отсутствующем `$1` bash `${var:?message}` печатает message и ЗАВЕРШАЕТ ВЕСЬ ВЫЗЫВАЮЩИЙ
+  # ПРОЦЕСС (`exit`, не `return`) — сюрприз для вызывающего скрипта (например bin/claude-auto,
+  # который source'ит эту библиотеку В СВОЙ ЖЕ шелл): опечатка/пустая переменная в вызове
+  # `process_control_tmux ""` убивала бы ВЕСЬ `claude-auto`, а не только эту функцию,
+  # асимметрично с JS-стороной, где эквивалентная валидация — catchable `throw`. Явная
+  # проверка + `return 1` — тот же die-путь, каким уже оформлены ВСЕ ОСТАЛЬНЫЕ отказы в этом
+  # файле (echo "process-control: ..." >&2; return 1), деградация теста/вызывающего, не убийство.
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "process-control: process_control_tmux: usage: process_control_tmux <name> [tmux-args...]" >&2
+    return 1
+  fi
   shift
   [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || {
     echo "process-control: process_control_tmux: имя воркера '$name' содержит недопустимые символы (разрешено [a-zA-Z0-9_-])" >&2
@@ -349,7 +386,15 @@ process_control_unit_dir() {
 # из T1), иначе явный отказ ДО записи. `realpath -m` (не `-e`) — каталог обычно ещё не
 # существует на момент проверки (создаётся `mkdir -p` уже ПОСЛЕ прохождения проверки).
 process_control_check_unit_dir() {
-  local dir="${1:?process_control_check_unit_dir: usage: process_control_check_unit_dir <dir>}"
+  # М3 (Codex-аудит, финальное ревью изоляции T1-T7): та же правка, что у process_control_tmux
+  # выше — было `${1:?...}` (убивает ВЕСЬ вызывающий процесс через `exit`, не `return`),
+  # теперь explicit-проверка + `return 1`, тот же die-путь, каким оформлены остальные отказы
+  # в этом файле.
+  local dir="${1:-}"
+  if [ -z "$dir" ]; then
+    echo "process-control: process_control_check_unit_dir: usage: process_control_check_unit_dir <dir>" >&2
+    return 1
+  fi
   local test_root canon_dir
   test_root="$(_process_control_test_root)" || return 1
   [ -n "$test_root" ] || return 0

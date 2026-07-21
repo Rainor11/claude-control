@@ -151,6 +151,31 @@ out4b="$("${RENDER_ENV[@]}" CLAUDE_AUTO_BIN="$FAKE_CA" BRAIN_CLIENTS="$BRAIN_CLI
 echo "$out4b" | command grep -q 'зарезервировано' || fail "dept-spawn-exec: отказ по 'watchdog' без пояснения"
 [ -s "$FAKE_CA_LOG" ] && fail "dept-spawn-exec вызвал claude-auto ДО отказа по зарезервированному имени"
 
+# ---- 4c) К1 (Codex-аудит, финальное ревью изоляции T1-T7): dept-spawn-exec, вызванный ПОД
+#         маркером БЕЗ ручной подстановки BRAIN_CLIENTS (симулирует забывчивого автора
+#         следующего теста), обязан остаться ВНУТРИ песочницы — НЕ писать скелет клиента в
+#         живой Мозг (/home/rainor/brain/wiki/work/ai-dev/клиенты). До фикса единственной
+#         защитой была дисциплина — BRAIN_CLIENTS="$BRAIN_CLIENTS_TEST" вручную на каждый
+#         вызов выше (4/4а/4b). Здесь — СВОЙ подкорень (не смешивать со сценарием 4/4a/4b) и
+#         BRAIN_CLIENTS ЯВНО unset (make_test_subroot её не трогает, а внешняя песочница
+#         раннера уже экспортирует СВОЙ BRAIN_CLIENTS — без unset тест проверял бы утечку
+#         легаси-переменной наружу ЭТОГО подкорня, не дефолт-fallback). --------------------
+make_test_subroot brainguard BG_ROOT BG_ENV
+K1_CLIENT="k1-regress-guard-$$"
+mkdir -p "$BG_ROOT/brain-clients"
+cp "$BRAIN_CLIENTS_TEST/_template.md" "$BG_ROOT/brain-clients/_template.md"
+out_k1="$(
+  unset BRAIN_CLIENTS
+  "${BG_ENV[@]}" CLAUDE_AUTO_BIN=/bin/true \
+    "$DIR/bin/dept-spawn-exec" --client "$K1_CLIENT" --name mk-k1guard --asana-gid 9990001 \
+    --asana-url 'https://app.asana.com/0/0/9990001' 2>&1
+)" || fail "dept-spawn-exec (К1: BRAIN_CLIENTS не подставлен вручную) упал: $out_k1"
+[ -f "$BG_ROOT/brain-clients/$K1_CLIENT/CLAUDE.md" ] \
+  || fail "К1: скелет клиента не создан внутри песочницы (fallback BRAIN_CLIENTS не сработал): $out_k1"
+[ ! -e "/home/rainor/brain/wiki/work/ai-dev/клиенты/$K1_CLIENT" ] \
+  || fail "К1 РЕГРЕССИЯ: dept-spawn-exec создал скелет клиента в ЖИВОМ Мозге ($K1_CLIENT) — маркер не сдержал BRAIN_CLIENTS!"
+echo "OK: dept-spawn-exec (К1) — без ручной подстановки BRAIN_CLIENTS под маркером остаётся в песочнице, живой Мозг не тронут"
+
 # ---- 5) dept-sleep-request: не-мк отвергается; валидная заявка проходит --------------
 "$DL" registry-set test-notmk --role тп >/dev/null
 out5a="$(DEPT_APPROVE_TEST_ACTOR=test-head "$SANDBOX/dept-sleep-request" --worker test-notmk --reason 'x' 2>&1)" \

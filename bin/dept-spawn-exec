@@ -13,14 +13,44 @@ BINDIR="$(cd "$(dirname "$0")" && pwd)"
 DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 CA="${CLAUDE_AUTO_BIN:-$BINDIR/claude-auto}"   # env-переопределение для тестов (PATH-заглушка недоступна — вызов по абсолютному пути)
 REPO="$(cd "$BINDIR/.." && pwd)"
-BRAIN_CLIENTS="${BRAIN_CLIENTS:-/home/rainor/brain/wiki/work/ai-dev/клиенты}"
+die() { echo "dept-spawn-exec: $*" >&2; exit 1; }
 # T5: DEPT_HOME-корень — через единый резолвер (lib/runtime-root.sh, задача T1). Профиль
 # dept_only: DEPT_HOME → $HOME/.claude-control/department. Без маркера CLAUDE_CONTROL_TEST_ROOT
 # возвращает ту же строку, что прежний inline-дефолт; под маркером — fail-closed на <песочница>/department.
 # shellcheck disable=SC1091
 . "$BINDIR/../lib/runtime-root.sh"
 DEPT="$(resolve_runtime_root dept_only)" || exit 1
-die() { echo "dept-spawn-exec: $*" >&2; exit 1; }
+
+# BRAIN_CLIENTS: путь в СОВСЕМ ДРУГОМ дереве (живой Мозг: /home/rainor/brain/...), не входит
+# ни в один из 4 канонических профилей резолвера T1 (не корень флота claude-control). До этой
+# правки единственной защитой от записи под маркером было то, что КАЖДЫЙ вызывающий тест
+# вручную подставлял BRAIN_CLIENTS внутрь своей песочницы (см. tests/dept-requests.test.sh) —
+# дисциплина автора теста, не механика: забывчивый следующий тест писал бы скелет клиента в
+# живой Мозг (синкается Obsidian, авто-коммитится Stop-хуком) — Codex-аудит К1, финальное
+# ревью изоляции T1-T7.
+#
+# Решение построено НА УЖЕ провалидированном test root — тот же приём, каким
+# lib/process-control.sh добавляет НОВЫЕ решения (какой каталог/сокет использовать под
+# маркером) ПОВЕРХ resolve_runtime_root, не дублируя его валидацию (sentinel/containment/
+# HOME-проверки уже прогнаны строкой выше для DEPT; control_only здесь просто даёт "голый"
+# канонический test root без профильного суффикса "/department", тот же приём, что
+# `_process_control_test_root` в lib/process-control.sh делает через `control_only`).
+if [ -n "${CLAUDE_CONTROL_TEST_ROOT+set}" ]; then
+  brain_sandbox_root="$(resolve_runtime_root control_only)" || exit 1
+  if [ -n "${BRAIN_CLIENTS:-}" ]; then
+    brain_clients_canon="$(realpath -e "$BRAIN_CLIENTS" 2>/dev/null)" || die "BRAIN_CLIENTS='$BRAIN_CLIENTS' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но не резолвится — уберите BRAIN_CLIENTS или укажите путь внутри тестового корня"
+    _runtime_root_contained "$brain_clients_canon" "$brain_sandbox_root" || die "BRAIN_CLIENTS='$BRAIN_CLIENTS' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но указывает НЕ внутрь тестового корня '$brain_sandbox_root' — похоже на утечку живого Мозга в тест. Уберите BRAIN_CLIENTS или укажите путь внутри тестового корня."
+    BRAIN_CLIENTS="$brain_clients_canon"
+  else
+    # Забывчивый вызывающий (тест, не подставивший BRAIN_CLIENTS вручную) — дефолт ВНУТРИ
+    # test root, а не боевой путь. Раннер (tests/run) дополнительно экспортирует BRAIN_CLIENTS
+    # сам — эта ветка страхует тех, кто вызывает dept-spawn-exec НАПРЯМУЮ под маркером, минуя
+    # tests/run (make_test_subroot и т.п.).
+    BRAIN_CLIENTS="$brain_sandbox_root/brain-clients"
+  fi
+else
+  BRAIN_CLIENTS="${BRAIN_CLIENTS:-/home/rainor/brain/wiki/work/ai-dev/клиенты}"
+fi
 
 approval="" client="" name="" gid="" url="" note=""
 while [ $# -gt 0 ]; do case "$1" in

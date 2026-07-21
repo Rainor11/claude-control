@@ -48,12 +48,12 @@ resolve_runtime_root() {
   case "$profile" in
     control_only|auto_then_control|auto_then_hardcoded|dept_only) ;;
     *)
-      echo "resolve_runtime_root: неизвестный профиль '$profile' (ожидался один из: control_only, auto_then_control, auto_then_hardcoded, dept_only)" >&2
+      echo "runtime-root: неизвестный профиль '$profile' (ожидался один из: control_only, auto_then_control, auto_then_hardcoded, dept_only)" >&2
       return 1
       ;;
   esac
   if [ -z "${HOME:-}" ]; then
-    echo "resolve_runtime_root: переменная HOME не установлена — резолвер не может вычислить боевой корень по умолчанию" >&2
+    echo "runtime-root: переменная HOME не установлена — резолвер не может вычислить боевой корень по умолчанию" >&2
     return 1
   fi
 
@@ -95,7 +95,7 @@ _runtime_root_reject_if_entangled_with_prod() {
   local canon_root="$1" prod_path_raw="$2" canon_prod
   canon_prod="$(realpath -e "$prod_path_raw" 2>/dev/null)" || return 0
   if _runtime_root_contained "$canon_root" "$canon_prod" || _runtime_root_contained "$canon_prod" "$canon_root"; then
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT='$canon_root' пересекается с боевым корнем ($prod_path_raw) — совпадает с ним, вложен в него или содержит его целиком; тестам сюда нельзя, укажите отдельный временный каталог вне боевого дерева" >&2
+    echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT='$canon_root' пересекается с боевым корнем ($prod_path_raw) — совпадает с ним, вложен в него или содержит его целиком; тестам сюда нельзя, укажите отдельный временный каталог вне боевого дерева" >&2
     return 1
   fi
   return 0
@@ -142,19 +142,19 @@ _runtime_root_resolve_test_marker() {
   case "$marker" in
     /*) ;;
     *)
-      echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT должен быть абсолютным путём, получено '$marker'" >&2
+      echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT должен быть абсолютным путём, получено '$marker'" >&2
       return 1
       ;;
   esac
 
   local canon_root
   canon_root="$(realpath -e "$marker" 2>/dev/null)" || {
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT='$marker' не резолвится (каталог не существует или недоступен)" >&2
+    echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT='$marker' не резолвится (каталог не существует или недоступен)" >&2
     return 1
   }
 
   if [ "$canon_root" = "/" ]; then
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT не может быть корнем файловой системы '/'" >&2
+    echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT не может быть корнем файловой системы '/'" >&2
     return 1
   fi
 
@@ -164,11 +164,11 @@ _runtime_root_resolve_test_marker() {
   # совпадает, значит не рискуем и отказываем, а не тихо пропускаем проверку.
   local canon_home
   canon_home="$(realpath -e "$HOME" 2>/dev/null)" || {
-    echo "resolve_runtime_root: HOME='$HOME' не резолвится — не могу проверить, что CLAUDE_CONTROL_TEST_ROOT не совпадает с домашним каталогом" >&2
+    echo "runtime-root: HOME='$HOME' не резолвится — не могу проверить, что CLAUDE_CONTROL_TEST_ROOT не совпадает с домашним каталогом" >&2
     return 1
   }
   if [ "$canon_root" = "$canon_home" ]; then
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT не может совпадать с домашним каталогом ($canon_home) — слишком широкий охват для тестового корня" >&2
+    echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT не может совпадать с домашним каталогом ($canon_home) — слишком широкий охват для тестового корня" >&2
     return 1
   fi
 
@@ -181,7 +181,7 @@ _runtime_root_resolve_test_marker() {
   # М1 (ревью T1): sentinel обязан быть ОБЫЧНЫМ ФАЙЛОМ, не каталогом — `-e` считал каталог с
   # таким именем валидным sentinel (обходится одним `mkdir` вместо `touch`). `-f`, не `-e`.
   if [ ! -f "$canon_root/$_RUNTIME_ROOT_SENTINEL_NAME" ]; then
-    echo "resolve_runtime_root: CLAUDE_CONTROL_TEST_ROOT='$canon_root' не содержит sentinel-файл '$_RUNTIME_ROOT_SENTINEL_NAME' (обязан быть обычным файлом, не каталогом) — тестовый раннер обязан создать его перед использованием корня (защита от случайно указанного боевого/произвольного каталога)" >&2
+    echo "runtime-root: CLAUDE_CONTROL_TEST_ROOT='$canon_root' не содержит sentinel-файл '$_RUNTIME_ROOT_SENTINEL_NAME' (обязан быть обычным файлом, не каталогом) — тестовый раннер обязан создать его перед использованием корня (защита от случайно указанного боевого/произвольного каталога)" >&2
     return 1
   fi
 
@@ -193,13 +193,13 @@ _runtime_root_resolve_test_marker() {
     raw="${!name:-}"
     [ -n "$raw" ] || continue
     canon_legacy="$(realpath -e "$raw" 2>/dev/null)" || {
-      echo "resolve_runtime_root: переменная $name='$raw' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но не резолвится — уберите $name или укажите путь внутри тестового корня" >&2
+      echo "runtime-root: переменная $name='$raw' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но не резолвится — уберите $name или укажите путь внутри тестового корня" >&2
       return 1
     }
     # containment через общую _runtime_root_contained (К1 ревью T1: раньше эта логика была
     # инлайнена только тут — вынесена в отдельную функцию, чтобы жила в одном месте).
     if ! _runtime_root_contained "$canon_legacy" "$canon_root"; then
-      echo "resolve_runtime_root: переменная $name='$raw' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но указывает НЕ внутрь тестового корня '$canon_root' — похоже на утечку боевого окружения в тест. Уберите $name или укажите путь внутри тестового корня." >&2
+      echo "runtime-root: переменная $name='$raw' задана вместе с CLAUDE_CONTROL_TEST_ROOT, но указывает НЕ внутрь тестового корня '$canon_root' — похоже на утечку боевого окружения в тест. Уберите $name или укажите путь внутри тестового корня." >&2
       return 1
     fi
   done

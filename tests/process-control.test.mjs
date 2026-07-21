@@ -164,6 +164,26 @@ test('checkBinarySeam: заглушка-СИМЛИНК внутри test root н
   assert.throws(() => checkBinarySeam('SYSTEMCTL', symlinkStub, root), /снаружи|не внутрь/);
 });
 
+// ---------------------------------------------------------------------------------------
+// В6 (Codex-аудит, финальное ревью изоляции T1-T7): ловушка арности — третий аргумент
+// (testRootOrNull) НЕ ПЕРЕДАН вовсе (в отличие от явного `null`, легитимно означающего
+// "маркер не задан") обязан быть явным отказом, а не тем же fail-open, что у `null`.
+// Bash-сторона (process_control_check_binary_seam) — двухаргументная, сама резолвит корень;
+// мигрант, скопировавший этот вызов на JS "по аналогии" (2 аргумента), раньше молча получал
+// пропуск проверки под маркером.
+// ---------------------------------------------------------------------------------------
+
+test('checkBinarySeam: третий аргумент НЕ передан (arity trap) — throw, НЕ тихий пропуск (В6)', () => {
+  assert.throws(
+    () => checkBinarySeam('SYSTEMCTL', 'systemctl'),
+    /третий аргумент|ловушка арности/i,
+  );
+});
+
+test('checkBinarySeam: явный null (легитимное "маркер не задан") — по-прежнему НЕ throw (В6, без ложных срабатываний)', () => {
+  assert.doesNotThrow(() => checkBinarySeam('SYSTEMCTL', 'systemctl-not-a-real-command-xyz', null));
+});
+
 test('preflight: неизвестный класс — throw', () => {
   const home = fakeDir('pc-home-');
   assert.throws(() => preflight('bogus_class', { HOME: home }), /неизвестный класс/);
@@ -333,6 +353,64 @@ test('realpathM: симлинк-цикл — НЕ виснет, возвраща
   // резолва (rc=0), не виснет и не бросает — здесь достаточно, что вызов вообще завершается
   // (timeout выше) и не бросает исключение.
   assert.doesNotThrow(() => realpathM(join(cycA, 'tail')));
+});
+
+// ---------------------------------------------------------------------------------------
+// В5 (Codex-аудит, финальное ревью изоляции T1-T7): realpathM/checkUnitDir абсолютизировали
+// вход через `path.resolve()`, который схлопывает ".." ЛЕКСИЧЕСКИ ДО обхода по компонентам —
+// симлинк ВНУТРИ test root, указывающий НАРУЖУ, + буквальный ".." В ЗАПРОСЕ ПОСЛЕ симлинка
+// давал "выглядит внутри root" вместо физического резолва (см. "ДЕФЕКТ 2" в
+// lib/process-control.js). Репро ревьюера: `checkUnitDir("<root>/link/../escape")` было
+// APPROVED, bash-сторона (`realpath -m`, реальный бинарь) REJECTED. ВАЖНО: входной путь
+// собираем БУКВАЛЬНОЙ КОНКАТЕНАЦИЕЙ строк (`` `${link}/../escape` ``), НЕ через `join()` —
+// `path.join()` САМ схлопнул бы ".." ДО вызова realpathM, и тест проходил бы вслепую, никогда
+// не поймав Дефект 2 (та же ошибка была поймана в диф-фазз-харнессе при верификации фикса —
+// первая версия харнесса использовала `path.join(base, case)` и получала 0 расхождений
+// ЛОЖНО, см. отчёт).
+// ---------------------------------------------------------------------------------------
+
+test('realpathM: симлинк ВНУТРИ test root наружу + ".." В ЗАПРОСЕ ПОСЛЕ симлинка — резолвится ФИЗИЧЕСКИ, как GNU realpath -m, не лексически (В5, Дефект 2)', () => {
+  const root = fakeDir('pc-root-');
+  const outside = fakeDir('pc-outside-');
+  const link = join(root, 'link');
+  symlinkSync(outside, link);
+  const rawInput = `${link}/../escape`;
+  const viaRealBinary = execFileSync('realpath', ['-m', '--', rawInput], { encoding: 'utf8' }).trim();
+  // Sanity: сценарий реально уходит НАРУЖУ и symlink-цели, и root (иначе тест был бы про
+  // что-то другое, не про побег) — не ".../root/escape", не ".../outside/escape".
+  assert.notEqual(viaRealBinary, join(root, 'escape'));
+  assert.equal(realpathM(rawInput), viaRealBinary);
+});
+
+test('checkUnitDir: симлинк ВНУТРИ test root наружу + ".." В ЗАПРОСЕ ПОСЛЕ симлинка — throw (было APPROVED до фикса Дефекта 2, В5, точный репро ревьюера)', () => {
+  const home = fakeDir('pc-home-');
+  const root = fakeDir('pc-root-');
+  sentinelFile(root);
+  const outside = fakeDir('pc-outside-');
+  const link = join(root, 'link');
+  symlinkSync(outside, link);
+  const rawInput = `${link}/../escape`;
+  assert.throws(
+    () => checkUnitDir(rawInput, { HOME: home, [MARKER_VAR]: root }),
+    /снаружи/i,
+  );
+});
+
+test('realpathM: батарея кейсов ".." после симлинка/несуществующего компонента/двойного слэша — паритет с GNU realpath -m (В5, Дефект 2)', () => {
+  const root = fakeDir('pc-root-');
+  mkdirSync(join(root, 'a', 'b'), { recursive: true });
+  const outside = fakeDir('pc-outside-');
+  symlinkSync(outside, join(root, 'a', 'linkabs'));
+  const cases = [
+    `${root}/a/b/../../a`,
+    `${root}/a/linkabs/../x`,
+    `${root}/a/doesnotexist/../y`,
+    `${root}/a//b//../c`,
+  ];
+  for (const rawInput of cases) {
+    const expected = execFileSync('realpath', ['-m', '--', rawInput], { encoding: 'utf8' }).trim();
+    assert.equal(realpathM(rawInput), expected, rawInput);
+  }
 });
 
 // ---------------------------------------------------------------------------------------

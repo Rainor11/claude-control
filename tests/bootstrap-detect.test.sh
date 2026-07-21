@@ -61,6 +61,18 @@ EOF
 check "легитимный source после 'set -euo pipefail' (другой вариант той же допустимой директивы)" \
   "$FIXTURE_DIR/legit-set-euo-pipefail.test.sh" protected
 
+# М4 (Codex-аудит, финальное ревью изоляции T1-T7): форма `source path` (bash-синоним `.`,
+# полноценный builtin) — раньше распознавался ТОЛЬКО `. path`, файл с `source` считался
+# незащищённым, хотя реально подключает bootstrap.
+cat > "$FIXTURE_DIR/legit-source-keyword.test.sh" <<'EOF'
+#!/bin/bash
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bootstrap.sh"
+echo body
+EOF
+check "М4: легитимное подключение через 'source path' (bash-синоним '.') — обязано считаться защищённым" \
+  "$FIXTURE_DIR/legit-source-keyword.test.sh" protected
+
 cat > "$FIXTURE_DIR/legit.test.mjs" <<'EOF'
 import './lib/bootstrap.mjs';
 import { test } from 'node:test';
