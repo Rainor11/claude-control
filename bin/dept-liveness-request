@@ -28,9 +28,13 @@ DL="$BINDIR/dept-ledger"
 RR="$BINDIR/dept-request-render"
 RNR_DB="${RNR_DB_BIN:-$BINDIR/../bot/rnr_db.py}"
 OPERATOR_ENV="${CLAUDE_AUTO_OPERATOR_ENV:-/home/rainor/server/.env}"
-# CLAUDE_AUTO_HOME — тот же корень, что чтят watchdog (claude-auto-liveness) и dispatcher
-# (dept-dispatcher CC_HOME); CLAUDE_CONTROL_DIR остаётся fallback для остальных обёрток.
-CONTROL_DIR="${CLAUDE_AUTO_HOME:-${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}}"
+# T5: корень рантайма — через единый резолвер (lib/runtime-root.sh, задача T1). Профиль
+# auto_then_control: CLAUDE_AUTO_HOME → CLAUDE_CONTROL_DIR → $HOME/.claude-control — тот же
+# корень, что чтят watchdog (claude-auto-liveness) и dispatcher (CC_HOME). Без маркера
+# CLAUDE_CONTROL_TEST_ROOT — та же строка, что прежний inline-дефолт; под маркером fail-closed.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/runtime-root.sh"
+CONTROL_DIR="$(resolve_runtime_root auto_then_control)" || exit 1
 die() { echo "dept-liveness-request: $*" >&2; exit 1; }
 
 worker="" frozen="" transcript=""
