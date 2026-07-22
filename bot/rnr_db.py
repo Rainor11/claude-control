@@ -329,6 +329,20 @@ def record_attempt(qid):
         conn.close()
 
 
+def undo_attempt(qid):
+    """Откатить попытку, которой фактически не было (session-inject вернул rc=4 —
+    auth-blocked: логин хоста протух, в pane ничего не печаталось). Счётчик инкрементируется
+    ДО инжекта намеренно (иначе падение БД ПОСЛЕ успешной доставки оставило бы строку
+    undelivered и она уехала бы воркеру повторно) — поэтому нужен именно откат, а не
+    «посчитаем после». Ниже нуля не опускаем."""
+    conn = connect()
+    try:
+        with conn:
+            conn.execute("UPDATE asks SET attempts=MAX(attempts-1, 0) WHERE qid=?", (qid,))
+    finally:
+        conn.close()
+
+
 def mark_delivered(qid):
     conn = connect()
     try:

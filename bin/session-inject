@@ -62,6 +62,22 @@ pane="$(tmux -L "$socket" list-panes -t "$target" -F '#{pane_active} #{pane_id}'
 
 BUSY_RE="${INJECT_BUSY_RE:-esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc}"
 APPROVAL_RE="${INJECT_APPROVAL_RE:-Do you want|Would you like|❯ *[0-9]+\.|[0-9]+\. (Yes|No|Allow|Deny)|permission to use|Allow this}"
+# Host auth is dead (expired login): the session is alive but every turn fails instantly.
+# Typing into it is pointless AND harmful — each failed delivery walks the caller's backoff
+# ladder and eventually dead-letters the event (that is how two dept-bus handoffs to the
+# archivist were lost on 21.07). We bail out BEFORE touching the pane and report it distinctly
+# as rc=4 so callers can defer without counting a delivery failure. NOT folded into rc=1: after
+# paste+Enter the outcome is genuinely unknown (the payload may have been sent), so a generic
+# failure must never be "forgiven" — retrying it would duplicate the event.
+# Anchored to the START of a line (bullet/frame glyphs allowed before it) — NOT a substring
+# match anywhere in the tail. Otherwise any text merely MENTIONING the error — an assistant
+# reply about this very incident, or an injected event payload quoting it — would poison the
+# pane: every later inject would return rc=4 before changing the screen, the marker would stay
+# put, and delivery to that worker would be blocked indefinitely (Codex-ревью 21.07).
+# NB: держим дефолт отдельной переменной — `{0,8}` внутри `${VAR:-...}` обрывает подстановку
+# на своей закрывающей скобке, и регексп молча превращался в мусор (поймано тестом).
+AUTH_RE_DEFAULT='^[^[:alnum:]]{0,8}(Login expired|OAuth token revoked|Session expired|API Error: 401|claude.ai credential is missing or expired)'
+AUTH_RE="${INJECT_AUTH_RE:-$AUTH_RE_DEFAULT}"
 
 # sanitize: strip control bytes except \n and \t
 msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037')"
@@ -112,6 +128,13 @@ while :; do
   # trailing blank lines IDENTICALLY — comparing a piped `capture|tail` against a
   # command-substituted one does NOT, and silently never settles.)
   tail_txt="$(printf '%s\n' "$pane_txt" | tail -n 12)"
+  # Auth first: waiting is pointless when the host login is dead — the session will stay
+  # "idle" forever and every injected turn would fail instantly. Checked BEFORE clear_input /
+  # paste / Enter, so rc=4 always means "nothing was typed into the pane".
+  if printf '%s\n' "$tail_txt" | grep -qiE "$AUTH_RE"; then
+    echo "session-inject: $target shows expired login — not injecting (host auth is dead; run /login)" >&2
+    exit 4
+  fi
   if printf '%s\n' "$tail_txt" | grep -qiE "$APPROVAL_RE"; then
     # An approval/selection prompt is up — NEVER type over it.
     ms_sleep "$POLL_MS"; continue
@@ -145,6 +168,38 @@ post_paste="$(snapshot)" || { echo "session-inject: snapshot failed after paste 
 # which would push a fixed tail window off the real hint line).
 busy_base="$(printf '%s\n' "$post_paste" | grep -cF 'esc to interrupt')"
 
+# Second, independent proof of submission — for HEAVY sessions where the busy hint shows up
+# later than CONFIRM_TIMEOUT. Observed live on 21.07: a 242.9k-token session accepted the
+# message and started working, yet this script reported "no turn started" because the hint had
+# not rendered within 8s. The caller then re-injects, duplicating the event.
+# The proof: an anchor from the payload's first line is NO LONGER in the input zone (bottom
+# rows) but IS visible above it — i.e. the text moved from the input box into the transcript.
+# Both halves are required: "gone from the input" alone could just be a repaint, and "visible
+# above" alone is true the whole time the payload sits in the input box.
+INPUT_ZONE_LINES=6
+# The anchor is the payload's LAST non-empty line, not its first. A multiline payload (every
+# event-bridge frame is at least two lines) fills the input box from the top, so its FIRST
+# line scrolls out of the bottom zone while the payload is still sitting there unsent — an
+# anchor on it would read as "already submitted" and the caller would mark a never-delivered
+# event as seen. The last line stays next to the cursor, i.e. inside the input zone, for
+# exactly as long as the payload is unsent.
+# ...and within that line we take the LAST three words, not the first: a single long line
+# WRAPS across many terminal rows, so its beginning scrolls out of the six-row zone while the
+# payload is still sitting in the input box — the same false "delivered" the multiline case
+# had. The end of the text is always next to the cursor, i.e. in the bottom row.
+probe="$(printf '%s' "$msg" | grep -v '^[[:space:]]*$' | tail -n1 | tr -s ' ' \
+  | awk '{s=(NF>3?NF-2:1); out=$s; for(i=s+1;i<=NF;i++) out=out" "$i; print out}')"
+# "everything except the last N lines" — via awk, because `head -n -N` is GNU-only and this
+# repo also runs on macOS (launchd/).
+strip_input_zone() { awk -v n="$INPUT_ZONE_LINES" '{b[NR]=$0} END{for(i=1;i<=NR-n;i++) print b[i]}'; }
+payload_left_input() {
+  local snap="$1"
+  [ -n "$probe" ] || return 1
+  printf '%s\n' "$snap" | tail -n "$INPUT_ZONE_LINES" | grep -qF "$probe" && return 1
+  printf '%s\n' "$snap" | strip_input_zone | grep -qF "$probe" || return 1
+  return 0
+}
+
 # Confirm submit by watching for the turn to actually START, not by a single early
 # snapshot. A submitted message begins a turn that shows the busy hint ("esc to
 # interrupt") for the whole API round-trip (seconds) — but that hint appears a BEAT
@@ -176,6 +231,9 @@ while :; do
   busy_now="$(printf '%s\n' "$snap" | grep -cF 'esc to interrupt')"
   if [ "$busy_now" -gt "$busy_base" ]; then
     submitted=1; break   # a turn started — submitted
+  fi
+  if payload_left_input "$snap"; then
+    submitted=1; break   # payload moved out of the input box into the transcript — submitted
   fi
   if [ "$snap" = "$post_paste" ] && [ "$enter_sends" -lt 4 ]; then
     # Payload untouched => the Enter was dropped => re-press it (bounded).

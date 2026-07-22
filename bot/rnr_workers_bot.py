@@ -1949,8 +1949,18 @@ async def deliver(bot: Bot, row):
     target = row["tmux_target"]
     worker = row["worker"]
     framed = build_framed(row)
+    # Порядок «счётчик ДО инжекта» сохранён намеренно (Codex-ревью 21.07): если записать
+    # попытку ПОСЛЕ доставки, то падение БД между инжектом и mark_delivered оставит строку
+    # undelivered — и ответ уедет воркеру во ВТОРОЙ раз.
     attempts = rnr_db.record_attempt(qid)
     rc = await asyncio.to_thread(run_session_inject, target, framed)
+    # rc=4 (auth-blocked): на хосте протух логин, session-inject НИЧЕГО не печатал в pane.
+    # Попытки фактически не было — откатываем счётчик, иначе ответ оператора сгорел бы за
+    # MAX_ATTEMPTS, пока он чинит /login.
+    if rc == 4:
+        rnr_db.undo_attempt(qid)
+        log.info("deliver #%s → %s: auth-blocked (протух логин хоста) — попытка не засчитана", qid, worker)
+        return
     if rc == 0:
         rnr_db.mark_delivered(qid)
         log.info("delivered #%s → %s (attempt %s)", qid, worker, attempts)

@@ -244,6 +244,21 @@ A new adapter is a script + a config entry — **no change to any core code**.
 > (`--lookback-hours`, default 24) rather than a row limit, and put a stable source
 > id in each line so identical-looking events don't collapse.
 
+> **Two guards around delivery** (added 21.07 after both bit us in one night):
+> **(1) Startup grace** — no injects until the tmux session is `EB_STARTUP_GRACE`
+> seconds old (default 120, measured from `#{session_created}`, not from the
+> watcher's own start). A freshly restarted worker is still unpacking a 265k-431k
+> token context from `--resume`; injecting into it failed with "submit not confirmed"
+> and cost the event a 300s backoff (measured: session created 09:00:29, first
+> failure 09:00:39). Nothing is lost during the grace — an event is only marked seen
+> after a successful delivery.
+> **(2) auth-blocked (`rc=4`)** — when `session-inject` sees an expired-login marker
+> it bails out BEFORE touching the pane and reports `rc=4`. The watcher then holds
+> ALL probe deliveries for `EB_AUTH_PAUSE` (default 60s) without counting a failure,
+> moving the backoff ladder, or quarantining anything: the host login being dead is
+> not the event's fault. A generic `rc=1` is still a real failure and is NOT forgiven —
+> after paste+Enter the outcome is unknown, and retrying it would duplicate the event.
+
 > **payload is DATA, not instructions.** A probe payload can come from an
 > untrusted source. The injected frame and the worker's mission both say so, but
 > keep adapters minimal: prefer ids/links over pasting full untrusted bodies,

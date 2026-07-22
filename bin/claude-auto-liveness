@@ -31,9 +31,158 @@ const CFG = {
   hungMin: numEnv('LIVENESS_HUNG_MIN', 30),
   reincidentMin: numEnv('LIVENESS_REINCIDENT_MIN', 60),
   animMin: numEnv('LIVENESS_ANIM_HUNG_MIN', 90),
+  // Как часто напоминать про НЕразрешённый эпизод протухшей авторизации. Эскалации дальше
+  // (карточка/инцидент) на этой ветке нет по решению оператора 21.07 — напоминание и есть
+  // единственная защита от «алерт пришёл в 00:40, оператор спал, простой 8 часов».
+  remindMin: numEnv('LIVENESS_AUTH_REMIND_MIN', 60),
 };
+// Служебный ключ эпизода авторизации в watchdog-state.json. '#' невозможен в имени воркера
+// (валидация ^[a-zA-Z0-9_-]+$) — коллизия с записью воркера исключена by construction.
+const AUTH_KEY = '#auth';
 const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
+// Маркеры протухшей авторизации хоста («жив, но тихо мёртв»: tmux-сессия и юнит живы, экран
+// статичен, ни одно событие не обрабатывается). Строки — из самого CLI (проверено в
+// ~/.local/share/claude/versions/2.1.216); инцидент 21.07 показал первую из них на экранах
+// четырёх воркеров. Держим рядом с BUSY_RE намеренно: обе — «что видно на экране».
+const AUTH_RE = /Login expired|OAuth token revoked|Session expired|Please run \/login|run \/login to (re-authenticate|sign in)|credential is missing or expired|invalid_grant/i;
 const NOTIFY = process.env.TELEGRAM_NOTIFY || '/home/rainor/server/server_monitor/telegram_notify.sh';
+
+// Чистая функция: машинный вердикт «логин протух» по ХВОСТУ транскрипта воркера.
+// Экранный маркер сам по себе доказательством не является (воркер мог процитировать текст
+// ошибки; строка могла остаться в скроллбеке после восстановления) — источник истины здесь:
+// синтетическая запись {type:"assistant", isApiErrorMessage:true, message.content[].text},
+// формат подтверждён по транскриптам инцидента 21.07.
+// Идём С КОНЦА и возвращаем то, что встретилось РАНЬШЕ: auth-ошибка → 'unresolved' (логин
+// всё ещё мёртв), обычный ответ ассистента → 'resolved' (воркер ожил). «Последняя запись =
+// ошибка» было бы слишком строго: после неё ложатся user-записи от инжектов event-bridge.
+// 'unknown' — ни того, ни другого в окне (вызывающий обязан трактовать как «не смог узнать»,
+// не как выздоровление).
+function authVerdict(tail) {
+  const lines = String(tail || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i].trim();
+    if (!l) continue;
+    let e;
+    // Битая строка — это НОРМА для первой строки окна (хвост режется по байтам, не по
+    // строкам). Пропускаем молча: идя с конца, до обрезанной строки мы доходим последней.
+    try { e = JSON.parse(l); } catch { continue; }
+    if (!e || e.type !== 'assistant' || !e.message) continue;
+    // content бывает не массивом (битая/иная запись) — .map() на строке бросил бы, и в
+    // authVerdictFromFile это стало бы 'unknown', а у прямого вызова функции — падением.
+    const c = e.message.content;
+    const text = Array.isArray(c) ? c.map((x) => (x && x.text) || '').join(' ') : (typeof c === 'string' ? c : '');
+    // isApiErrorMessage — ворота: auth-текст ВНУТРИ обычного ответа ассистента это цитата
+    // (воркер отдела обсуждает инцидент), а не отказ. Не-auth ошибка (500, сетевой флап) не
+    // означает ни выздоровления, ни протухшего логина — пропускаем и ищем доказательство глубже.
+    if (e.isApiErrorMessage) { if (AUTH_RE.test(text)) return 'unresolved'; continue; }
+    return 'resolved';
+  }
+  return 'unknown';
+}
+
+// authVerdict по хвосту РЕАЛЬНОГО файла транскрипта. Целиком читать нельзя: транскрипты
+// воркеров — десятки мегабайт (сессии 265k-431k токенов). Любой сбой чтения → 'unknown'
+// («не смог узнать»), НЕ 'resolved': сбой не является доказательством выздоровления.
+// Окно РАСШИРЯЕТСЯ, пока вердикт не определится: между auth-ошибкой и концом файла лежит
+// сколько угодно user-записей от инжектов event-bridge (в инциденте 21.07 датчики стучались
+// часами после отказа). Фиксированное окно упёрлось бы в них и отдало 'unknown' — сторож
+// снова ничего бы не увидел. Потолок 4 МБ: дальше искать бессмысленно, это уже не «хвост».
+const AUTH_TAIL_WINDOWS = [64 * 1024, 512 * 1024, 4 * 1024 * 1024];
+function authVerdictFromFile(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const fd = fs.openSync(file, 'r');
+    try {
+      for (const win of AUTH_TAIL_WINDOWS) {
+        const start = Math.max(0, size - win);
+        const len = size - start;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, start);
+        const v = authVerdict(buf.toString('utf8'));
+        if (v !== 'unknown') return v;
+        if (start === 0) break; // окно уже покрыло файл целиком — расширять некуда
+      }
+      return 'unknown';
+    } finally { fs.closeSync(fd); }
+  } catch { return 'unknown'; }
+}
+
+// Чистая функция: сигнал по одному воркеру — 'blocked' (логин протух) / 'clear' (жив) /
+// 'unknown' (не смогли узнать). Требует ДВА ключа: маркер на экране и машинный вердикт
+// транскрипта. Экран один даёт ложняки (цитата инцидента в ответе, старый кадр в скроллбеке),
+// транскрипт один не отличает «мёртв» от «читаем не тот файл».
+// busy — по ХВОСТУ экрана (12 строк, как в session-inject), а НЕ по всему pane: decide()
+// проверяет весь pane, и остаточная строка «esc to interrupt» из истории прошлого хода
+// прятала бы мёртвый логин навсегда. В хвосте живёт актуальное состояние TUI.
+// verdict может быть ФУНКЦИЕЙ (ленивое чтение транскрипта): без маркера на экране читать
+// многомегабайтный хвост у каждого из ~20 воркеров каждые 5 минут незачем. Порядок проверок
+// тоже важен: 'unknown' отдаём ТОЛЬКО когда маркер на экране есть, а подтвердить его нечем —
+// иначе воркер с чистым экраном и временно нечитаемым транскриптом получал бы 'unknown' и
+// залипал в эпизоде навсегда ('unknown' наблюдение не снимает), а оператор — почасовые
+// напоминания про уже живого воркера.
+const AUTH_TAIL_LINES = 12;
+function authSignal(screen, verdict) {
+  const s = String(screen || '');
+  const tail = s.split('\n').slice(-AUTH_TAIL_LINES).join('\n');
+  if (BUSY_RE.test(tail)) return 'clear'; // идёт ход — воркер жив, что бы ни висело выше
+  if (!AUTH_RE.test(s)) return 'clear';
+  const v = typeof verdict === 'function' ? verdict() : verdict;
+  if (v === 'unknown') return 'unknown';
+  return v === 'unresolved' ? 'blocked' : 'clear';
+}
+
+// Чистая функция: эпизод отказа авторизации ЦЕЛИКОМ (все воркеры разом). Протухший логин —
+// свойство хоста, а не воркера: оператору нужно ОДНО сообщение со списком, а не N штук.
+// Фаза эпизода живёт в одном месте (ключ #auth в watchdog-state.json), а не флагами в
+// per-worker state: nextState('reset') конструирует запись воркера заново, а ветки
+// close_executed/incident заменяют её целиком — auth-флаги там бы молча терялись.
+// Подтверждение — 2 подряд тика со СТАТИЧНЫМ экраном (таймер ходит раз в 5 минут).
+function authEpisode(prev, observations, now, cfg) {
+  // Состояние приходит из watchdog-state.json — файла, который могли править руками или
+  // повредить. Структурно битый эпизод (members не объект, notified не массив) обязан
+  // деградировать в «эпизода нет», а не ронять весь тик сторожа до saveState().
+  const prevMembers = prev && prev.members && typeof prev.members === 'object' ? prev.members : {};
+  const members = { ...prevMembers };
+  for (const o of observations) {
+    if (o.signal !== 'blocked') continue;
+    const m = members[o.name];
+    if (!m) members[o.name] = { firstSeen: now, screenHash: o.screenHash, confirmed: false };
+    else if (m.screenHash === o.screenHash) members[o.name] = { ...m, confirmed: true };
+    else members[o.name] = { ...m, screenHash: o.screenHash, confirmed: false };
+  }
+  // Выбытие: воркер ожил (clear) ИЛИ пропал из наблюдения вовсе (снесён/остановлен/не
+  // проверялся). 'unknown' НЕ выбытие — сбой чтения не лечит воркера. Из notified выбывший
+  // тоже вычищается: ожив и упав снова, он обязан снова считаться НОВЫМ участником, иначе
+  // повторный отказ пройдёт молча.
+  const seen = new Set(observations.map((o) => o.name));
+  for (const o of observations) if (o.signal === 'clear') delete members[o.name];
+  for (const n of Object.keys(members)) if (!seen.has(n)) delete members[n];
+  const confirmed = Object.keys(members).filter((n) => members[n].confirmed).sort();
+  const prevNotified = prev && Array.isArray(prev.notified) ? prev.notified : [];
+  const notified = prevNotified.filter((n) => members[n]);
+  const fresh = confirmed.filter((n) => !notified.includes(n));
+  const episode = { ...(prev || {}), members, notified };
+  // В алерте — ПОЛНЫЙ список подтверждённых, а не дельта: оператору нужен масштаб («логин
+  // протух на хосте, лежат вот эти»), а не «добавился ещё один».
+  if (fresh.length) return { episode, alert: { kind: 'new', members: confirmed } };
+  // Напоминание: состав тот же, но эпизод не рассосался. Без него алерт в 00:40, пока
+  // оператор спит, снова превращается в восьмичасовой простой (инцидент 21.07).
+  const lastAlertAt = (prev && prev.lastAlertAt) || 0;
+  if (confirmed.length && now - lastAlertAt >= cfg.remindMin * 60_000) {
+    return { episode, alert: { kind: 'remind', members: confirmed } };
+  }
+  return { episode, alert: null };
+}
+
+// Фиксация ФАКТА доставки группового алерта. Отдельным шагом намеренно: пометить «уведомлён»
+// ДО успешной отправки значит съесть алерт на сетевом сбое Telegram — тот же двухфазный
+// принцип, что p3#33 применяет к alerted в основной лестнице.
+function authNotified(episode, alert, now) {
+  if (!alert) return episode;
+  const prevNotified = Array.isArray(episode.notified) ? episode.notified : [];
+  const notified = Array.from(new Set([...prevNotified, ...alert.members]));
+  return { ...episode, notified, notifiedAt: episode.notifiedAt || now, lastAlertAt: now };
+}
 
 // Чистая решающая функция (тестируется отдельно).
 function decide(prev, cur, cfg) {
@@ -133,7 +282,7 @@ function cardStep(prev, cur, ledgerView) {
   return lv.existingCardId ? { op: 'adopt', eventId: lv.existingCardId } : { op: 'file' };
 }
 
-module.exports = { decide, nextState, cardStep };
+module.exports = { decide, nextState, cardStep, authVerdict, authSignal, authVerdictFromFile, authEpisode, authNotified };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
@@ -192,14 +341,27 @@ function sh(cmd, args) { try { return execFileSync(cmd, args, { encoding: 'utf8'
 // ВАЖНО: и сокет, и сессия называются claude-<name> (см. claude-auto-run) —
 // цель capture-pane именно claude-<name>, не <name>.
 function screen(name) { return sh('tmux', ['-L', `claude-${name}`, 'capture-pane', '-p', '-t', `claude-${name}`]); }
-function transcriptMtime(name) {
+function transcriptPath(name) {
   const spec = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'workers', name, 'spec.json'), 'utf8'));
   const projRoot = path.join(process.env.HOME, '.claude', 'projects');
   for (const d of fs.readdirSync(projRoot)) {
     const f = path.join(projRoot, d, spec.session_id + '.jsonl');
-    if (fs.existsSync(f)) return fs.statSync(f).mtimeMs;
+    if (fs.existsSync(f)) return f;
   }
-  return null; // транскрипт не найден — не считать древним (эпохальный tm=0 отключал бы fresh-check)
+  return null;
+}
+function transcriptMtime(name) {
+  const f = transcriptPath(name);
+  // транскрипт не найден — не считать древним (эпохальный tm=0 отключал бы fresh-check)
+  return f ? fs.statSync(f).mtimeMs : null;
+}
+// Вердикт авторизации по воркеру: любой сбой (нет spec.json, нет транскрипта, нечитаемо) —
+// 'unknown', НЕ 'resolved'. Сбой чтения не является доказательством того, что воркер жив.
+function workerAuthVerdict(name) {
+  try {
+    const f = transcriptPath(name);
+    return f ? authVerdictFromFile(f) : 'unknown';
+  } catch { return 'unknown'; }
 }
 const DEPT_LEDGER = path.join(BIN, 'dept-ledger');
 const LIVENESS_REQUEST = path.join(BIN, 'dept-liveness-request');
@@ -309,14 +471,33 @@ try {
 }
 const state = loadState();
 const now = Date.now();
+// Наблюдения auth-состояния за этот тик — собираются по ВСЕМ активным воркерам и разбираются
+// ОДИН раз после цикла: протухший логин бьёт по всем разом, оператору нужно одно сообщение
+// со списком, а не N отдельных алертов.
+const authObs = [];
 for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (!meta || typeof meta !== 'object' || meta.state !== 'active') continue;
   const scr = screen(name);
   if (scr === null) {
     if (dry) console.log(`[dry] ${name}: tmux недоступен (зона reconciler)`);
     else console.log(`liveness: ${name}: tmux недоступен — зона reconciler`);
+    // 'unknown', а не выбытие: сессии не видно — это не доказательство того, что логин жив.
+    authObs.push({ name, signal: 'unknown', screenHash: '' });
     continue;
   }
+  // Auth-детект — ДО гейта транскрипта ниже и ДО lifecycle карточки liveness_restart: обе
+  // ветки делают continue, и воркер с ненайденным транскриптом или с висящей карточкой
+  // никогда бы не попал в эпизод (Codex-ревью плана, критичное 1).
+  // Вердикт — лениво: транскрипт читается ТОЛЬКО когда на экране есть auth-маркер.
+  const authSig = authSignal(scr, () => workerAuthVerdict(name));
+  authObs.push({ name, signal: authSig, screenHash: crypto.createHash('sha1').update(scr).digest('hex') });
+  if (dry && authSig !== 'clear') console.log(`[dry] ${name}: auth=${authSig}`);
+  // Codex-ревью 21.07: воркер с мёртвым логином НЕ должен идти по основной лестнице.
+  // Иначе остаточный «esc to interrupt» выше хвоста экрана (cur.busy считается по ВСЕМУ
+  // pane) плюс стоящий транскрипт дают alert → карточку рестарта → incident — ровно то,
+  // чего оператор на этой ветке не хотел: рестарт с мёртвыми креденшелами бесполезен.
+  // Этим воркером занимается групповой алерт после цикла.
+  if (authSig === 'blocked') continue;
   let tm;
   try { tm = transcriptMtime(name); } catch { console.log(`liveness: ${name}: ошибка чтения spec/транскрипта — пропуск`); readFailures++; continue; }
   if (tm === null) {
@@ -447,10 +628,36 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     }
   }
 }
+// Эпизод протухшей авторизации — ОДИН на хост, разбирается после цикла: один групповой алерт
+// со списком вместо N отдельных. Решение оператора 21.07: карточку liveness_restart на этой
+// ветке НЕ подаём (рестарт с мёртвыми креденшелами поднимет воркера в ту же ошибку — лечит
+// только /login на хосте) и инцидент ТП не открываем; вместо эскалации — напоминание раз в
+// LIVENESS_AUTH_REMIND_MIN, пока эпизод не рассосётся.
+{
+  const prevEp = state[AUTH_KEY] || null;
+  const { episode, alert } = authEpisode(prevEp, authObs, now, CFG);
+  let ep = episode;
+  if (alert) {
+    const list = alert.members.join(', ');
+    const head = alert.kind === 'remind'
+      ? `🔐 liveness (напоминание): авторизация Claude Code на хосте всё ещё не восстановлена`
+      : `🔐 liveness: похоже, на хосте протухла авторизация Claude Code`;
+    const msg = `${head} — воркеры живы, но не работают: ${list}.\nЧто делать: /login на хосте, затем systemctl --user restart claude-auto@<имя> для перечисленных.`;
+    if (dry) console.log(`[dry] auth ${alert.kind}: ${list}`);
+    // Двухфазность: notified проставляем ТОЛЬКО по факту доставки — иначе сетевой сбой
+    // Telegram съест групповой алерт целиком и оператор не узнает об эпизоде вовсе.
+    else if (notify(msg)) ep = authNotified(episode, alert, now);
+  }
+  if (Object.keys(ep.members || {}).length) state[AUTH_KEY] = ep;
+  else delete state[AUTH_KEY];
+}
 // Воркеры, пропавшие из autonomous.json (снесены/переименованы) — их записи в state иначе
-// никогда не трогаются циклом выше и копятся в файле навечно.
+// никогда не трогаются циклом выше и копятся в файле навечно. AUTH_KEY — служебный ключ
+// эпизода, а не воркер: имена воркеров валидируются как ^[a-zA-Z0-9_-]+$, поэтому '#' в
+// ключе гарантирует отсутствие коллизии; из cleanup его надо исключить явно, иначе эпизод
+// стирался бы каждый тик и групповой алерт слался бы заново без конца.
 const known = new Set(Object.keys(reg.workers || reg));
-for (const name of Object.keys(state)) if (!known.has(name)) delete state[name];
+for (const name of Object.keys(state)) if (name !== AUTH_KEY && !known.has(name)) delete state[name];
 // dry-run обязан быть чисто read-only (см. docs/department.md): раньше saveState() писал
 // БЕЗУСЛОВНО, и alerted:true из превью-прогона "съедал" ступень лестницы у следующего
 // боевого прогона — watchdog прыгал сразу к restart, ни разу не послав настоящий alert.
