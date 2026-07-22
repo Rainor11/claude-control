@@ -590,6 +590,12 @@ def render_commands():
         "<code>claude-auto set-probe-limit &lt;имя&gt; &lt;N&gt;</code>",
         "— потолок самообслуживания датчиков",
         "",
+        "<b>🎛 Модель</b>",
+        "<code>claude-auto get-model &lt;имя&gt;</code>",
+        "— модель воркера + каталог (JSON)",
+        "<code>claude-auto set-model &lt;имя&gt; &lt;модель|--default&gt;</code>",
+        "— сменить модель (каталог: ~/.claude-control/models.json; применяется рестартом)",
+        "",
         "<b>🔗 Подключиться к сессии</b>",
         "<code>tmux -L claude-&lt;имя&gt; attach -t claude-&lt;имя&gt;</code>",
         "— открыть TUI воркера (выход: Ctrl-b, затем d)",
@@ -1420,10 +1426,11 @@ def _run_lifecycle(action, worker):
 
 
 def _run_mcp(*args):
-    """Run a claude-auto MCP/lifecycle subcommand (get-mcp/set-mcp/mcp-add/mcp-rm/
-    mcp-reset/restart) as the operator (argv, shell=False; claude-auto validates names
-    against the catalog + writes spec.json atomically under the shared lock). Wider
-    timeout because `restart` drives systemctl. Returns (returncode, short_output)."""
+    """Run a claude-auto MCP/model/lifecycle subcommand (get-mcp/set-mcp/mcp-add/
+    mcp-rm/mcp-reset/get-model/set-model/restart) as the operator (argv, shell=False;
+    claude-auto validates names against the catalog + writes spec.json atomically under
+    the shared lock). Wider timeout because `restart` drives systemctl.
+    Returns (returncode, short_output)."""
     try:
         p = subprocess.run([CLAUDE_AUTO, *args], capture_output=True, timeout=60)
         out = (p.stdout or b"").decode("utf-8", "replace").strip() \
@@ -1558,6 +1565,99 @@ def _worker_mcp_summary(worker):
     return "⚠"
 
 
+def _worker_model(worker):
+    """Cheap model summary for the card — spec.json only, no CLI on the hot card path
+    (spec_rmw swaps the file with an atomic mv, so a lockless read sees a whole old or
+    new version). Returns the pinned model string, None for default (absent/null), or
+    '⚠' for a corrupted (non-string) value — never dress corruption up as 'default'."""
+    try:
+        with open(os.path.join(WORKERS_DIR, worker, "spec.json")) as f:
+            v = json.load(f).get("model")
+    except Exception:  # noqa: BLE001
+        return None
+    if v is None or v == "":  # ""≈null: the launcher's ${model:-…} falls back too
+        return None
+    if isinstance(v, str):
+        return v
+    return "⚠"
+
+
+def _worker_model_info(worker):
+    """The worker's model view via `claude-auto get-model`:
+    {model: str|null, default: str, available: [str…]}. None on error."""
+    rc, out = _run_mcp("get-model", worker)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _model_token(name):
+    """12-char fingerprint of a model name for the picker callback — same rationale as
+    _mcp_token: a stale button (models.json edited since render) resolves safely."""
+    return hashlib.sha1(f"model:{name}".encode("utf-8")).hexdigest()[:12]
+
+
+# Safety ceiling on picker buttons: models.json is hand-edited; a runaway catalog must
+# not blow up the inline keyboard (TG_LIMIT caps only the text, not the keyboard).
+_MODEL_BTN_CAP = 24
+
+
+def wl_model_view(worker, info):
+    """Model submenu for a worker. `info` is the parsed `claude-auto get-model` dict
+    ({model, default, available}; model=None ⇒ launcher default). Returns (text, kb).
+    The catalog is re-read by the CLI on every open — adding a model to models.json
+    needs no bot restart. Selection applies on restart (button below, shared handler)."""
+    model = info.get("model")
+    default = str(info.get("default") or "")
+    avail_full = [m for m in (info.get("available") or []) if isinstance(m, str) and m]
+    over_cap = len(avail_full) > _MODEL_BTN_CAP
+    avail = avail_full[:_MODEL_BTN_CAP]
+    is_default = model is None
+    corrupted = not is_default and not isinstance(model, str)
+
+    lines = [f"🎛 <b>Модель</b> · «{esc(worker)}»"]
+    if corrupted:
+        lines.append("⚠️ В spec.json <code>.model</code> повреждён (не строка) — "
+                     "выбери модель кнопкой, это перезапишет значение.")
+    elif is_default:
+        lines.append(f"Сейчас: <b>по умолчанию</b> (<code>{esc(default[:64])}</code>)")
+    else:
+        lines.append(f"Сейчас: <code>{esc(str(model)[:64])}</code>")
+        # membership vs the FULL catalog — a model merely sliced off by the button cap
+        # must not be reported as "removed from models.json"
+        if model not in avail_full:
+            lines.append("⚠️ Текущей модели нет в каталоге (models.json сузили) — "
+                         "она продолжит работать, но выбрать её заново отсюда нельзя.")
+    if not avail:
+        lines.append("Каталог пуст: заполни <code>~/.claude-control/models.json</code> "
+                     "(JSON-массив строк) — кнопки появятся при следующем открытии.")
+    if over_cap:
+        lines.append(f"⚠️ Каталог длиннее {_MODEL_BTN_CAP} — показаны первые {_MODEL_BTN_CAP}.")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("⚠️ Смена применяется после <b>перезапуска</b> (сессия продолжится, "
+                 "контекст цел).")
+
+    rows = []
+    for m in avail:
+        mark = "🟢" if m == model else "⚪"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {m}"[:60], callback_data=f"wl:mset:{worker}:{_model_token(m)}")])
+    rows.append([InlineKeyboardButton(
+        text=f"{'🟢' if is_default else '⚪'} ⭐ По умолчанию ({default})"[:60],
+        callback_data=f"wl:mset:{worker}:default")])
+    rows.append([InlineKeyboardButton(text="🔄 Перезапустить сейчас",
+                                      callback_data=f"wl:mres:{worker}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:model:{worker}"),
+                 InlineKeyboardButton(text="⬅️ К воркеру", callback_data=f"wl:w:{worker}")])
+    text = "\n".join(lines)
+    if len(text) > TG_LIMIT:
+        text = text[:TG_LIMIT - 1].rstrip() + "\n…"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def wl_mcp_view(worker, mcp):
     """MCP-server submenu for a worker. `mcp` is the parsed `claude-auto get-mcp` dict
     ({subscribed, catalog, missing}; subscribed=None ⇒ inherits ALL). Returns (text, kb).
@@ -1625,6 +1725,9 @@ def wl_worker_view(worker):
     probes = _worker_probe_objs(worker)
     limit = _worker_max_probes(worker)
     mcp_sum = _worker_mcp_summary(worker)
+    model = _worker_model(worker)
+    model_disp = ("повреждена ⚠️" if model == "⚠"
+                  else "по умолчанию" if model is None else model[:40])
 
     lines = [f"🤖 <b>{esc(worker)}</b>  {'🟢 активен' if active else '🔴 остановлен'}"]
     lines.append(f"🧠 Контекст <b>{round(ctx / 1000)}k</b> / {round(thr / 1000)}k · "
@@ -1665,6 +1768,7 @@ def wl_worker_view(worker):
     lines.append("🧩 <b>MCP</b>: " + ("наследует все" if mcp_sum == "все"
                  else "подписка повреждена ⚠️" if mcp_sum == "⚠"
                  else f"подписка на {mcp_sum} серв."))
+    lines.append(f"🎛 <b>Модель</b>: {esc(model_disp)}")
     lines.append(f"\n🔗 <code>tmux -L claude-{esc(worker)} attach -t claude-{esc(worker)}</code>")
 
     rows = []
@@ -1684,6 +1788,8 @@ def wl_worker_view(worker):
                                       callback_data=f"wl:limit:{worker}")])
     rows.append([InlineKeyboardButton(text=f"🧩 MCP-серверы ({mcp_sum})",
                                       callback_data=f"wl:mcp:{worker}")])
+    rows.append([InlineKeyboardButton(text=f"🎛 Модель ({model_disp})"[:60],
+                                      callback_data=f"wl:model:{worker}")])
     rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"wl:w:{worker}"),
                  InlineKeyboardButton(text="⬅️ К воркерам", callback_data="wl:list")])
     text = "\n".join(lines)
@@ -1711,7 +1817,8 @@ async def cb_wl(cb: CallbackQuery):
     # only well-formed operator callbacks act). worker is at parts[2] (when present).
     arity = {"list": 2, "w": 3, "add": 3, "start": 3, "stop": 3,
              "stopc": 3, "limit": 3, "rm": 5, "rmc": 5,
-             "mcp": 3, "mtog": 4, "mrst": 3, "mres": 3}
+             "mcp": 3, "mtog": 4, "mrst": 3, "mres": 3,
+             "model": 3, "mset": 4}
     if arity.get(sub) != len(parts):
         await cb.answer("неизвестная команда", show_alert=True)
         return
@@ -1904,9 +2011,49 @@ async def cb_wl(cb: CallbackQuery):
                 f"❌ Рестарт «{esc(worker)}»: <code>{esc(out)}</code>", parse_mode="HTML")
         elif "DEFERRED" in out or "занят" in out.lower():
             await cb.message.answer(
-                f"⏸️ «<b>{esc(worker)}</b>» сейчас занят — рестарт отложен. Новый MCP-набор "
-                "применится при следующем перезапуске (или нажми ещё раз, когда освободится).",
+                f"⏸️ «<b>{esc(worker)}</b>» сейчас занят — рестарт отложен. Изменения "
+                "(MCP-набор / модель) применятся при следующем перезапуске (или нажми "
+                "ещё раз, когда освободится).",
                 parse_mode="HTML")
+        return
+
+    # ---- model: open picker (model) / set (mset); restart reuses mres above ----
+    if sub == "model":
+        info = await asyncio.to_thread(_worker_model_info, worker)
+        if info is None:
+            await cb.answer("не смог прочитать модель воркера", show_alert=True)
+            return
+        text, kb = wl_model_view(worker, info)
+        await _safe_edit(cb.message, text, kb)
+        await cb.answer()
+        return
+
+    if sub == "mset":
+        token = parts[3]
+        info = await asyncio.to_thread(_worker_model_info, worker)
+        if info is None:
+            await cb.answer("не смог прочитать модель воркера", show_alert=True)
+            return
+        if token == "default":
+            rc, out = await asyncio.to_thread(_run_mcp, "set-model", worker, "--default")
+            picked = "по умолчанию"
+        else:
+            avail = [m for m in (info.get("available") or []) if isinstance(m, str) and m]
+            matches = [m for m in avail if _model_token(m) == token]
+            if len(matches) != 1:  # catalog changed since render (or dup fingerprint) →
+                await cb.answer("каталог моделей изменился — обновил", show_alert=True)
+                text, kb = wl_model_view(worker, info)
+                await _safe_edit(cb.message, text, kb)
+                return
+            rc, out = await asyncio.to_thread(_run_mcp, "set-model", worker, matches[0])
+            picked = matches[0]
+        await cb.answer(f"ошибка: {out[:180]}" if rc != 0
+                        else f"модель: {picked} · перезапусти для применения",
+                        show_alert=(rc != 0))
+        info = await asyncio.to_thread(_worker_model_info, worker)
+        if info is not None:
+            text, kb = wl_model_view(worker, info)
+            await _safe_edit(cb.message, text, kb)
         return
 
     await cb.answer()

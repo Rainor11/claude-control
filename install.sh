@@ -245,6 +245,8 @@ copy_example_if_missing() {
 
 copy_example_if_missing "$REPO_DIR/examples/projects.yaml.example" \
                         "$CONTROL_DIR/projects.yaml"
+copy_example_if_missing "$REPO_DIR/examples/models.json.example" \
+                        "$CONTROL_DIR/models.json"
 copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
                         "$CONTROL_DIR/CLAUDE.md"
 

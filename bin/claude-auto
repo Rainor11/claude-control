@@ -822,9 +822,14 @@ spec_rmw() {
     || die "spec write: spec.json missing/empty/invalid for '$name' — refusing to write"
   mkdir -p "$statedir"
   if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
-    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
-      flock -w 10 8 2>/dev/null || die "spec write: busy (a probe/spec change is in progress) — retry"
-    fi
+    # Fail CLOSED: if the lock file can't even be opened (after mkdir -p it means a real
+    # FS problem — permissions/RO mount), refuse to write rather than silently proceed
+    # UNLOCKED (the old `if exec…` swallowed the failure and wrote lock-free, defeating
+    # the whole RMW guarantee). CLAUDE_AUTO_PROBES_LOCKED=1 stays as the re-entrancy
+    # seam for callers already holding this lock (claude-auto-self-probes).
+    exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null \
+      || die "spec write: cannot open $statedir/.probes-rmw.lock — refusing to write unlocked"
+    flock -w 10 8 2>/dev/null || die "spec write: busy (a probe/spec change is in progress) — retry"
   fi
   local t; t="$(mktemp "$home/.spec.XXXXXX")" || die "spec write: mktemp failed"
   if jq "$@" "$prog" "$spec" > "$t" && [ -s "$t" ] && jq -e 'type=="object"' "$t" >/dev/null 2>&1; then
@@ -1601,6 +1606,84 @@ cmd_mcp_reset() {
   echo "mcp-reset: '$name' subscription cleared — now inherits ALL catalog servers. Restart to apply: claude-auto restart $name"
 }
 
+# ---- worker model (spec.json .model, pinned via --model at every launch) ----
+# The operator-editable model catalog for the bot's picker: $CONTROL_DIR/models.json,
+# a flat JSON array of strings. Read on EVERY call (no cache) — adding a model is a
+# config edit, never a code change or bot restart. Normalized here so garbage entries
+# (non-strings, empty, oversized, control chars, dups) never become buttons.
+MODELS_CATALOG_FILE="$CONTROL_DIR/models.json"
+models_catalog() {  # echo a normalized JSON array ([] if unreadable/absent/malformed)
+  # Filters mirror cmd_set_model's validation EXACTLY (whitespace ban included) — a
+  # catalog entry that set-model would reject must never become a button that always
+  # fails. Leading "-" is banned so no entry can collide with the --default sentinel
+  # (or any future flag). .[0:64] bounds a hostile/runaway catalog (ARG_MAX, keyboard).
+  { [ -f "$MODELS_CATALOG_FILE" ] \
+      && jq -c 'if type=="array" then
+                  map(select(type=="string" and length>0 and length<=64
+                             and (test("\\s")|not) and (test("[[:cntrl:]]")|not)
+                             and (startswith("-")|not))) | unique | .[0:64]
+                else [] end' "$MODELS_CATALOG_FILE" 2>/dev/null; } || echo '[]'
+}
+
+# Resolve the default model the LAUNCHER will actually use. KEEP IN SYNC with
+# DEFAULT_MODEL in claude-auto-run. Subtlety: the worker unit reads
+# EnvironmentFile=-~/.config/claude-control/env (claude-auto@.service.tmpl), which a
+# CLI call from the bot does NOT inherit — so mirror it: process env first, then the
+# unit's env file, then the hardcoded fallback.
+model_default() {
+  if [ -n "${CLAUDE_AUTO_DEFAULT_MODEL:-}" ]; then
+    printf '%s\n' "$CLAUDE_AUTO_DEFAULT_MODEL"; return 0
+  fi
+  local envf="$HOME/.config/claude-control/env" v
+  v="$(sed -n 's/^CLAUDE_AUTO_DEFAULT_MODEL=//p' "$envf" 2>/dev/null | tail -1 \
+        | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
+  printf '%s\n' "${v:-opus[1m]}"
+}
+
+# get-model <name> — JSON view for the bot: the worker's pinned model (null = default),
+# the resolved default, and the catalog of offered models.
+cmd_get_model() {
+  local name="${1:?usage: get-model <name>}"
+  worker_exists "$name" || die "no worker '$name'"
+  local spec="$WORKERS_DIR/$name/spec.json" cur
+  # Fail closed on an unreadable spec (same precondition as spec_rmw): a missing/broken
+  # spec.json must NOT render as a healthy "default" picker — the worker can't launch at
+  # all in that state, the bot shows its read-error alert instead.
+  [ -s "$spec" ] && jq -e 'type=="object"' "$spec" >/dev/null 2>&1 \
+    || die "get-model: spec.json missing/empty/invalid for '$name'"
+  # ""→null: the launcher's `${model:-$DEFAULT_MODEL}` treats an empty string as
+  # "use the default", so show it as default too. A non-string, non-null value
+  # (malformed hand edit) is passed through as-is for the bot to flag.
+  cur="$(jq -c '.model // null | if . == "" then null else . end' "$spec" 2>/dev/null)" || cur=null
+  [ -n "$cur" ] || cur=null
+  jq -nc --argjson model "$cur" --arg def "$(model_default)" --argjson avail "$(models_catalog)" \
+    '{model: $model, default: $def, available: $avail}'
+}
+
+# set-model <name> <model | --default> — pin the worker's model in spec.json (applies at
+# next launch: claude-auto-run passes --model on every start). `--default` writes null
+# (launcher reads `.model // empty` → falls back to its DEFAULT_MODEL). The model must be
+# in models.json: an arbitrary string would become `claude --model <garbage>` → a
+# crash-looping unit under systemd. Extending the choice = editing the config, not code.
+cmd_set_model() {
+  local name="${1:?usage: set-model <name> <model|--default>}" model="${2:-}"
+  worker_exists "$name" || die "no worker '$name'"
+  [ -n "$model" ] || die "usage: set-model <name> <model|--default>"
+  if [ "$model" = "--default" ]; then
+    spec_rmw "$name" '.model = null'
+    echo "set-model: '$name' model → default ($(model_default)). Restart to apply: claude-auto restart $name"
+    return 0
+  fi
+  # Sanity (no artificial charset — the name never hits shell interpolation or
+  # callback_data): non-empty, bounded, no whitespace/control chars.
+  [ "${#model}" -le 64 ] || die "set-model: model name too long (>64)"
+  case "$model" in *[[:space:]]*|*[[:cntrl:]]*) die "set-model: model name has whitespace/control chars" ;; esac
+  jq -e --arg m "$model" 'index($m) != null' <<<"$(models_catalog)" >/dev/null 2>&1 \
+    || die "set-model: '$model' is not in the model catalog ($MODELS_CATALOG_FILE)"
+  spec_rmw "$name" '.model = $m' --arg m "$model"
+  echo "set-model: '$name' model → $model. Restart to apply: claude-auto restart $name"
+}
+
 # restart <name> — stop + start (kills tmux, brings up a fresh `claude --resume <W>`),
 # the way MCP-set changes take effect (settings/argv are read only at launch). Honors
 # worker_busy: never kills a worker mid-turn / over a prompt (would lose input) — instead
@@ -1884,6 +1967,15 @@ MCP-СЕРВЕРЫ (какой набор MCP воркер поднимает)
   mcp-reset <имя>              очистить подписку → наследовать ВСЕ серверы каталога
   (изменения применяются при следующем рестарте: claude-auto restart <имя>)
 
+МОДЕЛЬ (какой моделью воркер работает; пинится --model при каждом старте)
+  get-model <имя>              JSON: модель воркера + дефолт + каталог (для бота)
+  set-model <имя> <модель|--default>
+                               записать .model в spec.json (--default = null →
+                               дефолт лаунчера); модель должна быть в каталоге
+                               ~/.claude-control/models.json (правится руками,
+                               читается на каждый вызов — без рестарта бота);
+                               применяется при рестарте: claude-auto restart <имя>
+
 БЕЛЫЙ СПИСОК (кому воркер пишет БЕЗ подтверждения: TG + почта)
   allow list <имя>                       показать белый список воркера
   allow add <имя> tg:<chat_id>|email:<addr>     добавить контакт
@@ -1992,6 +2084,8 @@ case "$sub" in
   mcp-add) cmd_mcp_add "$@" ;;
   mcp-rm) cmd_mcp_rm "$@" ;;
   mcp-reset) cmd_mcp_reset "$@" ;;
+  get-model) cmd_get_model "$@" ;;
+  set-model) cmd_set_model "$@" ;;
   restart) cmd_restart "$@" ;;
   upgrade) cmd_upgrade "$@" ;;
   rebase) cmd_rebase "$@" ;;
