@@ -47,7 +47,7 @@ control-сессия   - запускает claude-rc cactus-adm, отвечае
 ## Быстрый старт
 
 ```sh
-git clone https://github.com/dewil/claude-control.git
+git clone https://github.com/Rainor11/claude-control.git
 cd claude-control
 ./install.sh
 $EDITOR ~/.claude-control/projects.yaml   # вписать свои проекты

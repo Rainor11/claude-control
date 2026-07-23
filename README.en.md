@@ -47,7 +47,7 @@ You                      - inside the project, remotely
 ## Quickstart
 
 ```sh
-git clone https://github.com/dewil/claude-control.git
+git clone https://github.com/Rainor11/claude-control.git
 cd claude-control
 ./install.sh
 $EDITOR ~/.claude-control/projects.yaml   # add your projects
