@@ -35,6 +35,9 @@ const processControl = require('../lib/process-control.js');
 // auto_then_hardcoded воспроизводит прежнюю строку без маркера; под CLAUDE_CONTROL_TEST_ROOT —
 // fail-closed на песочницу. Тот же кэшированный модуль, что уже тянет process-control.js.
 const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
+// Рендер операторских карточек. Булев контракт notify() СОХРАНЁН — на нём висит дедуп
+// эпизодов (маркер exec-stuck-*, remindState) — он пишется только по факту доставки.
+const card = require('../lib/notify-card.js');
 
 const EXEC_KINDS = new Set(['worker_spawn', 'mission_change', 'planerka', 'sleep', 'liveness_restart']);
 // Codex-аудит К3: исполнять только заявки, поданные Руководителем (роль from по
@@ -121,6 +124,20 @@ function humanApproval(row) {
   if (cp.length > 120) summary = cp.slice(0, 120).join('') + '…';
   if (!summary) return `заявка ${id}`;
   return `${summary} — заявка ${(row && row.from) || '?'} (${id})`;
+}
+// Те же данные, что humanApproval кладёт в одну строку, но разложенные по полям карточки:
+// «смок stuck — заявка dept-head (evt_…)» одной строкой глазом не разбиралось. humanApproval
+// сохранена — она по-прежнему нужна для dry-run-вывода и логов, где карточек нет.
+function approvalFields(row) {
+  const id = (row && row.event_id) || '';
+  let summary = row && row.summary ? String(row.summary).replace(/\s+/g, ' ').trim() : '';
+  const cp = [...summary];
+  if (cp.length > 120) summary = cp.slice(0, 120).join('') + '…';
+  return [
+    ['Заявка', summary || 'без описания'],
+    ['Автор', (row && row.from) || 'неизвестен'],
+    ['ID', id],
+  ];
 }
 // P3-CRITICAL-2 (2026-07-16, первый боевой найм): раннер, запущенный detached+unref из
 // oneshot-тика, умирал через миллисекунды — detached выводит из process group, но НЕ из
@@ -250,7 +267,10 @@ function tail(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.sl
 // успех/провал: дедуп-стейт эпизода (exec-stuck маркер) пишется только при доставке.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  if (sh(NOTIFY, [msg], 45_000) === null) { console.log('dispatcher: notify FAILED:', msg); return false; }
+  // card.send сама выбирает бота, ставит --parse-mode HTML и `--`, ретраит plain-текстом
+  // ТОЛЬКО на ошибке разметки. Возврат — прежний boolean.
+  const r = card.send(msg, { tg: NOTIFY });
+  if (!r.ok) { console.log('dispatcher: notify FAILED:', r.out); return false; }
   return true;
 }
 function loadJSON(file, fallback) {
@@ -305,9 +325,19 @@ function runProbe(cmd, timeoutSec) {
 
 let deptReg, autoReg;
 try { deptReg = JSON.parse(fs.readFileSync(path.join(DEPT, 'registry.json'), 'utf8')); }
-catch (e) { notify(`🚨 dispatcher: не смог прочитать registry.json: ${e.code || e.message} — тик пропущен`); process.exit(0); }
+catch (e) { notify(card.build({
+  head: ['🚨', 'Тик диспетчера пропущен'],
+  fields: [['Файл', 'registry.json']],
+  sections: [{ emoji: '🔴', title: 'Ошибка чтения', text: e.code || e.message }],
+  action: 'Починить файл — до этого заявки отдела не исполняются',
+})); process.exit(0); }
 try { autoReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8')); }
-catch (e) { notify(`🚨 dispatcher: не смог прочитать autonomous.json: ${e.code || e.message} — тик пропущен`); process.exit(0); }
+catch (e) { notify(card.build({
+  head: ['🚨', 'Тик диспетчера пропущен'],
+  fields: [['Файл', 'autonomous.json']],
+  sections: [{ emoji: '🔴', title: 'Ошибка чтения', text: e.code || e.message }],
+  action: 'Починить файл — до этого заявки отдела не исполняются',
+})); process.exit(0); }
 const autoWorkers = autoReg.workers || autoReg;
 const deptWorkers = deptReg.workers || {};
 const roleOf = (n) => (deptWorkers[n] || {}).role;
@@ -359,9 +389,18 @@ for (const [name, meta] of Object.entries(autoWorkers)) {
       wokenCount++;
       // agent_run wake — best-effort, зеркало spawn/rebase/mission_update в claude-auto (bash `|| true`).
       sh(DEPT_LEDGER, ['append', '--kind', 'agent_run', '--data', JSON.stringify({ worker: name, run_kind: 'wake', probe: pname }), '--actor', 'dispatcher']);
-      notify(`🌅 контур «${name}» разбужен датчиком ${pname}: ${excerpt}`);
+      notify(card.build({
+        head: ['🌅', 'Контур разбужен'],
+        fields: [['Воркер', name], ['Датчик', pname]],
+        sections: [{ emoji: '📨', title: 'Событие', text: excerpt }],
+      }));
     } catch (e) {
-      notify(`🚨 dispatcher: не удалось разбудить «${name}» (датчик ${pname}): ${e.message}`);
+      notify(card.build({
+        head: ['🚨', 'Не удалось разбудить контур'],
+        fields: [['Воркер', name], ['Датчик', pname]],
+        sections: [{ emoji: '🔴', title: 'Ошибка', text: e.message }],
+        action: `Поднять вручную: claude-auto start ${name}`,
+      }));
     }
   }
 }
@@ -401,7 +440,12 @@ for (const s of stuck) {
   // humanApproval вместо голого event_id — фидбэк оператора 16.07: алерт читается без ledger.
   // p3#33: маркер (дедуп алерта) — только при ДОСТАВЛЕННОМ алерте; провал notify оставляет
   // эпизод несообщённым, следующий тик (2 мин) повторит попытку.
-  if (!notify(`🚨 dispatcher: заявка ${s.kind_of} зависла в executing >${EXEC_MAX_MIN}мин: ${humanApproval(s)} — раннер умер? разберись`)) continue;
+  if (!notify(card.build({
+    head: ['🚨', 'Заявка зависла в executing'],
+    fields: [...approvalFields(s), ['Тип', s.kind_of], ['Висит', `>${EXEC_MAX_MIN} мин`]],
+    note: 'Похоже, раннер умер, не записав финал.',
+    action: `Разобрать вручную: dept-ledger list --kind approval --event-id ${s.event_id}`,
+  }))) continue;
   try { fs.writeFileSync(marker, String(now)); } catch (e) { console.error(`dispatcher: не смог записать маркер зависшей заявки ${s.event_id}: ${e.message}`); }
 }
 
@@ -418,13 +462,17 @@ for (const s of staleOpen) {
   // напрямую, TypeError на мусорной строке ронял бы весь тик ДО исполнения approved-заявок.
   if (dry) { console.log(`[dry] напоминание о зависшей заявке: ${humanApproval(openReminderLabel(s))}`); continue; }
   if (remindState[s.event_id]) continue; // уже напоминали про этот эпизод
-  // humanApproval ждёт ПЛОСКИЕ row.summary/row.from (см. её сигнатуру выше), а openApprovalRows —
+  // approvalFields ждёт ПЛОСКИЕ row.summary/row.from (см. её сигнатуру выше), а openApprovalRows —
   // сырые события ledger, где эти поля лежат в data. Без уплощения алерт выродился бы в
   // голый event_id — ровно то, от чего уходили по фидбэку оператора 16.07.
-  const human = humanApproval(openReminderLabel(s));
+  const label = openReminderLabel(s);
   // p3#33: писать «напомнили» только при ДОСТАВЛЕННОМ алерте — иначе сетевой флап
   // проглотит напоминание навсегда (следующий тик повторит попытку).
-  if (!notify(`⏳ dispatcher: заявка висит без решения >${OPEN_REMIND_MIN} мин: ${human} — реши кнопкой или попроси автора отозвать (dept-withdraw)`)) continue;
+  if (!notify(card.build({
+    head: ['⏳', 'Заявка ждёт твоего решения'],
+    fields: [...approvalFields(label), ['Висит', `>${OPEN_REMIND_MIN} мин`]],
+    action: 'Решить кнопкой в боте — или попросить автора отозвать (dept-withdraw)',
+  }))) continue;
   remindState[s.event_id] = now;
 }
 if (!dry) {
@@ -507,7 +555,13 @@ for (const row of executable) {
   } catch (e) {
     const detail = ((e.stderr && String(e.stderr).trim()) || e.message || String(e)).slice(0, 300);
     // humanApproval вместо голого event_id — фидбэк оператора 16.07: алерт читается без ledger.
-    notify(`🚨 dispatcher: раннер НЕ запустился (${kindOf}): ${humanApproval({ event_id: id, summary: row.data.summary, from: row.data.from })} — помечена executing (${detail}) — зависнет, нужен recovery-разбор`);
+    notify(card.build({
+      head: ['🚨', 'Раннер НЕ запустился'],
+      fields: [...approvalFields({ event_id: id, summary: row.data.summary, from: row.data.from }), ['Тип', kindOf]],
+      sections: [{ emoji: '🔴', title: 'Ошибка запуска', text: detail }],
+      note: 'Заявка уже помечена executing и зависнет в этом статусе.',
+      action: 'Нужен recovery-разбор вручную',
+    }));
   }
 }
 
@@ -573,7 +627,11 @@ for (const [name, meta] of Object.entries(deptWorkers)) {
       // p3#33-решение: asked (дедуп эпизода) привязан к УСПЕХУ ledger-send, НЕ к notify —
       // содержательное действие (decision_request Руководителю) уже в журнале, повтор на
       // следующем тике создал бы ДУБЛЬ заявки; TG-уведомление здесь информационное.
-      notify(`💤 dispatcher: МК «${name}» неактивен ${Math.floor(idleDays)} дн — запрос Руководителю отправлен`);
+      notify(card.build({
+        head: ['💤', 'МК давно неактивен'],
+        fields: [['Воркер', name], ['Простой', `${Math.floor(idleDays)} дн`]],
+        note: 'Запрос Руководителю отправлен — он предложит усыпить или обоснует. Действий от тебя не требуется.',
+      }));
       sleepState[name] = { asked: true };
     } else {
       console.error(`dispatcher: не удалось отправить decision_request по ${name} — попробуем на следующем тике`);
@@ -583,10 +641,19 @@ for (const [name, meta] of Object.entries(deptWorkers)) {
     try {
       execFileSync(CLAUDE_AUTO, ['sleep', name], { encoding: 'utf8', timeout: 60_000 });
       sh(DEPT_LEDGER, ['append', '--kind', 'agent_run', '--data', JSON.stringify({ worker: name, run_kind: 'auto_sleep', idle_days: Math.floor(idleDays) }), '--actor', 'dispatcher']);
-      notify(`😴 dispatcher: МК «${name}» усыплён автоматически (неактивен ${Math.floor(idleDays)} дн)`);
+      notify(card.build({
+        head: ['😴', 'МК усыплён автоматически'],
+        fields: [['Воркер', name], ['Простой', `${Math.floor(idleDays)} дн`]],
+        note: 'Контур остаётся живым: датчики опрашиваются, новое событие разбудит воркера.',
+      }));
       delete sleepState[name]; // эпизод закрыт сном
     } catch (e) {
-      notify(`🚨 dispatcher: авто-сон «${name}» НЕ удался: ${e.message}`);
+      notify(card.build({
+        head: ['🚨', 'Авто-сон НЕ удался'],
+        fields: [['Воркер', name], ['Простой', `${Math.floor(idleDays)} дн`]],
+        sections: [{ emoji: '🔴', title: 'Ошибка', text: e.message }],
+        action: `Усыпить вручную: claude-auto sleep ${name}`,
+      }));
     }
   }
   // decision === 'none' (гард активен или уже спрошено) — sleepState не трогаем

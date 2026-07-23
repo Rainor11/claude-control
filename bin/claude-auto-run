@@ -218,7 +218,15 @@ else
     # never crash-loop under systemd supervision.
     if [ "$mcp_sub" = '"bad"' ]; then
       say "WARN: spec.json .mcp_servers is malformed (not an array of strings) — failing closed to strict-zero MCP"
-      notify_operator "⚠️ Воркер «$name»: поле .mcp_servers в spec.json повреждено — стартую БЕЗ MCP-серверов (strict-zero). Проверь подписку."
+      notify_operator "⚠️ Повреждена подписка на MCP
+━━━━━━━━━━━━━━
+Воркер — $name
+Поле — .mcp_servers в spec.json
+
+Стартую БЕЗ MCP-серверов (strict-zero).
+
+➡️ Что делать
+   Проверить подписку: бот → 🧩 MCP-серверы"
       mcp_sub='[]'
     fi
     catalog="$(jq -c '.mcpServers // {}' "$trust_cfg" 2>/dev/null || echo '{}')"
@@ -240,10 +248,25 @@ else
         chmod 600 "$mcp_runtime" 2>/dev/null || true
         args+=( --strict-mcp-config --mcp-config "$mcp_runtime" )
         say "WARN: could not build resolved MCP config — failing CLOSED to strict-zero (no servers)"
-        notify_operator "⚠️ Воркер «$name»: не смог собрать MCP-набор — стартую БЕЗ серверов (strict-zero, fail-closed). Проверь подписку/каталог."
+        notify_operator "⚠️ Не собран MCP-набор
+━━━━━━━━━━━━━━
+Воркер — $name
+
+Стартую БЕЗ серверов (strict-zero, fail-closed).
+
+➡️ Что делать
+   Проверить подписку и каталог: бот → 🧩 MCP-серверы"
       else
         say "CRITICAL: cannot write any MCP runtime config ($mcp_runtime) — launching WITHOUT --mcp-config (inherits all). Investigate disk/permissions."
-        notify_operator "🔴 Воркер «$name»: не смог записать MCP-конфиг ВООБЩЕ ($home/state) — стартую с НАСЛЕДОВАНИЕМ всех серверов. Проверь диск/права."
+        notify_operator "🔴 MCP-конфиг НЕ записан
+━━━━━━━━━━━━━━
+Воркер — $name
+Каталог — $home/state
+
+Стартую с НАСЛЕДОВАНИЕМ всех серверов — воркер получит больше доступов, чем подписан.
+
+➡️ Что делать
+   Проверить диск и права на каталог"
       fi
     fi
     # Alert on subscribed-but-vanished servers (deduped by set hash; cleared on recovery).
@@ -252,7 +275,15 @@ else
       mhash="$(printf '%s' "$missing" | sha1sum 2>/dev/null | cut -c1-16)"
       if [ "$(cat "$mcp_notified" 2>/dev/null)" != "$mhash" ]; then
         say "subscribed MCP server(s) not in catalog — skipped: $missing"
-        notify_operator "⚠️ Воркер «$name»: подписан на MCP-серверы, которых нет в каталоге — пропущены: $(printf '%s' "$missing" | jq -r 'join(", ")' 2>/dev/null). Обнови подписку (бот → 🧩 MCP-серверы)."
+        notify_operator "⚠️ MCP-серверы из подписки не найдены
+━━━━━━━━━━━━━━
+Воркер — $name
+
+🔴 Пропущены
+   $(printf '%s' "$missing" | jq -r 'join(" · ")' 2>/dev/null)
+
+➡️ Что делать
+   Обновить подписку: бот → 🧩 MCP-серверы"
         printf '%s' "$mhash" > "$mcp_notified" 2>/dev/null || true
       fi
     else
@@ -392,8 +423,19 @@ maybe_alert_wedged() {
   local mins=$(( (now - 10#$first) / 60 )) excerpt
   excerpt="$(printf '%s' "$tail" | tail -6 | tr -d '\000-\010\013\014\016-\037' | cut -c1-200)"
   say "WEDGE: stuck on an interactive prompt for >=${WEDGE_MIN}m — alerting operator"
-  notify_operator "⚠️ Воркер «$name» завис на интерактивном промпте уже ~${mins} мин — не обрабатывает события. Открой 'tmux -L claude-$name attach -t claude-$name' и реши, или перезапусти ('claude-auto restart $name'). Низ экрана:
-$excerpt"
+  notify_operator "⚠️ Воркер завис на интерактивном промпте
+━━━━━━━━━━━━━━
+Воркер — $name
+Висит — ~${mins} мин
+
+События не обрабатываются, пока промпт не разрешён.
+
+📺 Низ экрана
+$excerpt
+
+➡️ Что делать
+   tmux -L claude-$name attach -t claude-$name — и решить
+   либо перезапустить: claude-auto restart $name"
   printf '%s %s 1\n' "$sig" "$first" > "$WEDGE_FLAG"
 }
 

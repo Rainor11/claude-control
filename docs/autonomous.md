@@ -360,8 +360,10 @@ compaction.
 ## Permission UX when a worker blocks
 
 When an `ask`/out-of-allowlist action fires, the worker **blocks** at the prompt
-and `claude-auto-notify` pings you on Telegram (`🤖 autoworker <name> needs you …`,
-throttled). You then `tmux -L claude-<name> attach -t claude-<name>` and answer. (A per-worker
+and `claude-auto-notify` pings you on Telegram with a card (`🤖 Воркер ждёт тебя` —
+worker name, what it is waiting for, and the attach command under «Что делать»;
+throttled, rendered by `lib/notify-card.sh`). You then `tmux -L claude-<name> attach -t claude-<name>`
+and answer. (A per-worker
 inline yes/no relay is not used by default: Telegram allows one getUpdates
 consumer per bot token, so co-loading the shared telegram channel in every worker
 would 409-conflict. For a single worker you can opt into the channel-mode relay.)

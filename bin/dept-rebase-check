@@ -16,6 +16,9 @@ const { memoryFreshness } = require('./dept-memory-freshness');
 // auto_then_hardcoded воспроизводит прежнюю строку (CLAUDE_AUTO_HOME || '/home/rainor/.claude-control')
 // без маркера; под CLAUDE_CONTROL_TEST_ROOT — fail-closed на корень песочницы.
 const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
+// Рендер операторских карточек. Контракт notify() (boolean) не меняется — от него
+// зависит дедуп эпизодов (alerted пишется только при доставленном алерте).
+const card = require('../lib/notify-card.js');
 
 const CC_HOME = resolveRuntimeRoot('auto_then_hardcoded');
 // DEPT остаётся производным от резолвленного CC_HOME (композитный DEPT): DEPT_HOME → CC_HOME/department.
@@ -72,9 +75,21 @@ function pruneState(state, deptWorkers, autoWorkers) {
 // подставлять его в тот же ${bus ? ... : '🔴 НЕ отправлена'}, иначе dry-превью врёт про
 // провал доставки на каждом прогоне, хотя в боевом режиме просьба реально ушла бы.
 function staleAlertMessage({ dry, bus, name, reason }) {
-  return dry
-    ? `⚠️ [dry] rebase-check: ${name} — ${reason}. Автопорог сработал бы; отправил бы воркеру просьбу докурировать.`
-    : `⚠️ rebase-check: ${name} — ${reason}. Автопорог сработал, но rebase запрещён до курации; воркеру ${bus ? 'отправлена' : '🔴 НЕ отправлена'} просьба докурировать.`;
+  const spec = {
+    head: ['⚠️', 'Сессия устарела', dry ? '[dry] превью' : ''],
+    fields: [['Воркер', name], ['Причина', reason]],
+    sections: [],
+  };
+  if (dry) {
+    spec.note = 'Автопорог сработал бы. Воркеру ушла бы просьба докурировать.';
+  } else if (bus) {
+    spec.note = 'Автопорог сработал, но rebase запрещён до курации — воркеру отправлена просьба докурировать.';
+  } else {
+    spec.note = 'Автопорог сработал, но rebase запрещён до курации.';
+    spec.sections.push({ emoji: '🔴', title: 'Просьба докурировать НЕ отправлена', items: name });
+    spec.action = `Отправить вручную: dept-ledger send --to ${name}`;
+  }
+  return card.build(spec);
 }
 module.exports = { decide, pruneState, staleAlertMessage };
 if (require.main !== module) return;
@@ -130,7 +145,10 @@ function saveState(s) {
 // успех/провал: дедуп-стейт эпизода (alerted) пишется только при доставленном алерте.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  if (sh(NOTIFY, [msg], 45_000) === null) { console.log('rebase-check: notify FAILED:', msg); return false; }
+  // Отправка через card.send: она сама выбирает бота, ставит --parse-mode HTML и `--`, и
+  // ретраит plain-текстом ТОЛЬКО на ошибке разметки. Булев результат — прежний контракт.
+  const r = card.send(msg, { tg: NOTIFY });
+  if (!r.ok) { console.log('rebase-check: notify FAILED:', r.out); return false; }
   return true;
 }
 
@@ -153,7 +171,12 @@ function readCompactions(name) {
 function readRegistry(file, label) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (e) {
-    notify(`🚨 rebase-check: не смог прочитать ${label} (${file}): ${e.code || e.message} — проверка флота НЕ выполнена, почини вручную`);
+    notify(card.build({
+      head: ['🚨', 'Проверка флота НЕ выполнена'],
+      fields: [['Сторож', 'rebase-check'], ['Файл', label]],
+      sections: [{ emoji: '🔴', title: 'Ошибка чтения', text: `${file}: ${e.code || e.message}` }],
+      action: 'Починить файл вручную — до этого возраст сессий никто не сторожит',
+    }));
     process.exit(0);
   }
 }
@@ -232,7 +255,12 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
   // d.action === 'rebase'
   if (!ENFORCE) {
     // p3#33: тот же принцип — alerted только при доставленном [would-rebase]-алерте.
-    if (notify(`⚠️ [would-rebase] rebase-check: ${name} — ${d.reason}. Включи DEPT_REBASE_ENFORCE=1 или ребейзни вручную: claude-auto rebase ${name}`)) {
+    if (notify(card.build({
+      head: ['⚠️', 'Нужна пересборка сессии', 'would-rebase'],
+      fields: [['Воркер', name], ['Причина', d.reason]],
+      note: 'Автопорог сработал, но DEPT_REBASE_ENFORCE выключен — сама пересборка не выполнялась.',
+      action: `Ребейзнуть вручную: claude-auto rebase ${name} (или включить DEPT_REBASE_ENFORCE=1)`,
+    }))) {
       state[name] = { phase: 'rebase_alerted' };
     }
     continue;
@@ -249,14 +277,23 @@ for (const [name, meta] of Object.entries(deptReg.workers || {})) {
     // p3#33-решение: state чистим НЕЗАВИСИМО от исхода notify — эпизод закрыт ФАКТОМ
     // rebase (триггеры обнулены), уведомление информационное; следующий тик и так
     // удалил бы запись по anyTrigger=false.
-    notify(`✅ rebase-check: ${name} — автопорог сработал (${d.reason}), rebase выполнен.`);
+    notify(card.build({
+      head: ['✅', 'Сессия пересобрана'],
+      fields: [['Воркер', name], ['Причина', d.reason]],
+      note: 'Автопорог сработал, rebase выполнен.',
+    }));
     delete state[name];
   } catch (e) {
     if (e.status === 3) {
       console.log(`rebase-check: ${name} занят (exit 3) — rebase отложен, следующий тик повторит`);
       // эпизод НЕ сброшен: state как был, следующий тик пересчитает триггеры заново
     } else {
-      notify(`🚨 rebase-check: ENFORCE rebase ${name} FAILED (${d.reason}): ${e.message}`);
+      notify(card.build({
+        head: ['🚨', 'Пересборка сессии ПРОВАЛИЛАСЬ'],
+        fields: [['Воркер', name], ['Причина', d.reason]],
+        sections: [{ emoji: '🔴', title: 'Ошибка', text: e.message }],
+        action: `Разобрать и ребейзнуть вручную: claude-auto rebase ${name}`,
+      }));
     }
   }
 }

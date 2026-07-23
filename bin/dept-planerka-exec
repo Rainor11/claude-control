@@ -24,6 +24,10 @@ DL="$BINDIR/dept-ledger"; RR="$BINDIR/dept-request-render"
 # fail-closed на корень песочницы.
 # shellcheck disable=SC1091
 . "$BINDIR/../lib/runtime-root.sh"
+# Рендер операторской карточки. Этот файл в шов T8 не входит (список — claude-auto-{tg,ask,
+# send,run}), поэтому подключать библиотеку здесь можно.
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/notify-card.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 die() { echo "dept-planerka-exec: $*" >&2; exit 1; }
@@ -113,9 +117,28 @@ while IFS= read -r w; do
   fi
 done <<<"$targets"
 
+# stdout остаётся PLAIN и в прежнем формате — это НЕ дубль телеграм-сообщения: хвост этого
+# вывода dept-exec-runner кладёт в `dept-ledger approval-exec --note` (его строка 129), и
+# HTML в журнале отдела не нужен никому. Карточка уходит ТОЛЬКО в Telegram.
 summary="Планёрка отдела («$reason»): разослано ${pver} — ${sent[*]:-нет}; спят (пропущены, догонят турникетом) — ${sleeping_list[*]:-нет}; 🔴 не разослано — ${failed[*]:-нет}. Сессии не пересобирались; ack'и контролирует Руководитель."
 echo "$summary"
-"$NOTIFY" "$summary" >/dev/null 2>&1 || echo "dept-planerka-exec: notify FAILED" >&2
+
+total=$(( ${#sent[@]} + ${#sleeping_list[@]} + ${#failed[@]} ))
+nc_reset
+nc_head "📢" "Планёрка отдела"
+nc_field "Правила" "$pver"
+nc_field "Итог" "${#sent[@]} из ${total} доставлено"
+# Пустые сегменты НЕ печатаются: прежняя строка тратила на «спят — нет; 🔴 не разослано —
+# нет» столько же места, сколько на реальный отказ, и глазом их было не отличить.
+nc_section "✅" "Доставлено" "${sent[*]:-}"
+nc_section "💤" "Спят — догонят турникетом" "${sleeping_list[*]:-}"
+nc_section "🔴" "Не доставлено" "${failed[*]:-}"
+nc_quote "$reason"
+nc_note "Сессии не пересобирались, ack'и контролирует Руководитель"
+# «Что делать» ставим ТОЛЬКО когда от оператора реально что-то требуется: на успешной
+# планёрке блок с действием обесценил бы себя на всех остальных карточках.
+[ "${#failed[@]}" -gt 0 ] && nc_action "Проверь шину: $DL list --to ${failed[0]}"
+NC_TG="$NOTIFY" nc_send || echo "dept-planerka-exec: notify FAILED" >&2
 # Частичная рассылка — НЕ успех (Codex важное №11): «разослано 5 из 7» с exit 0 дало бы
 # executed на карточке, и оператор увидел бы 🔴 только внутри текста сводки. Ненулевой код
 # → раннер пишет exec_failed + шлёт «🔴 НЕ исполнено» с хвостом лога.

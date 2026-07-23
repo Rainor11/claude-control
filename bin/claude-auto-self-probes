@@ -28,6 +28,10 @@ ADAPTERS_DIR="$(cd "$SELF_DIR/.." 2>/dev/null && pwd)/channels/event-bridge/adap
 # fail-closed на корень песочницы.
 # shellcheck disable=SC1091
 . "$SELF_DIR/../lib/runtime-root.sh"
+# Рендер операторских карточек. Этот файл в шов T8 НЕ входит (там claude-auto-{tg,ask,
+# send,run}), поэтому подключение библиотеки здесь законно.
+# shellcheck disable=SC1091
+. "$SELF_DIR/../lib/notify-card.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 1
 TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 # Trusted claude install tree. HARDCODED on purpose (NOT $HOME / NOT an env var):
@@ -146,9 +150,12 @@ effective_max_probes() {
 }
 
 # ---- presentation helpers (operator-facing Telegram card) ------------------
-html_escape() {  # minimal HTML entity escape for parse_mode=HTML
-  local s="${1:-}"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"
-}
+# Локального html_escape здесь больше нет: экранирование делает lib/notify-card.sh внутри
+# своих хелперов, вызывающему забыть его нельзя. Прежняя реализация была вдобавок СЛОМАНА
+# на bash 5.2 — голый `&` в строке замены ${s//pat/repl} раскрывается в совпавший текст
+# (shopt patsub_replacement, включён по умолчанию), поэтому `${s//</&lt;}` давало «<lt;»
+# вместо «&lt;». Telegram отвергал такую карточку целиком, а вызов заглушён через `|| true`,
+# так что оператор об этом не узнавал.
 
 human_interval() {  # seconds -> human RU phrase (3600 -> "каждый час")
   local s="${1:-}"
@@ -181,31 +188,24 @@ probe_kind_label() {  # adapter source -> labelled kind (own emoji)
 notify() {
   local verb="${1:-}" pname="${2:-}" detail="${3:-}"
   [ -x "$TG" ] || return 0
-  local emoji word
+  local word
   case "$verb" in
-    add)    emoji='➕'; word='Добавлен датчик' ;;
-    remove) emoji='🗑'; word='Удалён датчик' ;;
-    retime) emoji='⏱'; word='Изменён интервал' ;;
-    *)      emoji='🔧'; word='Изменение' ;;
+    add)    word='➕ Добавлен датчик' ;;
+    remove) word='🗑 Удалён датчик' ;;
+    retime) word='⏱ Изменён интервал' ;;
+    *)      word='🔧 Изменение' ;;
   esac
-  local body
-  body="🔧 <b>Датчики · воркер «$(html_escape "$NAME")»</b>
-━━━━━━━━━━━━━━
-${emoji} ${word} <code>$(html_escape "$pname")</code>"
-  [ -n "$detail" ] && body="${body}
-$(html_escape "$detail")"
+  nc_reset
+  nc_head "🔧" "Датчики воркера «$NAME»"
+  nc_field "$word" "$pname"
+  [ -n "$detail" ] && nc_field "Детали" "$detail"
   if [ -n "$REASON" ]; then
     local r; r="$(printf '%s' "$REASON" | tr -d '\000-\010\013\014\016-\037' | cut -c1-300)"
-    [ -n "$r" ] && body="${body}
-💬 <i>$(html_escape "$r")</i>"
+    nc_quote "$r"
   fi
-  # Route to the @RnR_Workers bot when its token is valid in .env; else default bot.
-  local rnr_val
-  rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' /home/rainor/server/.env 2>/dev/null | head -1 \
-              | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
-  local -a botflag=()
-  [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
-  "$TG" "${botflag[@]}" --parse-mode HTML -- "$body" >/dev/null 2>&1 || true
+  # Выбор бота и plain-ретрай на ошибке разметки — внутри библиотеки (regex проверки токена
+  # больше не дублируется здесь). Best-effort: смена датчика из-за косметики не падает.
+  NC_TG="$TG" nc_send >/dev/null 2>&1 || true
 }
 
 # Apply a new probes array (compact JSON) via the operator validator. flock covers

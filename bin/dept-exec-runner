@@ -30,6 +30,9 @@ NOTIFY="${TELEGRAM_NOTIFY:-/home/rainor/server/server_monitor/telegram_notify.sh
 # возвращает ту же строку, что прежний inline-дефолт; под маркером — fail-closed на <песочница>/department.
 # shellcheck disable=SC1091
 . "$BINDIR/../lib/runtime-root.sh"
+# Рендер операторских карточек (файл не входит в шов T8 — там claude-auto-{tg,ask,send,run}).
+# shellcheck disable=SC1091
+. "$BINDIR/../lib/notify-card.sh"
 DEPT="$(resolve_runtime_root dept_only)" || exit 1
 die() { echo "dept-exec-runner: $*" >&2; exit 1; }
 
@@ -92,18 +95,18 @@ sys.stdout.buffer.write(s[:n].encode("utf-8"))' "$1"
 
 # Человеческий контекст заявки для TG-алертов (фидбэк оператора 16.07: «✅ заявка evt_…
 # исполнена» нечитаемо — алерт должен читаться без ledger). Best-effort: ledger/jq могут
-# быть недоступны или строка уехала в архив — тогда label падает к голому event_id, как
-# раньше; исполнение из-за косметики алерта НЕ падает (никаких die в этом блоке).
+# быть недоступны или строка уехала в архив — тогда поля падают к «без описания»/
+# «неизвестен», а event_id есть всегда; исполнение из-за косметики алерта НЕ падает
+# (никаких die в этом блоке).
+#
+# Раньше отсюда же собиралась плоская строка $label («summary — заявка from (evt_…)»),
+# которую вставляли в каждое из четырёх сообщений. Теперь те же данные раскладываются по
+# полям карточки в nc_card_head ниже, и склейка не нужна.
 summary="" req_from=""
 row="$("$DL" list --kind approval --event-id "$approval" 2>/dev/null)" || row=""
 if [ -n "$row" ] && command -v jq >/dev/null 2>&1; then
   summary="$(printf '%s' "$row" | jq -r '.data.summary // empty' 2>/dev/null | utf8_head 120)" || summary=""
   req_from="$(printf '%s' "$row" | jq -r '.data.from // empty' 2>/dev/null | head -n1)" || req_from=""
-fi
-if [ -n "$summary" ]; then
-  label="$summary — заявка ${req_from:-?} ($approval)"
-else
-  label="заявка $approval"
 fi
 
 mkdir -p "$DEPT" 2>/dev/null || true
@@ -124,16 +127,33 @@ rc=$?
   echo "--- stderr ---"; cat "$err_file"
 } >> "$LOG_FILE" 2>&1
 
+# Общая шапка всех четырёх карточек раннера. Тот же человеческий контекст, что раньше нёс
+# $label (фидбэк оператора 16.07 — алерт обязан читаться без похода в ledger), но разложенный
+# по полям: одной строкой «смок sleep — заявка dept-head (evt_…) (executor=…)» глазом не
+# разбирался. $label оставлен для stderr-диагностики и логов.
+nc_card_head() {
+  local emoji="$1" title="$2"
+  nc_reset
+  nc_head "$emoji" "$title"
+  nc_field "Заявка" "${summary:-без описания}"
+  nc_field "Автор" "${req_from:-неизвестен}"
+  nc_field "Исполнитель" "$executor_base"
+  nc_field "ID" "$approval"
+}
+
 if [ "$rc" -eq 0 ]; then
   note="$(utf8_tail 500 < "$out_file")"
-  # $label вместо голого event_id — фидбэк оператора 16.07: алерт должен читаться без ledger.
   if "$DL" approval-exec "$approval" --status executed --note "$note" --actor dispatcher >>"$LOG_FILE" 2>&1; then
-    "$NOTIFY" "✅ Исполнено: $label (executor=$executor_base)" >/dev/null 2>&1
+    nc_card_head "✅" "Заявка исполнена"
+    NC_TG="$NOTIFY" nc_send || true
     exit 0
   fi
   # Исполнитель УЖЕ сделал дело, но исход не записан — заявка останется в executing и
   # попадёт в recovery-детект диспетчера (DEPT_EXEC_MAX_MIN). Кричим сразу, не ждём таймера.
-  "$NOTIFY" "🚨 dept-exec-runner: ИСПОЛНЕНО, но финал не записан: $label — approval-exec executed НЕ записан (см. $LOG_FILE), зависнет в executing, разберись" >/dev/null 2>&1
+  nc_card_head "🚨" "Исполнено, но финал не записан"
+  nc_note "Исполнитель отработал успешно, но approval-exec executed в журнал НЕ записан — заявка зависнет в статусе executing."
+  nc_action "Разобрать вручную, лог раннера: $LOG_FILE"
+  NC_TG="$NOTIFY" nc_send || true
   exit 1
 fi
 
@@ -143,10 +163,19 @@ else
   msg="$(utf8_tail 500 < "$err_file")"
   [ -n "$msg" ] || msg="executor завершился с exit code $rc без вывода в stderr (см. $LOG_FILE)"
 fi
-# $label вместо голого event_id — фидбэк оператора 16.07 (см. блок «Человеческий контекст» выше).
 if "$DL" approval-exec "$approval" --status exec_failed --note "$msg" --actor dispatcher >>"$LOG_FILE" 2>&1; then
-  "$NOTIFY" "🔴 НЕ исполнено: $label (executor=$executor_base): $msg" >/dev/null 2>&1
+  nc_card_head "🔴" "Заявка НЕ исполнена"
+  # Хвост stderr — именно nc_block: это вывод программы, он идёт моноширинным и отдельно от
+  # прозы карточки. Экранирование внутри библиотеки: '<' из чужого stderr иначе отправил бы
+  # всю карточку в 400 (а этот вызов заглушён — оператор не узнал бы вовсе).
+  nc_block "🔴" "Ошибка" "$msg"
+  nc_action "Полный вывод: $LOG_FILE"
+  NC_TG="$NOTIFY" nc_send || true
   exit 1
 fi
-"$NOTIFY" "🚨 dept-exec-runner: НЕ исполнено, И финал не записан: $label — approval-exec exec_failed НЕ записан (см. $LOG_FILE), зависнет в executing, разберись" >/dev/null 2>&1
+nc_card_head "🚨" "НЕ исполнено, и финал не записан"
+nc_block "🔴" "Ошибка" "$msg"
+nc_note "Вдобавок approval-exec exec_failed в журнал НЕ записан — заявка зависнет в статусе executing."
+nc_action "Разобрать вручную, лог раннера: $LOG_FILE"
+NC_TG="$NOTIFY" nc_send || true
 exit 1

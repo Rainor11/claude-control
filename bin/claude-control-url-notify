@@ -28,6 +28,9 @@ _t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 _t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
 # shellcheck disable=SC1091
 . "$_t5_bindir/../lib/runtime-root.sh"
+# Рендер карточки + выбор бота (файл не входит в шов T8).
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/notify-card.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 TG="${CLAUDE_CONTROL_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 POINTER="${CLAUDE_CONTROL_BRIDGE_POINTER:-$HOME/.claude/projects/-home-rainor--claude-control/bridge-pointer.json}"
@@ -41,10 +44,6 @@ say() { echo "$(ts) url-notify: $*" >&2; }
 
 command -v jq >/dev/null 2>&1 || { say "jq required — abort"; exit 0; }
 
-# @RnR_Workers bot, gracefully: use it only if its token is configured; else default bot.
-rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' /home/rainor/server/.env 2>/dev/null | head -1 \
-            | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
-botflag=(); [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
 
 read_env() { jq -r '.environmentId // empty' "$POINTER" 2>/dev/null; }
 
@@ -87,7 +86,12 @@ while :; do
   if [ "$(now)" -ge "$deadline" ]; then
     say "registration not confirmed in ${TIMEOUT}s (env='${env:-none}')"
     if [ -x "$TG" ]; then
-      "$TG" "${botflag[@]}" "⚠️ claude-control не зарегистрировался за ${TIMEOUT}с после старта — проверь: systemctl --user status claude-control (и control.debug.log)." >/dev/null 2>&1 || true
+      nc_reset
+      nc_head "⚠️" "Диспетчер не зарегистрировался"
+      nc_field "Ждали" "${TIMEOUT}с после старта"
+      nc_note "Без регистрации control-сессия недоступна с телефона."
+      nc_action "systemctl --user status claude-control (и control.debug.log)"
+      NC_TG="$TG" nc_send >/dev/null 2>&1 || true
     fi
     exit 0
   fi
@@ -103,7 +107,13 @@ if [ "$env" = "$prev" ]; then
 fi
 
 URL="https://claude.ai/code?environment=$env"
-if [ -x "$TG" ] && "$TG" "${botflag[@]}" "🔄 claude-control перезагрузился. Диспетчер: $URL — открой ссылку один раз, чтобы вернуть control в Recents." >/dev/null 2>&1; then
+nc_reset
+nc_head "🔄" "Диспетчер перезагрузился"
+nc_note "Открой ссылку один раз, чтобы вернуть control в Recents:
+$URL"
+# Состояние .last пишется ТОЛЬКО при подтверждённой доставке (иначе следующая загрузка
+# промолчит, а оператор так и не узнает нового URL) — поведение сохранено дословно.
+if [ -x "$TG" ] && NC_TG="$TG" nc_send >/dev/null 2>&1; then
   printf '%s\n' "$env" > "$LAST" 2>/dev/null || true
   say "notified env=$env"
 else

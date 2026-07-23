@@ -22,6 +22,9 @@ _t5_self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 _t5_bindir="$(cd "$(dirname "$_t5_self")" && pwd)"
 # shellcheck disable=SC1091
 . "$_t5_bindir/../lib/runtime-root.sh"
+# Рендер карточки + выбор бота (файл не входит в шов T8).
+# shellcheck disable=SC1091
+. "$_t5_bindir/../lib/notify-card.sh"
 CONTROL_DIR="$(resolve_runtime_root control_only)" || exit 0
 TG="${CLAUDE_AUTO_TG:-/home/rainor/server/server_monitor/telegram_notify.sh}"
 THROTTLE="${CLAUDE_AUTO_NOTIFY_THROTTLE:-60}"
@@ -64,12 +67,6 @@ stamp="$statedir/.last_notify"
 
   [ -x "$TG" ] || exit 0
 
-  # @RnR_Workers bot, gracefully: use it only if its token is configured; else fall
-  # back to the default bot (deploying before the token is added must not break pings).
-  rnr_val="$(grep -E '^RNR_WORKERS_BOT_TOKEN=' /home/rainor/server/.env 2>/dev/null | head -1 \
-              | sed -e 's/^RNR_WORKERS_BOT_TOKEN=//' -e 's/^["'\'' ]*//' -e 's/["'\'' ]*$//')"
-  botflag=(); [[ "$rnr_val" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && botflag=(--bot-token-env RNR_WORKERS_BOT_TOKEN)
-
   # Friendly Russian framing. Claude Code's raw .message is English ("Claude is
   # waiting for your input" / "Claude needs your permission to use <tool>").
   # Translate the two common cases; fall back to the raw text for anything else.
@@ -79,11 +76,11 @@ stamp="$statedir/.last_notify"
     *)                           human="$msg" ;;
   esac
 
-  "$TG" "${botflag[@]}" "🤖 Агент «$name» ждёт тебя
-
-⏳ ${human}
-
-👉 Открыть: tmux -L claude-$name attach -t claude-$name
-   (выйти из окна: Ctrl-b, затем d)" >/dev/null 2>&1 || true
+  nc_reset
+  nc_head "🤖" "Воркер ждёт тебя"
+  nc_field "Воркер" "$name"
+  nc_note "$human"
+  nc_action "tmux -L claude-$name attach -t claude-$name   (выйти: Ctrl-b, затем d)"
+  NC_TG="$TG" nc_send >/dev/null 2>&1 || true
 } 2>/dev/null
 exit 0

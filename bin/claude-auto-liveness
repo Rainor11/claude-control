@@ -17,6 +17,9 @@ const crypto = require('crypto');
 // без маркера; под CLAUDE_CONTROL_TEST_ROOT — fail-closed на корень песочницы. require('../lib')
 // верен в repo- и install-layout (node резолвит по realpath модуля, как process-control.js в T4).
 const { resolveRuntimeRoot } = require('../lib/runtime-root.js');
+// Рендер операторских карточек. Булев контракт notify() СОХРАНЁН — от него зависят
+// дедуп-эпизоды (alerted/animAlerted/escalated пишутся только по факту доставки).
+const card = require('../lib/notify-card.js');
 
 const CC_HOME = resolveRuntimeRoot('auto_then_hardcoded');
 // DEPT остаётся производным от резолвленного CC_HOME (композитный DEPT): DEPT_HOME → CC_HOME/department.
@@ -595,8 +598,19 @@ function saveState(s) {
 // wouldNotified), провал notify НЕ помечает эпизод — следующий тик повторит.
 function notify(msg) {
   if (dry) { console.log('[dry] notify:', msg); return true; }
-  try { execFileSync(NOTIFY, [msg], { encoding: 'utf8', timeout: 45_000 }); return true; }
-  catch { console.log('liveness: notify FAILED:', msg); notifyFailures++; return false; }
+  // card.send сама выбирает бота, ставит --parse-mode HTML и `--`, и ретраит plain-текстом
+  // ТОЛЬКО на ошибке разметки (транспортный сбой telegram_notify.sh отрабатывает сам).
+  //
+  // notifyFailures считаем по .ok, а НЕ по исключению: card.send ловит сбой внутри и
+  // возвращает {ok:false}, ничего не бросая. Оставить инкремент только в catch означало бы,
+  // что счётчик навсегда нулевой, а строка 'process.exitCode = 1' ниже перестаёт срабатывать —
+  // сторож рапортовал бы systemd успех ровно в тот момент, когда алерты не доходят.
+  // catch остаётся страховкой на непредвиденное исключение самой библиотеки.
+  let ok = false; let detail = '';
+  try { const r = card.send(msg, { tg: NOTIFY }); ok = r.ok; detail = r.out; }
+  catch (e) { detail = (e && e.message) || String(e); }
+  if (!ok) { console.log('liveness: notify FAILED:', detail || msg); notifyFailures++; }
+  return ok;
 }
 
 // p3#19: раньше непойманное исключение здесь роняло процесс голым stack trace'ом (exit код уже
@@ -722,7 +736,12 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (d.action === 'anim_alert') {
     // p3#33: animAlerted (дедуп anim-эпизода) — только при ДОСТАВЛЕННОМ алерте,
     // иначе следующий тик повторит попытку (алерт не теряется на сетевом флапе).
-    const animOk = notify(`⚠️ liveness [anim]: воркер ${name} — экран активен, но транскрипт не движется ${Math.round((now - tm) / 60000)} мин. Возможно «анимированное зависание» (лимиты подписки/сеть). Проверь: tmux -L claude-${name} attach -t claude-${name}`);
+    const animOk = notify(card.build({
+      head: ['⚠️', 'Похоже на анимированное зависание'],
+      fields: [['Воркер', name], ['Транскрипт не движется', `${Math.round((now - tm) / 60000)} мин`]],
+      note: 'Экран активен, но работа не идёт. Обычная причина — лимиты подписки или сеть.',
+      action: `tmux -L claude-${name} attach -t claude-${name}`,
+    }));
     // nextState пишет СВЕЖИЙ cur.screenHash (не устаревший prev.screenHash) и безусловно
     // сбрасывает alerted/wouldNotified/wouldIncidentNotified — экран сменился by construction.
     state[name] = nextState(prev, cur, 'anim_alert', animOk);
@@ -743,7 +762,11 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (d.action === 'alert') {
     // p3#33: alerted (первая ступень лестницы) — только при доставленном алерте; провал
     // notify оставляет prev как есть, следующий тик снова даст action=alert и повторит.
-    state[name] = nextState(prev, cur, 'alert', notify(`⚠️ liveness: воркер ${name} завис (busy ${CFG.hungMin}+ мин, транскрипт не движется). Следующий шаг — заявка на перезапуск оператору.`));
+    state[name] = nextState(prev, cur, 'alert', notify(card.build({
+      head: ['⚠️', 'Воркер завис'],
+      fields: [['Воркер', name], ['Занят', `${CFG.hungMin}+ мин`]],
+      note: 'Транскрипт не движется. Следующий шаг — заявка на перезапуск, придёт карточкой от бота.',
+    })));
   } else if (d.action === 'restart') {
     // T3 (решение оператора 19.07): вместо авто-рестарта — подача заявки через гейт отдела.
     // Сюда попадаем только когда карточка ЕЩЁ не отслеживается (живая cardEventId обработана
@@ -770,7 +793,12 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
             // notify оператору здесь НЕ шлём — карточка сама придёт от бота (dept-liveness-request).
             state[name] = { ...prev, cardEventId: eid, cardScreenHash: cur.screenHash };
           } else {
-            notify(`🚨 liveness: не удалось подать заявку на перезапуск ${name} — вмешайся`);
+            notify(card.build({
+              head: ['🚨', 'Заявка на перезапуск НЕ подана'],
+              fields: [['Воркер', name], ['Завис', `${frozenMin} мин`]],
+              note: 'Сторож не смог подать заявку через гейт отдела — автоматика дальше не пойдёт.',
+              action: `Перезапустить вручную: claude-auto restart ${name}`,
+            }));
             actionFailures++; // видимая деградация — не только readFailures/notifyFailures
             // state НЕ обновляем — повтор на следующем тике
           }
@@ -789,10 +817,19 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
       // p3#33-решение: state пишем НЕЗАВИСИМО от исхода notify — инцидент УЖЕ открыт в
       // ledger (ТП получил message), повтор на следующем тике открыл бы ВТОРОЙ инцидент;
       // уведомление информационное, факт эпизода зафиксирован инцидентом.
-      notify(`🚨 liveness: ${name} завис ПОВТОРНО после рестарта — открыт инцидент для ТП.`);
+      notify(card.build({
+        head: ['🚨', 'Повторное зависание после рестарта'],
+        fields: [['Воркер', name]],
+        note: 'Инцидент для ТП открыт автоматически — действий от тебя не требуется.',
+      }));
       state[name] = { screenHash: '', firstSeen: now, alerted: false, restartedAt: 0 };
     } else {
-      notify(`🚨 liveness: не удалось открыть инцидент по ${name} — открой вручную`);
+      notify(card.build({
+        head: ['🚨', 'Инцидент НЕ открыт'],
+        fields: [['Воркер', name]],
+        note: 'Воркер виснет повторно после рестарта, но инцидент для ТП завести не удалось.',
+        action: `Открыть вручную: dept-ledger incident-open --about ${name} --severity high`,
+      }));
       actionFailures++; // видимая деградация — не только readFailures/notifyFailures
       // state НЕ обновляем
     }
@@ -809,10 +846,17 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   let ep = episode;
   if (alert) {
     const list = alert.members.join(', ');
-    const head = alert.kind === 'remind'
-      ? `🔐 liveness (напоминание): авторизация Claude Code на хосте всё ещё не восстановлена`
-      : `🔐 liveness: похоже, на хосте протухла авторизация Claude Code`;
-    const msg = `${head} — воркеры живы, но не работают: ${list}.\nЧто делать: /login на хосте, затем systemctl --user restart claude-auto@<имя> для перечисленных.`;
+    const msg = card.build({
+      head: ['🔐', 'Протухла авторизация Claude Code',
+             alert.kind === 'remind' ? 'напоминание' : ''],
+      // Список воркеров — СЕКЦИЯ, а не хвост фразы: на большом флоте перечисление внутри
+      // предложения снова превращалось в простыню, ради ухода от которой всё и делалось.
+      sections: [{ emoji: '🔴', title: 'Живы, но не работают', items: alert.members }],
+      note: alert.kind === 'remind'
+        ? 'Авторизация на хосте всё ещё не восстановлена.'
+        : 'Воркеры подняты, но каждая попытка работы упирается в неавторизованный CLI.',
+      action: 'Сделать /login на хосте, затем: systemctl --user restart claude-auto@<имя> для перечисленных',
+    });
     if (dry) console.log(`[dry] auth ${alert.kind}: ${list}`);
     // Двухфазность: notified проставляем ТОЛЬКО по факту доставки — иначе сетевой сбой
     // Telegram съест групповой алерт целиком и оператор не узнает об эпизоде вовсе.
@@ -934,12 +978,19 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   // Групповое уведомление — одно за тик. escalated двухфазно (как auth): помечаем только
   // по факту ДОСТАВКИ, иначе сетевой флап съедает эскалацию навсегда.
   if (doneList.length || failList.length || escList.length) {
-    const parts = [];
-    if (doneList.length) parts.push(`перезапустил: ${doneList.join(', ')}`);
-    if (deferList.length) parts.push(`заняты, отложено: ${deferList.join(', ')}`);
-    if (failList.length) parts.push(`рестарт не подтвердился (жду следующего тика): ${failList.join(', ')}`);
-    if (escList.length) parts.push(`НЕ поднимается после ${CFG.rcMaxRestarts} рестартов за ${CFG.rcWindowH}ч — нужен взгляд руками: ${escList.join(', ')}`);
-    const ok = notify(`📡 liveness [rc]: Remote Control отвалился — ${parts.join('; ')}.`);
+    // Каждая судьба — своя секция; пустые не печатаются. Прежняя строка склеивала все
+    // четыре через '; ', и «нужен взгляд руками» терялся в хвосте рядом с рутинным
+    // «перезапустил» — ровно та потеря сигнала, ради которой затевались карточки.
+    const ok = notify(card.build({
+      head: ['📡', 'Remote Control отвалился'],
+      sections: [
+        { emoji: '✅', title: 'Перезапустил', items: doneList },
+        { emoji: '⏳', title: 'Заняты — отложено до следующего тика', items: deferList },
+        { emoji: '⚠️', title: 'Рестарт не подтвердился — жду следующего тика', items: failList },
+        { emoji: '🔴', title: `НЕ поднимается после ${CFG.rcMaxRestarts} рестартов за ${CFG.rcWindowH}ч`, items: escList },
+      ],
+      action: escList.length ? `Посмотреть руками: tmux -L claude-${escList[0]} attach -t claude-${escList[0]}` : '',
+    }));
     if (ok) for (const n of escList) escalated[n] = { lastAlertAt: now };
   } else if (deferList.length) {
     // только отложенные: не спамим оператора каждые 5 минут, пока воркер занят — лог хватит
