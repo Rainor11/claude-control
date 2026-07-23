@@ -4,6 +4,8 @@
 // дольше HUNG_MIN. Лестница: alert → карточка перезапуска (кнопка оператора) → incident (ТП).
 // Решение оператора 19.07: авто-рестарт отменён навсегда — сторож только подаёт заявку
 // через dept-liveness-request, исполняет диспетчер по ✅ (см. liveness-button-plan.md).
+// ИСКЛЮЧЕНИЕ (оператор 22.07): ветка #rc — отвалившийся Remote Control у ЖИВОГО воркера
+// авто-рестартится (busy → DEFERRED, cap 2/24ч, гейты auth/карточки) — см. rcSignal ниже.
 // Запуск: systemd-таймер каждые 5 минут. Флаг --dry-run: только печать решений.
 'use strict';
 const fs = require('fs');
@@ -35,10 +37,24 @@ const CFG = {
   // (карточка/инцидент) на этой ветке нет по решению оператора 21.07 — напоминание и есть
   // единственная защита от «алерт пришёл в 00:40, оператор спал, простой 8 часов».
   remindMin: numEnv('LIVENESS_AUTH_REMIND_MIN', 60),
+  // RC-проба (ветка #rc, оператор 22.07). Grace после (пере)запуска сессии — RC подключается
+  // не мгновенно; absent/transient — раздельные пороги подтверждения (transient дольше:
+  // рестарт не должен сбивать штатный сетевой backoff reconnect'а); gap — разрыв наблюдений,
+  // рвущий streak (3x интервал таймера: опоздавший тик не должен склеивать разные эпизоды).
+  rcGraceMin: numEnv('LIVENESS_RC_GRACE_MIN', 10),
+  rcAbsentMin: numEnv('LIVENESS_RC_ABSENT_MIN', 15),
+  rcTransientMin: numEnv('LIVENESS_RC_TRANSIENT_MIN', 25),
+  rcGapMin: numEnv('LIVENESS_RC_GAP_MIN', 15),
+  rcMaxRestarts: numEnv('LIVENESS_RC_MAX_RESTARTS', 2),
+  rcWindowH: numEnv('LIVENESS_RC_WINDOW_H', 24),
 };
-// Служебный ключ эпизода авторизации в watchdog-state.json. '#' невозможен в имени воркера
-// (валидация ^[a-zA-Z0-9_-]+$) — коллизия с записью воркера исключена by construction.
+// Служебные ключи в watchdog-state.json. '#' невозможен в имени воркера (валидация
+// ^[a-zA-Z0-9_-]+$) — коллизия с записью воркера исключена by construction. Cleanup
+// внизу файла обязан щадить ВЕСЬ набор — точечное исключение одного ключа уже чуть не
+// стёрло второй (Codex-ревью плана #rc).
 const AUTH_KEY = '#auth';
+const RC_KEY = '#rc';
+const SERVICE_KEYS = new Set([AUTH_KEY, RC_KEY]);
 const BUSY_RE = /esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc/i;
 // Маркеры протухшей авторизации хоста («жив, но тихо мёртв»: tmux-сессия и юнит живы, экран
 // статичен, ни одно событие не обрабатывается). Строки — из самого CLI (проверено в
@@ -184,6 +200,113 @@ function authNotified(episode, alert, now) {
   return { ...episode, notified, notifiedAt: episode.notifiedAt || now, lastAlertAt: now };
 }
 
+// ---- Remote Control (#rc) -----------------------------------------------------------------
+// Оператор 22.07: у воркеров с remote_control=true в spec периодически отваливается RC —
+// сессия пропадает из аппки claude.ai, процесс при этом жив (не hung, не auth). Диагноз по
+// ФУТЕРУ TUI: подключённый RC рисует маркер '/rc' (варианты '/rc active|connecting|
+// reconnecting|failed' зашиты в CLI, проверено strings'ом по 2.1.217) в chrome-зоне ПОД
+// нижним бордером поля ввода. Лечение — обычный `claude-auto restart` (та же сессия
+// резюмится с --remote-control из spec). Это осознанное ИСКЛЮЧЕНИЕ из запрета авто-рестартов
+// 19.07: тот касался ЗАВИСШИХ (рестарт им не помогал); здесь воркер живой и idle (busy →
+// cmd_restart сам DEFERRED/exit 3), рестарт решает проблему. Подробнее — docs/autonomous.md.
+
+// Диалоги/промпты поверх TUI — зеркало worker_busy (bin/claude-auto) и session-inject:
+// пока они открыты, футер судить нельзя (skip), рестартить тем более.
+const RC_PROMPT_RE = /Do you want to|Allow .* to (run|use|edit|create|read)|trust (this )?(folder|directory)|new MCP server|resume .*session|Continue\?/i;
+// Маркер — строго в КОНЦЕ строки chrome-зоны (правый нижний угол футера). Якорь $ отсекает
+// цитаты «/rc failed» в тексте разговора: те живут выше бордера и не в конце chrome-строки.
+const RC_MARK_RE = /(^|\s)\/rc(?: (active|connecting|reconnecting|failed))?\s*$/;
+
+// Чистая функция: сигнал RC по одному экрану.
+//   'ok'        — маркер /rc (или /rc active) на месте
+//   'transient' — connecting/reconnecting (штатный reconnect, не трогаем до таймаута)
+//   'failed'    — /rc failed
+//   'absent'    — chrome-зона распознана, маркера нет (главный симптом обрыва)
+//   'skip'      — busy/промпт: судить нельзя, наблюдением не считается
+//   'unknown'   — капчер пуст / структура экрана не распознана (тоже не наблюдение)
+// Зона поиска СТРУКТУРНАЯ: строки ниже ПОСЛЕДНЕГО горизонтального бордера (нижняя граница
+// поля ввода), а не фиксированный tail: на узких панелях футер переносится и '/rc' уезжает
+// на отдельную строку (наблюдалось вживую на 80-колоночных панелях воркеров).
+function rcSignal(screen) {
+  if (screen == null) return 'unknown';
+  const s = String(screen);
+  const tail = s.split('\n').slice(-AUTH_TAIL_LINES).join('\n');
+  if (BUSY_RE.test(tail) || RC_PROMPT_RE.test(tail)) return 'skip';
+  const lines = s.split('\n');
+  let sep = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/─{10,}/.test(lines[i])) { sep = i; break; }
+  }
+  if (sep < 0) return 'unknown';
+  const zone = lines.slice(sep + 1).filter((l) => l.trim() !== '');
+  if (!zone.length) return 'unknown';
+  for (const l of zone) {
+    const m = RC_MARK_RE.exec(l);
+    if (!m) continue;
+    const kind = m[2] || 'active';
+    if (kind === 'failed') return 'failed';
+    if (kind === 'connecting' || kind === 'reconnecting') return 'transient';
+    return 'ok';
+  }
+  return 'absent';
+}
+
+// Чистая функция: эпизод RC-обрывов по наблюдениям тика. Логика TIME-BASED, не «тики
+// подряд»: systemd-тик может опоздать, busy-'skip' — не наблюдение (замораживает эпизод,
+// не двигая и не разрывая его; разрыв меряется по lastObservedAt при следующем ПЛОХОМ
+// наблюдении). Смена sessionCreated (воркер пересоздан кем угодно) сбрасывает эпизод.
+// obs: [{name, signal, sessionCreated}] — только воркеры под RC-надзором в этом тике;
+// не попавшие в obs выбывают из members (сняты/усыплены/rc выключен), как в authEpisode.
+// prev может быть битым (файл правили руками) — деградируем в пустой эпизод, не роняем тик.
+// Возвращает { members, due }: due — имена с ПОДТВЕРЖДЁННЫМ обрывом. Пороги по виду:
+// failed — ≥2 наблюдений; absent — ≥3 наблюдений И ≥ rcAbsentMin от firstBadAt;
+// transient — ≥3 И ≥ rcTransientMin.
+function rcEpisode(prev, obs, now, cfg) {
+  const prevMembers = prev && prev.members && typeof prev.members === 'object' ? prev.members : {};
+  // Object.create(null): имя воркера '__proto__' валидно по ^[a-zA-Z0-9_-]+$, а на обычном
+  // объекте members['__proto__']= дёргает сеттер прототипа вместо создания свойства —
+  // эпизод такого воркера молча исчезал бы при сериализации (Codex-ревью, low).
+  const members = Object.create(null);
+  const due = [];
+  for (const o of obs) {
+    const m = prevMembers[o.name];
+    if (o.signal === 'ok') continue; // выздоровел — member не переносим
+    if (o.signal === 'skip' || o.signal === 'unknown') {
+      if (m) members[o.name] = m; // заморозка как есть
+      continue;
+    }
+    // плохой сигнал: absent / transient / failed. Битый member (файл правили руками:
+    // NaN/мусор в числовых полях навсегда глушил бы пороги — NaN-сравнения все false)
+    // деградирует в НОВЫЙ эпизод, как authEpisode деградирует в «эпизода нет».
+    const corrupt = m && !(Number.isFinite(m.firstBadAt) && Number.isFinite(m.obsCount) && Number.isFinite(m.lastObservedAt));
+    if (!m || corrupt || m.sessionCreated !== o.sessionCreated || now - m.lastObservedAt > cfg.rcGapMin * 60_000) {
+      members[o.name] = { firstBadAt: now, badKind: o.signal, obsCount: 1, lastObservedAt: now, sessionCreated: o.sessionCreated };
+      continue;
+    }
+    const nm = { ...m, badKind: o.signal, obsCount: m.obsCount + 1, lastObservedAt: now };
+    members[o.name] = nm;
+    const sinceMin = (now - nm.firstBadAt) / 60_000;
+    // Быстрый путь failed — только ДВА failed ПОДРЯД (m.badKind хранит предыдущий вид):
+    // иначе смешанная серия absent→failed срабатывала бы на первом же failed, минуя
+    // absent-пороги (Codex-ревью, medium). Смешанные серии ждут следующего failed
+    // или добирают свой absent/transient-порог.
+    if (o.signal === 'failed' && nm.obsCount >= 2 && m.badKind === 'failed') due.push(o.name);
+    else if (o.signal === 'absent' && nm.obsCount >= 3 && sinceMin >= cfg.rcAbsentMin) due.push(o.name);
+    else if (o.signal === 'transient' && nm.obsCount >= 3 && sinceMin >= cfg.rcTransientMin) due.push(o.name);
+  }
+  return { members, due };
+}
+
+// Чистая функция: cap авто-рестартов. history — timestamps ВЕРИФИЦИРОВАННЫХ рестартов этого
+// воркера (живёт в #rc.history НЕЗАВИСИМО от эпизода: выздоровление не обнуляет счётчик —
+// иначе флапающий RC получал бы свежие 2 рестарта каждый цикл болезни). Мусор/просроченные
+// записи отфильтровываются, защита от clock rollback — Number.isFinite + окно.
+function rcAllowRestart(history, now, cfg) {
+  const fresh = (Array.isArray(history) ? history : [])
+    .filter((t) => Number.isFinite(t) && t <= now && now - t < cfg.rcWindowH * 3_600_000);
+  return { fresh, allowed: fresh.length < cfg.rcMaxRestarts };
+}
+
 // Чистая решающая функция (тестируется отдельно).
 function decide(prev, cur, cfg) {
   if (!cur.busy) return { action: 'none', reset: true };
@@ -282,7 +405,7 @@ function cardStep(prev, cur, ledgerView) {
   return lv.existingCardId ? { op: 'adopt', eventId: lv.existingCardId } : { op: 'file' };
 }
 
-module.exports = { decide, nextState, cardStep, authVerdict, authSignal, authVerdictFromFile, authEpisode, authNotified };
+module.exports = { decide, nextState, cardStep, authVerdict, authSignal, authVerdictFromFile, authEpisode, authNotified, rcSignal, rcEpisode, rcAllowRestart };
 if (require.main !== module) return;
 
 const dry = process.argv.includes('--dry-run');
@@ -362,6 +485,25 @@ function workerAuthVerdict(name) {
     const f = transcriptPath(name);
     return f ? authVerdictFromFile(f) : 'unknown';
   } catch { return 'unknown'; }
+}
+// spec воркера (remote_control-гейт RC-надзора); null при любом сбое чтения.
+function workerSpec(name) {
+  try { return JSON.parse(fs.readFileSync(path.join(CC_HOME, 'workers', name, 'spec.json'), 'utf8')); } catch { return null; }
+}
+// Время создания tmux-сессии воркера (unix-секунды) — якорь идентичности сессии для
+// RC-эпизода: смена значения = воркер пересоздан (кем угодно), grace и сброс эпизода.
+function sessionCreated(name) {
+  const out = sh('tmux', ['-L', `claude-${name}`, 'display-message', '-p', '-t', `claude-${name}`, '#{session_created}']);
+  if (out === null) return null;
+  const n = Number(out.trim());
+  return Number.isFinite(n) ? n : null;
+}
+// claude-auto restart: exit 3 = DEFERRED (busy) — машинный контракт cmd_restart. Таймаут
+// свой (90с, не общий 10с sh()): stop+start гоняет systemctl + tmux и живёт дольше.
+// null-status (timeout/сигнал) → -1: «неопределённый исход», вызывающий не тратит cap.
+function runRestart(name) {
+  try { execFileSync(path.join(BIN, 'claude-auto'), ['restart', name], { encoding: 'utf8', timeout: 90_000 }); return 0; }
+  catch (e) { return typeof e.status === 'number' && e.status !== null ? e.status : -1; }
 }
 const DEPT_LEDGER = path.join(BIN, 'dept-ledger');
 const LIVENESS_REQUEST = path.join(BIN, 'dept-liveness-request');
@@ -475,6 +617,10 @@ const now = Date.now();
 // ОДИН раз после цикла: протухший логин бьёт по всем разом, оператору нужно одно сообщение
 // со списком, а не N отдельных алертов.
 const authObs = [];
+// Наблюдения RC-состояния за этот тик (ветка #rc) — тоже разбираются ОДИН раз после цикла:
+// действия (рестарты) внутри цикла оставили бы остальную лестницу работать по снапшоту
+// уже убитой сессии (Codex-ревью плана).
+const rcObs = [];
 for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (!meta || typeof meta !== 'object' || meta.state !== 'active') continue;
   const scr = screen(name);
@@ -483,6 +629,9 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
     else console.log(`liveness: ${name}: tmux недоступен — зона reconciler`);
     // 'unknown', а не выбытие: сессии не видно — это не доказательство того, что логин жив.
     authObs.push({ name, signal: 'unknown', screenHash: '' });
+    // RC-эпизод замораживаем, не рвём: tmux-флап — зона reconciler, не доказательство обрыва.
+    const specNoTmux = workerSpec(name);
+    if (specNoTmux && specNoTmux.remote_control === true) rcObs.push({ name, signal: 'skip', sessionCreated: null });
     continue;
   }
   // Auth-детект — ДО гейта транскрипта ниже и ДО lifecycle карточки liveness_restart: обе
@@ -492,6 +641,27 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   const authSig = authSignal(scr, () => workerAuthVerdict(name));
   authObs.push({ name, signal: authSig, screenHash: crypto.createHash('sha1').update(scr).digest('hex') });
   if (dry && authSig !== 'clear') console.log(`[dry] ${name}: auth=${authSig}`);
+  // RC-наблюдение — до auth-continue ниже, чтобы auth-blocked воркер ЗАМОРАЖИВАЛ свой
+  // RC-эпизод (skip), а не выбывал из него. Гейты в порядке приоритета:
+  //  1) auth не clear → skip (протухший логин роняет RC у всех разом; рестарт с мёртвыми
+  //     креденшелами бесполезен — авторитет здесь auth-ветка);
+  //  2) висит карточка liveness_restart → skip (воркер завис, RC вторичен — решает оператор);
+  //  3) remote_control≠true в spec → воркер не под RC-надзором вовсе (не в obs → выбытие);
+  //  4) сессия моложе grace → skip (RC подключается не мгновенно после старта).
+  {
+    const rcSpec = workerSpec(name);
+    if (rcSpec && rcSpec.remote_control === true) {
+      const sc = sessionCreated(name);
+      let sig;
+      if (authSig !== 'clear') sig = 'skip';
+      else if (state[name] && state[name].cardEventId) sig = 'skip';
+      else if (sc === null) sig = 'unknown';
+      else if (now - sc * 1000 < CFG.rcGraceMin * 60_000) sig = 'skip';
+      else sig = rcSignal(scr);
+      rcObs.push({ name, signal: sig, sessionCreated: sc });
+      if (dry) console.log(`[dry] ${name}: rc=${sig}`);
+    }
+  }
   // Codex-ревью 21.07: воркер с мёртвым логином НЕ должен идти по основной лестнице.
   // Иначе остаточный «esc to interrupt» выше хвоста экрана (cur.busy считается по ВСЕМУ
   // pane) плюс стоящий транскрипт дают alert → карточку рестарта → incident — ровно то,
@@ -651,13 +821,147 @@ for (const [name, meta] of Object.entries(reg.workers || reg)) {
   if (Object.keys(ep.members || {}).length) state[AUTH_KEY] = ep;
   else delete state[AUTH_KEY];
 }
+// Эпизод RC-обрывов (#rc) — разбор после цикла (оператор 22.07: авто-рестарт + одно
+// групповое уведомление; исключение из 19.07, см. rcSignal). Структура ключа:
+//   members   — текущие эпизоды (rcEpisode)
+//   history   — timestamps ВЕРИФИЦИРОВАННЫХ авто-рестартов, живёт независимо от эпизода
+//               (cap 2/24ч не обнуляется выздоровлением — иначе флапающий RC получал бы
+//               свежий лимит каждый цикл болезни)
+//   escalated — {name:{lastAlertAt}} — cap исчерпан, напоминаем раз в remindMin
+{
+  const prevEp = state[RC_KEY] || null;
+  const { members, due } = rcEpisode(prevEp, rcObs, now, CFG);
+  // Object.create(null) — по той же причине, что members в rcEpisode (имя '__proto__').
+  const history = Object.assign(Object.create(null),
+    prevEp && prevEp.history && typeof prevEp.history === 'object' ? prevEp.history : {});
+  const escalated = Object.assign(Object.create(null),
+    prevEp && prevEp.escalated && typeof prevEp.escalated === 'object' ? prevEp.escalated : {});
+  const doneList = []; const deferList = []; const failList = []; const escList = [];
+  for (const name of due) {
+    const cap = rcAllowRestart(history[name], now, CFG);
+    history[name] = cap.fresh;
+    if (!cap.allowed) {
+      const e = escalated[name] && Number.isFinite(escalated[name].lastAlertAt) ? escalated[name] : { lastAlertAt: 0 };
+      if (now - e.lastAlertAt >= CFG.remindMin * 60_000) escList.push(name);
+      continue;
+    }
+    // Backoff неопределённых исходов: рестарт с exit≠0/3 или проваленной верификацией не
+    // тратит cap, но и не молотит каждый тик — повтор не раньше rcAbsentMin.
+    if (members[name].lastAttemptAt && now - members[name].lastAttemptAt < CFG.rcAbsentMin * 60_000) {
+      console.log(`liveness: ${name}: rc-рестарт недавно уже пробовали (исход неопределён) — жду backoff`);
+      continue;
+    }
+    if (dry) {
+      console.log(`[dry] ${name}: rc-обрыв подтверждён (${members[name].badKind}, ${members[name].obsCount} набл.) — перезапустил бы`);
+      continue;
+    }
+    // Повторная проверка eligibility ПОД ЗАНАВЕС (Codex-ревью: оператор мог усыпить/
+    // перезапустить воркера, пока шёл цикл): state=active по СВЕЖЕМУ реестру (не reg,
+    // прочитанному в начале тика), rc всё ещё включён в spec, и это ТА ЖЕ сессия.
+    // cardEventId — по ТЕКУЩЕМУ state (обс-гейт видел state НАЧАЛА тика; основная лестница
+    // могла подать карточку liveness_restart в ЭТОМ тике — рестартить поверх неё нельзя, и
+    // delete state[name] ниже осиротил бы её отслеживание).
+    if (state[name] && state[name].cardEventId) {
+      console.log(`liveness: ${name}: rc-рестарт отменён — в этом тике подана карточка liveness_restart, решает оператор`);
+      continue;
+    }
+    let freshReg = null;
+    try { freshReg = JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8')); } catch {}
+    const freshMeta = freshReg && (freshReg.workers || freshReg)[name];
+    const freshSpec = workerSpec(name);
+    const scBefore = sessionCreated(name);
+    if (!freshMeta || freshMeta.state !== 'active' || !freshSpec || freshSpec.remote_control !== true ||
+        scBefore === null || scBefore !== members[name].sessionCreated) {
+      console.log(`liveness: ${name}: rc-рестарт отменён — состояние воркера изменилось между наблюдением и действием`);
+      delete members[name];
+      continue;
+    }
+    const rrc = runRestart(name);
+    if (rrc === 3) { deferList.push(name); continue; } // busy — cmd_restart DEFERRED, cap не тратим
+    if (rrc === 4) {
+      // «не active» — оператор усыпил/остановил воркера между наблюдением и действием;
+      // cmd_restart отказался (и правильно). Эпизод снимаем: не-active выпадет из obs сам.
+      console.log(`liveness: ${name}: rc-рестарт отменён — воркер уже не active (решение оператора)`);
+      delete members[name];
+      continue;
+    }
+    // Верификация исхода: только РЕАЛЬНО пересозданная сессия (новый session_created) при
+    // живом юните считается рестартом и попадает в history. Codex-ревью (high): unit —
+    // Type=simple, systemctl start возвращается ДО того, как claude-auto-run создаст tmux —
+    // одноразовое чтение почти всегда давало бы ложное «не подтвердился» (и рестарт без
+    // учёта в cap). Поэтому ПОЛЛИМ до 30с; заодно переживаем секундную гранулярность
+    // session_created. systemctl is-active --quiet: exit 0 → sh() отдаёт '' (не null).
+    let scAfter = null;
+    for (let i = 0; i < 20; i++) {
+      scAfter = sessionCreated(name);
+      if (scAfter !== null && scAfter !== scBefore) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+    }
+    const unitUp = sh('systemctl', ['--user', 'is-active', '--quiet', `claude-auto@${name}.service`]) !== null;
+    if (rrc === 0 && unitUp && scAfter !== null && scAfter !== scBefore) {
+      history[name] = [...cap.fresh, now];
+      delete members[name];  // эпизод закрыт; новая сессия отработает grace и проверится заново
+      delete state[name];    // свежий baseline основной лестницы: экран пересоздан
+      doneList.push(name);
+      console.log(`liveness: ${name}: rc-рестарт выполнен (session_created ${scBefore} → ${scAfter}, рестартов в окне: ${history[name].length}/${CFG.rcMaxRestarts})`);
+    } else {
+      // Неопределённый исход (timeout/провал/unit не поднялся/сессия не пересоздалась):
+      // cap не тратим, member остаётся с lastAttemptAt-backoff — следующий тик разрешит
+      // неоднозначность по session_created (пересоздана → эпизод сбросится сам).
+      console.log(`liveness: ${name}: rc-рестарт с неопределённым исходом (exit=${rrc}, unit=${unitUp}, session ${scBefore} → ${scAfter}) — backoff`);
+      if (!unitUp) {
+        // Рестарт мог умереть МЕЖДУ stop и start (timeout убил claude-auto): воркер лежит
+        // со state=stopped, а реконсилятор чинит только state=active — без добивки он
+        // остался бы лежать навсегда. `start` идемпотентен (state=active + enable --now).
+        // Гейт по state==='stopped' СТРОГО: sleeping = осознанное решение оператора,
+        // будить его добивка не имеет права (Codex-ревью, гонка с операторским sleep).
+        let stNow = null;
+        try { stNow = (JSON.parse(fs.readFileSync(path.join(CC_HOME, 'autonomous.json'), 'utf8')).workers || {})[name]?.state; } catch {}
+        if (stNow === 'stopped') {
+          try {
+            execFileSync(path.join(BIN, 'claude-auto'), ['start', name], { encoding: 'utf8', timeout: 60_000 });
+            console.log(`liveness: ${name}: воркер лежал (state=stopped) после неудачного рестарта — добил start'ом`);
+          } catch { console.log(`liveness: ${name}: добивка start'ом тоже не удалась — вмешайся`); }
+        } else {
+          console.log(`liveness: ${name}: unit лежит, но state=${stNow} — добивку не делаю (не мой артефакт)`);
+        }
+      }
+      members[name] = { ...members[name], lastAttemptAt: now };
+      failList.push(name);
+      actionFailures++;
+    }
+  }
+  // Групповое уведомление — одно за тик. escalated двухфазно (как auth): помечаем только
+  // по факту ДОСТАВКИ, иначе сетевой флап съедает эскалацию навсегда.
+  if (doneList.length || failList.length || escList.length) {
+    const parts = [];
+    if (doneList.length) parts.push(`перезапустил: ${doneList.join(', ')}`);
+    if (deferList.length) parts.push(`заняты, отложено: ${deferList.join(', ')}`);
+    if (failList.length) parts.push(`рестарт не подтвердился (жду следующего тика): ${failList.join(', ')}`);
+    if (escList.length) parts.push(`НЕ поднимается после ${CFG.rcMaxRestarts} рестартов за ${CFG.rcWindowH}ч — нужен взгляд руками: ${escList.join(', ')}`);
+    const ok = notify(`📡 liveness [rc]: Remote Control отвалился — ${parts.join('; ')}.`);
+    if (ok) for (const n of escList) escalated[n] = { lastAlertAt: now };
+  } else if (deferList.length) {
+    // только отложенные: не спамим оператора каждые 5 минут, пока воркер занят — лог хватит
+    console.log(`liveness: rc: заняты, отложено: ${deferList.join(', ')}`);
+  }
+  // Санитария: history — только живые окна; escalated — только пока воркер болен.
+  for (const k of Object.keys(history)) {
+    history[k] = (Array.isArray(history[k]) ? history[k] : []).filter((t) => Number.isFinite(t) && t <= now && now - t < CFG.rcWindowH * 3_600_000);
+    if (!history[k].length) delete history[k];
+  }
+  for (const k of Object.keys(escalated)) if (!members[k]) delete escalated[k];
+  if (Object.keys(members).length || Object.keys(history).length || Object.keys(escalated).length) {
+    state[RC_KEY] = { members, history, escalated };
+  } else delete state[RC_KEY];
+}
 // Воркеры, пропавшие из autonomous.json (снесены/переименованы) — их записи в state иначе
-// никогда не трогаются циклом выше и копятся в файле навечно. AUTH_KEY — служебный ключ
-// эпизода, а не воркер: имена воркеров валидируются как ^[a-zA-Z0-9_-]+$, поэтому '#' в
-// ключе гарантирует отсутствие коллизии; из cleanup его надо исключить явно, иначе эпизод
-// стирался бы каждый тик и групповой алерт слался бы заново без конца.
+// никогда не трогаются циклом выше и копятся в файле навечно. SERVICE_KEYS (#auth, #rc) —
+// служебные ключи эпизодов, а не воркеры: имена воркеров валидируются как ^[a-zA-Z0-9_-]+$,
+// поэтому '#' гарантирует отсутствие коллизии; из cleanup их надо исключить явно, иначе
+// эпизод стирался бы каждый тик и групповой алерт слался бы заново без конца.
 const known = new Set(Object.keys(reg.workers || reg));
-for (const name of Object.keys(state)) if (name !== AUTH_KEY && !known.has(name)) delete state[name];
+for (const name of Object.keys(state)) if (!SERVICE_KEYS.has(name) && !known.has(name)) delete state[name];
 // dry-run обязан быть чисто read-only (см. docs/department.md): раньше saveState() писал
 // БЕЗУСЛОВНО, и alerted:true из превью-прогона "съедал" ступень лестницы у следующего
 // боевого прогона — watchdog прыгал сразу к restart, ни разу не послав настоящий alert.

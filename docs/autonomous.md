@@ -104,6 +104,27 @@ outage longer than ~10 min makes the Remote Control session time out and the
 process exit, which `Restart=always` + the reconciler bring back (resuming the
 pinned session). Keep it OFF for workers handling untrusted internet events.
 
+**RC-сторож (оператор 22.07).** RC периодически отваливается и БЕЗ смерти
+процесса: воркер жив и здоров, но `/rc`-маркер пропадает из футера и сессия
+исчезает из аппки (наблюдалось у 5-7 воркеров из 20 разом). Ветка `#rc` в
+`bin/claude-auto-liveness` ловит это по футеру TUI (маркер `/rc` в chrome-зоне
+под нижним бордером; состояния `active|connecting|reconnecting|failed` зашиты
+в CLI) и **авто-рестартит** воркера обычным `claude-auto restart` (та же сессия
+резюмится, RC-флаг перечитывается из spec). Это осознанное исключение из
+запрета авто-рестартов 19.07: тот касался ЗАВИСШИХ (рестарт им не помогал);
+здесь воркер живой и idle — busy воркера `cmd_restart` не трогает (DEFERRED,
+exit 3, ретрай следующим тиком). Защиты: гейт по auth-эпизоду (протухший логин
+роняет RC у всех — рестарт бесполезен, молчим в пользу auth-ветки), гейт по
+открытой карточке `liveness_restart`, startup-grace `LIVENESS_RC_GRACE_MIN`
+(10 мин), time-based подтверждение (`LIVENESS_RC_ABSENT_MIN` 15 мин /
+`LIVENESS_RC_TRANSIENT_MIN` 25 мин — не сбивать штатный reconnect-backoff),
+верификация исхода по смене tmux `session_created`, cap
+`LIVENESS_RC_MAX_RESTARTS` (2) за `LIVENESS_RC_WINDOW_H` (24 ч) — сверх лимита
+не рестартит, а эскалирует оператору с напоминанием. Уведомление групповое,
+одно за тик («перезапустил: …»). Ручной путь — кнопка «🔁 Перезапустить» в
+карточке воркера бота @RnR_Workers (гейт по live-состоянию юнита: усыплённого
+не разбудит).
+
 Under the hood (`claude-auto adopt`):
 1. generates a fresh pinned worker session id `W`;
 2. first launch forks the origin into `W`

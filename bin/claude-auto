@@ -1687,15 +1687,38 @@ cmd_set_model() {
 # restart <name> — stop + start (kills tmux, brings up a fresh `claude --resume <W>`),
 # the way MCP-set changes take effect (settings/argv are read only at launch). Honors
 # worker_busy: never kills a worker mid-turn / over a prompt (would lose input) — instead
-# DEFERS (the new set applies on the next launch anyway, since launch re-resolves spec).
+# DEFERS with exit 3 (machine-readable for the RC-watchdog and the bot; rebase precedent).
+# The busy-check + tmux kill run under the SAME per-target flock session-inject uses:
+# without it, inject could see idle, start typing, and restart would kill tmux mid-paste
+# (TOCTOU). Lock held only through cmd_stop — cmd_start doesn't conflict with injectors
+# (they fail fast on a missing/starting session and event-bridge retries with backoff).
 cmd_restart() {
   local name="${1:?usage: restart <name>}"
   worker_exists "$name" || die "no worker '$name'"
-  if worker_busy "$name"; then
-    echo "restart: '$name' is busy (turn running / prompt open) — DEFERRED, not interrupting. The new config applies on the next restart (natural crash/reboot, or retry when idle)."
-    return 0
-  fi
-  cmd_stop "$name"
+  local lockfile="${XDG_RUNTIME_DIR:-/tmp}/.session-inject.claude-$name.lock"
+  (
+    exec 9>"$lockfile" || { echo "restart: cannot open lock $lockfile" >&2; exit 1; }
+    if ! flock -w 5 9; then
+      echo "restart: '$name' — session-inject держит лок (доставка события в процессе) — DEFERRED, retry when idle."
+      exit 3
+    fi
+    # Exit 4 — «не active»: restart НЕ обязан будить спящего/остановленного (Codex-ревью:
+    # оператор мог усыпить воркера между чужим pre-check'ом и этим вызовом; раньше
+    # cmd_stop(no-op)+cmd_start молча отменяли решение оператора). Проверка ПОД локом.
+    local st
+    st="$(jq -r --arg n "$name" '.workers[$n].state // "unknown"' "$REGISTRY" 2>/dev/null)"
+    if [ "$st" != "active" ]; then
+      echo "restart: '$name' state=$st (не active) — перезапускать нечего; разбудить: claude-auto start $name"
+      exit 4
+    fi
+    if worker_busy "$name"; then
+      echo "restart: '$name' is busy (turn running / prompt open) — DEFERRED, not interrupting. The new config applies on the next restart (natural crash/reboot, or retry when idle)."
+      exit 3
+    fi
+    cmd_stop "$name"
+  )
+  local rc=$?
+  [ "$rc" -ne 0 ] && return "$rc"
   cmd_start "$name"
 }
 

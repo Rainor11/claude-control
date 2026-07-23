@@ -255,6 +255,73 @@ def _worker_active(name):
         return False
 
 
+# RC-статус по футеру TUI — та же классификация, что rcSignal в bin/claude-auto-liveness
+# (единственный второй потребитель футера; регексы менять СИНХРОННО). Маркер '/rc' живёт в
+# chrome-зоне под нижним бордером поля ввода; варианты состояний зашиты в CLI.
+_RC_BUSY_RE = re.compile(r"esc to interrupt|Thinking|Compacting|Forking|Summariz|tokens · esc", re.I)
+_RC_PROMPT_RE = re.compile(
+    r"Do you want to|Allow .* to (run|use|edit|create|read)|trust (this )?(folder|directory)"
+    r"|new MCP server|resume .*session|Continue\?", re.I)
+_RC_MARK_RE = re.compile(r"(^|\s)/rc(?: (active|connecting|reconnecting|failed))?\s*$")
+
+
+def _worker_rc_enabled(name):
+    try:
+        with open(os.path.join(WORKERS_DIR, name, "spec.json")) as f:
+            return json.load(f).get("remote_control") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _worker_reg_state(name):
+    """state воркера по autonomous.json (active/sleeping/stopped) или None при сбое чтения."""
+    try:
+        with open(os.path.join(CONTROL_DIR, "autonomous.json")) as f:
+            return ((json.load(f).get("workers") or {}).get(name) or {}).get("state")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rc_status(worker):
+    """Короткий статус Remote Control для карточки. Ошибка капчера / нераспознанный экран —
+    ОТДЕЛЬНЫЕ статусы, не «отвалился» (Codex-ревью плана: capture failure ≠ RC dead).
+    Blocking (tmux) → вызывать через asyncio.to_thread (wl_worker_view уже так зовётся)."""
+    if not _worker_rc_enabled(worker):
+        return "выключен (spec)"
+    try:
+        p = subprocess.run(["tmux", "-L", f"claude-{worker}", "capture-pane", "-p",
+                            "-t", f"claude-{worker}"], capture_output=True, timeout=5)
+        if p.returncode != 0:
+            return "капчер недоступен"
+        scr = p.stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return "капчер недоступен"
+    lines = scr.split("\n")
+    if _RC_BUSY_RE.search("\n".join(lines[-12:])) or _RC_PROMPT_RE.search("\n".join(lines[-12:])):
+        return "занят — не видно"
+    sep = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if "──────────" in lines[i]:  # нижний бордер поля ввода (≥10 U+2500 подряд)
+            sep = i
+            break
+    if sep < 0:
+        return "экран не распознан"
+    zone = [ln for ln in lines[sep + 1:] if ln.strip()]
+    if not zone:
+        return "экран не распознан"
+    for ln in zone:
+        m = _RC_MARK_RE.search(ln)
+        if not m:
+            continue
+        kind = m.group(2) or "active"
+        if kind == "failed":
+            return "ошибка ⚠️"
+        if kind in ("connecting", "reconnecting"):
+            return "подключается…"
+        return "подключён ✅"
+    return "отвалился ❌"
+
+
 def _live_ctx_from_transcript(name):
     """Recompute the worker's CURRENT context from the tail of its transcript — the
     last NON-ZERO model-request usage (input + cache_read + cache_creation), the same
@@ -1412,12 +1479,14 @@ def _run_set_limit(worker, n):
         return 99, str(e)
 
 
-def _run_lifecycle(action, worker):
-    """stop|start a worker via claude-auto. Idempotent and registry-aware
+def _run_lifecycle(action, worker, timeout=30):
+    """stop|start|restart a worker via claude-auto. Idempotent and registry-aware
     (stop → state=stopped so the reconciler won't wake it; start → state=active).
-    systemctl can be slower than `allow` → wider timeout. Returns (rc, short_out)."""
+    systemctl can be slower than `allow` → wider timeout; restart = stop+start, ещё
+    дольше — вызывающий передаёт timeout=60. rc=3 — машинный DEFERRED (busy) от
+    cmd_restart. Returns (rc, short_out)."""
     try:
-        p = subprocess.run([CLAUDE_AUTO, action, worker], capture_output=True, timeout=30)
+        p = subprocess.run([CLAUDE_AUTO, action, worker], capture_output=True, timeout=timeout)
         out = (p.stdout or b"").decode("utf-8", "replace").strip() \
             or (p.stderr or b"").decode("utf-8", "replace").strip()
         return p.returncode, out[:300]
@@ -1769,6 +1838,13 @@ def wl_worker_view(worker):
                  else "подписка повреждена ⚠️" if mcp_sum == "⚠"
                  else f"подписка на {mcp_sum} серв."))
     lines.append(f"🎛 <b>Модель</b>: {esc(model_disp)}")
+    if not _worker_rc_enabled(worker):
+        rc_disp = "выключен (spec)"
+    elif not active:
+        rc_disp = "воркер остановлен"
+    else:
+        rc_disp = _rc_status(worker)
+    lines.append(f"🛰 <b>Remote Control</b>: {esc(rc_disp)}")
     lines.append(f"\n🔗 <code>tmux -L claude-{esc(worker)} attach -t claude-{esc(worker)}</code>")
 
     rows = []
@@ -1779,9 +1855,12 @@ def wl_worker_view(worker):
             text=f"🗑 {'💬' if kind == 'tg' else '📧'} {short}",
             callback_data=f"wl:rm:{worker}:{i}:{_entry_token(kind, val)}")])
     rows.append([InlineKeyboardButton(text="➕ Добавить контакт", callback_data=f"wl:add:{worker}")])
-    # lifecycle: one state-aware button (sleep needs confirm, wake is immediate)
+    # lifecycle: state-aware buttons (sleep/restart need confirm, wake is immediate).
+    # restart — только активному: cmd_restart делает stop+start безусловно и разбудил бы
+    # усыплённого; повторный гейт по live-состоянию стоит и в обработчике rstc (stale card).
     if active:
-        rows.append([InlineKeyboardButton(text="⏸️ Усыпить", callback_data=f"wl:stop:{worker}")])
+        rows.append([InlineKeyboardButton(text="⏸️ Усыпить", callback_data=f"wl:stop:{worker}"),
+                     InlineKeyboardButton(text="🔁 Перезапустить", callback_data=f"wl:rst:{worker}")])
     else:
         rows.append([InlineKeyboardButton(text="▶️ Разбудить", callback_data=f"wl:start:{worker}")])
     rows.append([InlineKeyboardButton(text=f"📊 Лимит датчиков ({limit})",
@@ -1816,7 +1895,7 @@ async def cb_wl(cb: CallbackQuery):
     # Strict arity: reject unknown subs AND trailing junk (hardens the protocol so
     # only well-formed operator callbacks act). worker is at parts[2] (when present).
     arity = {"list": 2, "w": 3, "add": 3, "start": 3, "stop": 3,
-             "stopc": 3, "limit": 3, "rm": 5, "rmc": 5,
+             "stopc": 3, "rst": 3, "rstc": 3, "limit": 3, "rm": 5, "rmc": 5,
              "mcp": 3, "mtog": 4, "mrst": 3, "mres": 3,
              "model": 3, "mset": 4}
     if arity.get(sub) != len(parts):
@@ -1874,6 +1953,57 @@ async def cb_wl(cb: CallbackQuery):
         if rc != 0:
             await cb.message.answer(
                 f"❌ Не удалось усыпить «{esc(worker)}»: <code>{esc(out)}</code>",
+                parse_mode="HTML")
+        return
+
+    # ---- lifecycle: restart (confirm → rstc) — пересоздание сессии; тот же `claude-auto
+    # restart`, которым RC-сторож чинит отвалившийся Remote Control (контекст сохраняется:
+    # сессия резюмится по session_id, RC-флаг перечитывается из spec при запуске) ----------
+    if sub == "rst":
+        await cb.answer()
+        ok = await _safe_edit(
+            cb.message,
+            f"🔁 Перезапустить воркера «<b>{esc(worker)}</b>»?\n"
+            f"Сессия пересоздастся (с переподключением Remote Control, если он включён), "
+            f"весь контекст сохранится. Занятого воркера не прервёт — перезапуск отложится.",
+            _confirm_kb(f"wl:rstc:{worker}", "🔁 Перезапустить", f"wl:w:{worker}"))
+        if not ok:
+            await cb.message.answer("⚠️ Не смог показать подтверждение — открой карточку воркера заново.")
+        return
+
+    if sub == "rstc":
+        # Stale-card guard: cmd_restart делает stop+start БЕЗУСЛОВНО — карточка, нажатая
+        # после того как воркера усыпили, разбудила бы его. Гейт по live-состоянию юнита.
+        if not await asyncio.to_thread(_worker_active, worker):
+            await cb.answer("воркер не активен — перезапускать нечего", show_alert=True)
+            text, kb = await asyncio.to_thread(wl_worker_view, worker)
+            await _safe_edit(cb.message, text, kb)
+            return
+        await cb.answer("перезапускаю…")  # answer first — restart может пережить 15s callback TTL
+        rc, out = await asyncio.to_thread(_run_lifecycle, "restart", worker, 60)
+        text, kb = await asyncio.to_thread(wl_worker_view, worker)
+        await _safe_edit(cb.message, text, kb)
+        if rc == 3:
+            await cb.message.answer(
+                f"⏳ «{esc(worker)}» сейчас занят — перезапуск отложен, не прерываю. "
+                f"Повтори, когда освободится.", parse_mode="HTML")
+        elif rc == 4:
+            await cb.message.answer(
+                f"ℹ️ «{esc(worker)}» уже не активен — перезапускать нечего.", parse_mode="HTML")
+        elif rc != 0:
+            # Timeout/сбой мог убить claude-auto МЕЖДУ stop и start: воркер лежит со
+            # state=stopped, реконсилятор такое не поднимает. Добиваем start'ом — но
+            # ТОЛЬКО при state=stopped (sleeping = осознанное решение оператора).
+            recovered = ""
+            if (not await asyncio.to_thread(_worker_active, worker)
+                    and await asyncio.to_thread(_worker_reg_state, worker) == "stopped"):
+                rrc, _rout = await asyncio.to_thread(_run_lifecycle, "start", worker, 60)
+                recovered = (" Воркер остался лежать после сбоя — поднял его обратно." if rrc == 0
+                             else " Воркер остался лежать, поднять не удалось — нажми «Разбудить».")
+                text, kb = await asyncio.to_thread(wl_worker_view, worker)
+                await _safe_edit(cb.message, text, kb)
+            await cb.message.answer(
+                f"❌ Не удалось перезапустить «{esc(worker)}»: <code>{esc(out)}</code>.{esc(recovered)}",
                 parse_mode="HTML")
         return
 
