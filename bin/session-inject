@@ -18,29 +18,47 @@
 #   - queue-on-busy: retries until --timeout, then fails (does not silently skip);
 #   - multiline/special-char safe via tmux load-buffer + bracketed paste-buffer;
 #   - sanitizes control bytes from the payload;
-#   - verifies the input line cleared after submit (best-effort acceptance check).
+#   - verifies the input line cleared after submit (best-effort acceptance check);
+#   - optional --await-ready: for a JUST-created session, wait for the TUI to be ready for
+#     input (not merely for the tmux window to exist) before typing.
 #
 # Usage: session-inject <target> <message>     # message as arg
 #        echo "multi\nline" | session-inject <target> -   # message from stdin
 #        session-inject --timeout 120 <target> -
+#        session-inject --await-ready 180 --confirm-timeout 60 <target> -   # cold-start
 #
 # Tunable detection patterns (env, override without code change):
-#   INJECT_BUSY_RE, INJECT_APPROVAL_RE  (extended regex, case-insensitive)
+#   INJECT_BUSY_RE, INJECT_APPROVAL_RE, INJECT_READY_RE  (extended regex, case-insensitive)
 set -u
 
 TIMEOUT=90
 SETTLE_MS=600
 POLL_MS=1500
-CONFIRM_TIMEOUT="${INJECT_CONFIRM_TIMEOUT:-8}"  # seconds to watch for the turn to START after Enter
+# 20s, not the original 8: the confirm loop breaks the MOMENT a turn is observed, so this
+# value costs nothing on success — it is only the patience budget before declaring a submit
+# failed. Eight seconds was too little for a session that is still unpacking context /
+# connecting MCP servers, and every false "not delivered" makes the caller inject AGAIN
+# (that is the duplicate start-message bug of 20.07: one rebase, two identical kickoffs).
+CONFIRM_TIMEOUT="${INJECT_CONFIRM_TIMEOUT:-20}" # seconds to watch for the turn to START after Enter
 CONFIRM_POLL_MS=150                             # sample cadence while confirming the submit
+# Readiness gate, OFF by default (0 = old behaviour byte for byte). Callers that type into a
+# session which has JUST been created (claude-auto spawn/rebase kickoff) opt in: waiting for
+# the tmux window to exist only proves "the terminal is up", not "Claude is ready for input".
+READY_TIMEOUT=0
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --timeout) TIMEOUT="${2:?}"; shift 2 ;;
     --settle-ms) SETTLE_MS="${2:?}"; shift 2 ;;
     --poll-ms) POLL_MS="${2:?}"; shift 2 ;;
+    --confirm-timeout) CONFIRM_TIMEOUT="${2:?}"; shift 2 ;;
+    --await-ready) READY_TIMEOUT="${2:?}"; shift 2 ;;
     *) echo "session-inject: unknown flag $1" >&2; exit 2 ;;
   esac
 done
+for _n in "$TIMEOUT" "$SETTLE_MS" "$POLL_MS" "$CONFIRM_TIMEOUT" "$READY_TIMEOUT"; do
+  [[ "$_n" =~ ^[0-9]+$ ]] || { echo "session-inject: числовой параметр ожидался, получено '$_n'" >&2; exit 2; }
+done
+unset _n
 
 target="${1:?usage: session-inject [--timeout N] <tmux-target> <message|->}"
 shift
@@ -78,6 +96,14 @@ APPROVAL_RE="${INJECT_APPROVAL_RE:-Do you want|Would you like|❯ *[0-9]+\.|[0-9
 # на своей закрывающей скобке, и регексп молча превращался в мусор (поймано тестом).
 AUTH_RE_DEFAULT='^[^[:alnum:]]{0,8}(Login expired|OAuth token revoked|Session expired|API Error: 401|claude.ai credential is missing or expired)'
 AUTH_RE="${INJECT_AUTH_RE:-$AUTH_RE_DEFAULT}"
+# Признак того, что TUI РАЗВЁРНУТ и принимает ввод: нижняя рамка ввода со стрелкой-промптом
+# либо строка режима под ней (в любом режиме — auto/plan/bypass — там «shift+tab to cycle»,
+# в дефолтном «? for shortcuts»), либо уже идущий ход. Только с --await-ready; проверка
+# fail-open (не совпало за окно — печатаем как раньше), поэтому неточность паттерна стоит
+# ожидания, а не потери доставки. Дефолт отдельной переменной — та же причина, что у
+# AUTH_RE_DEFAULT выше (фигурная скобка внутри ${VAR:-…} обрывает подстановку).
+READY_RE_DEFAULT='shift\+tab to cycle|\? for shortcuts|esc to interrupt|^[[:space:]]*(❯|>)([[:space:]]|$)'
+READY_RE="${INJECT_READY_RE:-$READY_RE_DEFAULT}"
 
 # sanitize: strip control bytes except \n and \t
 msg="$(printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037')"
@@ -118,6 +144,24 @@ lockdir="${XDG_RUNTIME_DIR:-/tmp}"
 lockfile="$lockdir/.session-inject.$(printf '%s' "$target" | tr -c 'A-Za-z0-9_-' '_').lock"
 exec 9>"$lockfile" || { echo "session-inject: cannot open lock $lockfile" >&2; exit 1; }
 flock -w "$TIMEOUT" 9 || { echo "session-inject: could not acquire lock for $target within ${TIMEOUT}s" >&2; exit 1; }
+
+# --await-ready: дождаться, что сессия ГОТОВА принимать ввод, а не просто «окно tmux есть».
+# Свежая сессия (spawn/rebase) поднимает tmux мгновенно, а сам Claude ещё разворачивает
+# контекст и подключает MCP-серверы — вставка в этот момент проходит, но ход стартует
+# заметно позже, окно подтверждения истекает, вызывающий считает доставку провальной и шлёт
+# сообщение ВТОРОЙ раз (баг 20.07). Ждём под тем же локом, что и вставку: параллельный
+# инжектор (event-bridge-watch) не проскочит в полусобранный TUI между проверкой и пастой.
+# FAIL-OPEN: не дождались — идём дальше как раньше, доставку это не отменяет.
+if [ "$READY_TIMEOUT" -gt 0 ]; then
+  ready_deadline=$(( $(date +%s) + READY_TIMEOUT ))
+  ready=0
+  while :; do
+    if printf '%s\n' "$(snapshot)" | tail -n 12 | grep -qiE "$READY_RE"; then ready=1; break; fi
+    [ "$(date +%s)" -ge "$ready_deadline" ] && break
+    ms_sleep 1000
+  done
+  [ "$ready" = 1 ] || echo "session-inject: $target — признак готовности TUI не появился за ${READY_TIMEOUT}s, вставляю как раньше (fail-open)" >&2
+fi
 
 deadline=$(( $(date +%s) + TIMEOUT ))
 while :; do

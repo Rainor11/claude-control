@@ -15,7 +15,7 @@ This builds on claude-control (tmux sessions under `systemd --user` + linger).
 | `bin/claude-auto-run` | Foreground supervisor (one per worker, the `ExecStart` of `claude-auto@<name>.service`). Launches the worker in tmux, blocks for its lifetime, restarts it, runs controlled compaction, starts the event watcher. |
 | `bin/claude-auto-identity` | `SessionStart` hook: re-asserts the worker's identity + runtime awareness (and a live probe list + session title) on every start, including `/compact` and resume. See "Worker identity & runtime awareness". |
 | `bin/event-bridge-watch` | Per-worker event loop: runs the worker's probes and injects new events as user turns. **Re-reads `event-bridge.config.json` every tick (~5s)** so a probe change is picked up live, no restart. |
-| `bin/session-inject` | Types a message into a live Claude tmux session as a user turn (hardened idle/approval-aware send-keys). The fallback transport and the `/compact` injector. |
+| `bin/session-inject` | Types a message into a live Claude tmux session as a user turn (hardened idle/approval-aware send-keys). The fallback transport and the `/compact` injector. `--await-ready N` additionally waits for the TUI to be ready for input (used for cold-start kickoffs); `--confirm-timeout N` overrides the submit-confirmation window (default 20s, env `INJECT_CONFIRM_TIMEOUT`). |
 | `bin/claude-auto-heartbeat` | `Stop`/`TaskCompleted` hook: writes ops-state (liveness, last step, context-size estimate, compaction flag) under the worker's `state/`. **No brain writes** — deal memory is the worker's own job (see "Deal memory" below). |
 | `bin/claude-auto-notify` | `Notification` hook: one-way Telegram ping when the worker blocks on a permission prompt. |
 | `bin/claude-auto-reconciler` | Timer/boot job that (re)starts any registered-active worker whose unit isn't up. |
@@ -168,8 +168,8 @@ kickoff inject.
   it carries the `.spawn-marker` recovery file (written first — a crash
   before a valid spec.json leaves a safely-removable skeleton); a worker
   not created by spawn, or with another cwd, is refused. The kickoff file
-  is injected as the first user turn (bounded retries) — workers never get
-  a proactive first turn otherwise.
+  is injected as the first user turn (**exactly once**, see "Kickoff
+  delivery" below) — workers never get a proactive first turn otherwise.
 - **`rebase <name> [--reason s] [--kickoff-file f] [--force-stale]`** —
   planned session rebuild from files: new pinned session id
   (`seeded=false`, `origin_id=null`, history intentionally dropped — files
@@ -199,6 +199,46 @@ kickoff inject.
   live at zero session cost. Warns if a stateful probe has no warmed
   baseline (an event before warm-up would be lost silently). `start` also
   wakes manually.
+
+### Kickoff delivery (exactly once)
+
+`spawn` and `rebase` both type the start message into a session that was created
+*seconds ago* — the most hostile moment for an inject. On 20.07 one rebase
+produced **two** identical start messages: the session was still unpacking
+context / connecting MCP servers, the turn began after the confirmation window,
+`session-inject` reported failure, and the retry loop typed the same text again.
+Harmless for a rebase, dangerous for a **hire** (the newcomer's start message
+asks it to ingest client data from an Asana task — a repeat means a double
+ingest).
+
+`deliver_kickoff` (bin/claude-auto) now layers three guards:
+
+1. **Readiness** — `session-inject --await-ready` waits for the TUI to actually
+   accept input instead of trusting "the tmux window exists". Fail-open: if the
+   readiness marker never shows up, delivery proceeds as before.
+2. **A longer confirmation window** for the cold start (`--confirm-timeout`),
+   since the default 20s is tuned for warm sessions.
+3. **Mechanical proof of delivery before any retry** — a unique
+   `[kickoff-id: <hex>]` marker is appended as the message's last line, and the
+   session transcript (`~/.claude/projects/*/<session_id>.jsonl`, created on the
+   *first turn*; spawn/rebase always mint a fresh session id) is checked for it.
+   Marker present ⇒ the turn really started ⇒ no repeat, whatever exit code the
+   injector returned. Before a retry the delivery also waits out any running
+   turn, so a repeat can't land on top of one. The marker is visible to the
+   worker too: a second copy with the same id is recognizable as a duplicate.
+
+`rc=4` (expired host login — nothing was typed) stops the retries at once. The
+whole delivery is capped by `CLAUDE_AUTO_KICKOFF_DEADLINE` (600s) and each
+attempt is sliced out of the remaining budget, so a rebase can't run into
+`dept-exec-runner`'s 15-minute kill mid-delivery.
+
+Tunables (env, defaults in parentheses): `CLAUDE_AUTO_KICKOFF_READY_WAIT` (180),
+`CLAUDE_AUTO_KICKOFF_CONFIRM_TIMEOUT` (60), `CLAUDE_AUTO_KICKOFF_ATTEMPTS` (10),
+`CLAUDE_AUTO_KICKOFF_RETRY_PAUSE` (10), `CLAUDE_AUTO_KICKOFF_DEADLINE` (600).
+
+Ordinary probe events are NOT affected by this cold-start hazard:
+`event-bridge-watch` holds all deliveries until the session is
+`EB_STARTUP_GRACE` (120s) old, measured from tmux session creation.
 
 An **adapter** is just a probe command. A probe is cheap and non-AI: it prints
 **new** events one per line and **nothing when idle** (so the AI session spends

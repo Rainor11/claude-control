@@ -116,7 +116,12 @@ current_probes() {
 # read→mutate→write, so a worker self-change and an operator set-probes can't clobber
 # each other. One-shot process: the lock auto-releases on exit.
 take_lock() {
-  exec 8>"$LOCK" 2>/dev/null || die "lock open failed"
+  # Фигурные скобки ОБЯЗАТЕЛЬНЫ. `exec 8>файл 2>/dev/null` БЕЗ команды применяет ОБА
+  # перенаправления к самому шеллу и НАВСЕГДА — и то, что функция, не спасает (функции не
+  # форкаются). Из-за этого после взятия лока молча пропадали ВСЕ die-сообщения ниже:
+  # воркер, попросивший переставить несуществующий датчик, получал пустой отказ с кодом 1 и
+  # никакого объяснения. Группа глушит только саму команду открытия, fd 8 остаётся открытым.
+  { exec 8>"$LOCK"; } 2>/dev/null || die "lock open failed"
   flock -w 10 8 2>/dev/null || die "busy (another probe change in progress) — retry"
 }
 

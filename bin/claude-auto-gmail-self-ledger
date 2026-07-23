@@ -112,7 +112,11 @@ done
 chmod 600 "$LEDGER" 2>/dev/null || true
 
 # Single-flight append + cap (PostToolUse can fire concurrently for parallel calls).
-exec 9>"$LOCK" 2>/dev/null || exit 0
+# Скобки обязательны: `exec 9>файл 2>/dev/null` без команды перенаправляет stderr ВСЕГО
+# процесса и навсегда (тот же капкан описан в bin/claude-auto и bin/session-inject). Здесь
+# каждая команда ниже и так глушится поштучно, так что видимого эффекта нет — но мина под
+# любой будущей строкой, которой понадобится сказать об ошибке, снята.
+{ exec 9>"$LOCK"; } 2>/dev/null || exit 0
 flock -w 5 9 2>/dev/null || exit 0
 # Re-check inside the lock: narrows the symlink-swap TOCTOU to near-zero.
 if [ -L "$LEDGER" ]; then

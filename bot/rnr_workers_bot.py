@@ -138,6 +138,14 @@ TG_LIMIT = 3900  # safe chunk size under Telegram's 4096
 # --- delivery tunables ---
 POLL_SEC = 5          # delivery loop tick
 INJECT_TIMEOUT = 20   # session-inject wait-for-idle per attempt (short → loop not blocked)
+# Бюджет на УБИЙСТВО инжектора (subprocess timeout). Держать ЗАВЕДОМО больше его собственного
+# худшего случая: ожидание per-target флока (до INJECT_TIMEOUT) + ожидание idle (до
+# INJECT_TIMEOUT) + подтверждение сабмита (CONFIRM_TIMEOUT в bin/session-inject, 20с) + мелкие
+# паузы TUI. Прежние «+30» этот худший случай уже не покрывали: убитый посреди подтверждения
+# инжектор = ход в сессии НАЧАЛСЯ, а строка осталась undelivered → следующая попытка
+# доставила бы ответ оператора ВТОРОЙ раз (тот же класс, что дубль стартового сообщения).
+INJECT_CONFIRM = 20   # зеркало CONFIRM_TIMEOUT из bin/session-inject
+INJECT_KILL_AFTER = INJECT_TIMEOUT * 2 + INJECT_CONFIRM + 15
 RETRY_AFTER = 25      # don't re-attempt a row within this many seconds (> INJECT_TIMEOUT)
 ALERT_AT = 6          # attempts before a "still trying" ping (~few min)
 MAX_ATTEMPTS = 160    # give up + alert (a parked worker may stay busy a while)
@@ -232,10 +240,15 @@ def run_session_inject(target, text):
     session-inject exit code (0 = delivered). Blocking → call via to_thread."""
     try:
         p = subprocess.run(
-            [SESSION_INJECT, "--timeout", str(INJECT_TIMEOUT), target, "-"],
+            # --confirm-timeout передаём ЯВНО: иначе session-inject возьмёт значение из
+            # окружения (INJECT_CONFIRM_TIMEOUT — документированная ручка), и наш бюджет на
+            # убийство процесса перестанет его покрывать — убитый посреди подтверждения
+            # инжектор снова означал бы дубль доставки.
+            [SESSION_INJECT, "--timeout", str(INJECT_TIMEOUT),
+             "--confirm-timeout", str(INJECT_CONFIRM), target, "-"],
             input=text.encode("utf-8"),
             capture_output=True,
-            timeout=INJECT_TIMEOUT + 30,
+            timeout=INJECT_KILL_AFTER,
         )
         if p.returncode != 0:
             log.warning("session-inject rc=%s target=%s err=%s",

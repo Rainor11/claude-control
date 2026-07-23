@@ -663,6 +663,170 @@ two copies acting on the same files is confusing. Reconnect anytime with:
 EOF
 }
 
+# ---- доставка стартового сообщения (kickoff) ------------------------------
+# Общая для spawn и rebase: оба печатают стартовый текст в ТОЛЬКО ЧТО поднятую сессию —
+# самый враждебный для инжекта момент. Симптом 20.07 (mws-ariadna): воркер получил стартовое
+# сообщение ДВАЖДЫ при одной пересборке. Механика: сессия ещё разворачивалась (MCP-серверы),
+# ход стартовал позже окна подтверждения session-inject → ненулевой код → цикл ниже вставлял
+# тот же текст ещё раз. Для пересборки это лишний расход, для НАЙМА — риск двойного ingest'а
+# клиентских данных.
+#
+# Три слоя защиты, каждый закрывает свою часть:
+#   1) --await-ready: не печатаем в полусобранный TUI (tmux-окно ≠ готовность Claude);
+#   2) --confirm-timeout: холодному старту дают минуту, а не восемь секунд;
+#   3) МЕХАНИЧЕСКАЯ проверка факта доставки перед повтором — транскрипт сессии. Он создаётся
+#      на ПЕРВОМ ходе (тот же признак, по которому claude-auto-run подтверждает seeded), а
+#      session_id у spawn/rebase всегда НОВЫЙ, поэтому «в транскрипте есть наш маркер» = ход
+#      реально начался. Это доказательство не зависит ни от таймингов TUI, ни от экранных
+#      эвристик: даже если session-inject ошибётся и вернёт провал, повтора не будет.
+# Маркер kickoff-id заодно виден и самому воркеру — вторая доставка с тем же id опознаётся
+# им как дубль (страховка на случай, если оба механических слоя промахнутся).
+KICKOFF_READY_WAIT="${CLAUDE_AUTO_KICKOFF_READY_WAIT:-180}"
+KICKOFF_CONFIRM_TIMEOUT="${CLAUDE_AUTO_KICKOFF_CONFIRM_TIMEOUT:-60}"
+KICKOFF_ATTEMPTS="${CLAUDE_AUTO_KICKOFF_ATTEMPTS:-10}"
+KICKOFF_RETRY_PAUSE="${CLAUDE_AUTO_KICKOFF_RETRY_PAUSE:-10}"
+KICKOFF_DEADLINE="${CLAUDE_AUTO_KICKOFF_DEADLINE:-600}"
+# Санитайз env-переопределений: мусор в переменной не должен ни ронять `seq`, ни уезжать
+# в session-inject (тот отвергнет нечисловой параметр как ошибку вызова — и каждая из
+# десяти попыток «провалилась» бы, ничего не напечатав).
+[[ "$KICKOFF_READY_WAIT"      =~ ^[0-9]+$ ]] || KICKOFF_READY_WAIT=180
+[[ "$KICKOFF_CONFIRM_TIMEOUT" =~ ^[0-9]+$ ]] || KICKOFF_CONFIRM_TIMEOUT=60
+{ [[ "$KICKOFF_ATTEMPTS" =~ ^[0-9]+$ ]] && [ "$KICKOFF_ATTEMPTS" -ge 1 ]; } || KICKOFF_ATTEMPTS=10
+[[ "$KICKOFF_RETRY_PAUSE"     =~ ^[0-9]+$ ]] || KICKOFF_RETRY_PAUSE=10
+{ [[ "$KICKOFF_DEADLINE" =~ ^[0-9]+$ ]] && [ "$KICKOFF_DEADLINE" -ge 1 ]; } || KICKOFF_DEADLINE=600
+
+# Боевые значения задаются здесь, на верхнем уровне, а не внутри kickoff_seam: под `set -u`
+# обращение к незаданной переменной убивает скрипт, и любой будущий вызывающий, забывший
+# сначала позвать шов, ронял бы claude-auto целиком.
+KICKOFF_INJECT_BIN="$BIN_DIR/session-inject"
+KICKOFF_TRANSCRIPTS_DIR="$HOME/.claude/projects"
+KICKOFF_DELIVERED=false
+
+# kickoff_seam — тестовый шов по конвенции T8/K1: подменить бинарь инжектора и корень
+# транскриптов можно ТОЛЬКО под валидным тестовым маркером CLAUDE_CONTROL_TEST_ROOT. Без
+# маркера (бой) значения — прежние литералы, переменные окружения игнорируются.
+kickoff_seam() {
+  local _kf_root _kf_ok=1
+  _kf_root="$(_process_control_test_root)" || _kf_ok=0
+  [ "$_kf_ok" = 1 ] && [ -n "$_kf_root" ] || return 0
+  KICKOFF_INJECT_BIN="${CLAUDE_AUTO_TEST_INJECT_BIN:-$KICKOFF_INJECT_BIN}"
+  # Под маркером корень транскриптов уходит В ПЕСОЧНИЦУ даже без явного переопределения:
+  # чтение чужого каталога безвредно (ls+grep), но тест, забывший переменную, не должен
+  # случайно опознать «доставку» по настоящему транскрипту оператора.
+  KICKOFF_TRANSCRIPTS_DIR="${CLAUDE_AUTO_TEST_TRANSCRIPTS_DIR:-$_kf_root/transcripts}"
+}
+
+# kickoff_in_transcript <session-id> <marker> — ход с нашим маркером уже записан?
+# Транскрипт ищем по глобально уникальному имени файла (session_id.jsonl), а не по слагу
+# каталога проекта — ровно как find_wfile в claude-auto-run (слаг нетривиален для кириллицы).
+# Проверяем ИМЕННО маркер, а не наличие файла: событие от датчика могло создать транскрипт
+# раньше kickoff'а, и «файл есть» означало бы ложное «доставлено» — воркер остался бы без
+# стартового контекста.
+kickoff_in_transcript() {
+  local sid="$1" marker="$2" f
+  [ -n "$sid" ] || return 1
+  f="$(ls -1 "$KICKOFF_TRANSCRIPTS_DIR"/*/"$sid.jsonl" 2>/dev/null | head -1)"
+  [ -n "$f" ] || return 1
+  command grep -qF "$marker" "$f" 2>/dev/null
+}
+
+# kickoff_wait_idle <name> <deadline-epoch> — ждать окончания идущего хода (но не дольше
+# общего бюджета доставки). worker_busy — та же эвристика занятости, что у restart/upgrade.
+kickoff_wait_idle() {
+  local name="$1" deadline="$2"
+  while worker_busy "$name"; do
+    [ "$(date +%s)" -ge "$deadline" ] && return 0
+    sleep 3
+  done
+  return 0
+}
+
+# deliver_kickoff <name> <session-id> <text> — доставляет стартовый текст РОВНО ОДИН РАЗ.
+# Результат в глобальной KICKOFF_DELIVERED (true/false); rc всегда 0 — недоставленный
+# kickoff не должен ронять уже состоявшийся spawn/rebase (воркер поднят, юнит работает).
+deliver_kickoff() {
+  local name="$1" sid="$2" text="$3"
+  local id marker payload i rc ready_arg deadline
+  KICKOFF_DELIVERED=false
+  kickoff_seam
+  id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8)"
+  [ -n "$id" ] || id="$$"
+  marker="kickoff-id: $id"
+  # Маркер — ПОСЛЕДНЕЙ строкой и отдельно от пояснения. Не косметика: session-inject берёт
+  # якорь экранного доказательства сабмита из последних слов ПОСЛЕДНЕЙ непустой строки
+  # payload'а. Если там окажется общая для всех kickoff фраза, якорь одинаков у любой
+  # доставки — и «текст уехал из поля ввода» можно спутать с прошлой вставкой той же фразы,
+  # видимой выше. Короткая уникальная строка делает якорь уникальным для КАЖДОЙ доставки
+  # (находка Codex 23.07, п.4).
+  payload="$text
+Это стартовое сообщение доставляется один раз. Если сообщение с ТЕМ ЖЕ kickoff-id уже приходило в этой сессии — перед тобой дубль доставки: ничего не переделывай, просто продолжай начатое.
+[$marker]"
+  # Общий потолок времени. Пересборку по заявке запускает dept-exec-runner под `timeout 15m`
+  # — упереться в ЕГО таймаут (SIGKILL посреди доставки) хуже, чем самим честно сдаться
+  # раньше и оставить оператору внятное «не доставлен».
+  deadline=$(( $(date +%s) + KICKOFF_DEADLINE ))
+  ready_arg="$KICKOFF_READY_WAIT"
+  for i in $(seq 1 "$KICKOFF_ATTEMPTS"); do
+    if [ "$i" -gt 1 ]; then
+      # Пока в сессии ИДЁТ ХОД — не печатаем поверх и не считаем попытку провальной. На
+      # свежесобранной сессии единственный возможный ход — наш же kickoff, стартовавший
+      # позже окна подтверждения; дождавшись его конца, мы увидим маркер в транскрипте.
+      # Без этого ожидания оставалась щель (находка Codex 23.07, п.1): маркер ещё не записан
+      # на момент проверки, а вторая вставка уже уходит — ровно тот дубль, который чиним.
+      kickoff_wait_idle "$name" "$deadline"
+      if kickoff_in_transcript "$sid" "$marker"; then
+        KICKOFF_DELIVERED=true
+        echo "kickoff: '$name' — доставка подтверждена по транскрипту ($marker), повтор не нужен"
+        return 0
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "kickoff: '$name' — исчерпан общий бюджет ${KICKOFF_DEADLINE}с на доставку (попыток сделано $(( i - 1 )))" >&2
+        break
+      fi
+      # Ждать готовности TUI имеет смысл только на ПЕРВОЙ попытке (холодный старт). Дальше
+      # сессия либо уже развернулась, либо занята — и лишнее окно ожидания только съедает
+      # бюджет выше.
+      ready_arg=0
+    fi
+    # Жёсткий потолок: сам session-inject тратит своё --timeout ДВАЖДЫ (ожидание per-target
+    # флока + ожидание idle), плюс окно готовности, плюс окно подтверждения. Нарезаем
+    # остаток бюджета на четыре доли — тогда ОДНА попытка гарантированно укладывается в
+    # остаток, а не съедает 480с при заявленном потолке 600 (находка Codex 23.07, п.2:
+    # дедлайн проверялся только МЕЖДУ попытками, поэтому «потолок» им не был).
+    local left share t_inj t_ready t_conf
+    left=$(( deadline - $(date +%s) ))
+    [ "$left" -le 0 ] && break
+    share=$(( left / 4 )); [ "$share" -lt 5 ] && share=5
+    t_inj=120;                       [ "$t_inj"   -gt "$share" ] && t_inj="$share"
+    t_ready="$ready_arg";            [ "$t_ready" -gt "$share" ] && t_ready="$share"
+    t_conf="$KICKOFF_CONFIRM_TIMEOUT"; [ "$t_conf" -gt "$share" ] && t_conf="$share"
+    "$KICKOFF_INJECT_BIN" --timeout "$t_inj" --await-ready "$t_ready" \
+      --confirm-timeout "$t_conf" "claude-$name" "$payload" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then KICKOFF_DELIVERED=true; return 0; fi
+    # rc=4 — у хоста протух логин: в панель НИЧЕГО не напечатано (session-inject выходит до
+    # вставки), ход не начнётся ни с какой попытки. Десять заходов по 10с только тянут время.
+    if [ "$rc" -eq 4 ]; then
+      echo "kickoff: '$name' — сессия сообщает о протухшем логине (/login), стартовое сообщение НЕ доставлено; повтори после починки авторизации" >&2
+      return 0
+    fi
+    # Пауза перед повтором — с опросом транскрипта, а не глухим sleep: если попытка на самом
+    # деле доставила (ложный провал по таймауту подтверждения), маркер появится в эти секунды,
+    # и следующий заход цикла увидит его ДО того, как напечатает текст второй раз.
+    local waited=0
+    while [ "$waited" -lt "$KICKOFF_RETRY_PAUSE" ]; do
+      sleep 2; waited=$(( waited + 2 ))
+      kickoff_in_transcript "$sid" "$marker" && break
+    done
+  done
+  # Последнее слово — за транскриптом: последняя попытка могла быть ложным провалом.
+  if kickoff_in_transcript "$sid" "$marker"; then
+    KICKOFF_DELIVERED=true
+    echo "kickoff: '$name' — доставка подтверждена по транскрипту ($marker) после последней попытки"
+  fi
+  return 0
+}
+
 # ---- spawn (headless-найм: воркер С НУЛЯ, без origin-сессии) --------------
 # Unlike adopt (forks an existing origin session), spawn creates a worker whose
 # FIRST session is genuinely fresh: spec {origin_id:null, spawned:true,
@@ -785,10 +949,8 @@ cmd_spawn() {
 
   local kf="${kickoff_file:-$REPO_DIR/examples/department/spawn-kickoff.md}" delivered=false
   [ -f "$kf" ] || die "spawn: kickoff-файл не найден: $kf"
-  for i in $(seq 1 10); do
-    if "$BIN_DIR/session-inject" --timeout 120 "claude-$name" "$(cat "$kf")" >/dev/null 2>&1; then delivered=true; break; fi
-    sleep 10
-  done
+  deliver_kickoff "$name" "$W" "$(cat "$kf")"
+  delivered="$KICKOFF_DELIVERED"
   [ "$delivered" = true ] || echo "spawn: ВНИМАНИЕ — kickoff не доставлен; повтори: session-inject claude-$name < $kf" >&2
 
   "$BIN_DIR/dept-ledger" append --kind agent_run \
@@ -827,7 +989,14 @@ spec_rmw() {
     # UNLOCKED (the old `if exec…` swallowed the failure and wrote lock-free, defeating
     # the whole RMW guarantee). CLAUDE_AUTO_PROBES_LOCKED=1 stays as the re-entrancy
     # seam for callers already holding this lock (claude-auto-self-probes).
-    exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null \
+    # Фигурные скобки ОБЯЗАТЕЛЬНЫ. `exec 8>файл 2>/dev/null` БЕЗ команды применяет ОБА
+    # перенаправления к САМОМУ шеллу и НАВСЕГДА: после первой же записи спека весь остаток
+    # прогона печатал stderr в /dev/null. Так молча пропадали предупреждения после rebase —
+    # в том числе «kickoff не доставлен» (оператор не видел ни его, ни die-сообщений
+    # «воркер не поднялся»). Группа ограничивает 2>/dev/null одной командой, а fd 8 остаётся
+    # открытым в шелле (группа не форкается) — ровно то, что и требовалось. Тот же капкан
+    # описан в bin/session-inject над его `exec 9>`.
+    { exec 8>"$statedir/.probes-rmw.lock"; } 2>/dev/null \
       || die "spec write: cannot open $statedir/.probes-rmw.lock — refusing to write unlocked"
     flock -w 10 8 2>/dev/null || die "spec write: busy (a probe/spec change is in progress) — retry"
   fi
@@ -1132,10 +1301,8 @@ cmd_rebase() {
   reason="$(printf '%s' "$reason" | tr '\n\r' '  ')"
   ktext="$(sed -e "s/{{REASON}}/$(printf '%s' "$reason" | sed 's/[&/\\]/\\&/g')/g" "$kf")"
   local delivered=false
-  for i in $(seq 1 10); do
-    if "$BIN_DIR/session-inject" --timeout 120 "claude-$name" "$ktext" >/dev/null 2>&1; then delivered=true; break; fi
-    sleep 10
-  done
+  deliver_kickoff "$name" "$new_sid" "$ktext"
+  delivered="$KICKOFF_DELIVERED"
   [ "$delivered" = true ] || echo "rebase: ВНИМАНИЕ — kickoff не доставлен (воркер ждёт событий без стартового контекста); повтори инжект вручную" >&2
 
   "$BIN_DIR/dept-ledger" append --kind agent_run \
@@ -1333,7 +1500,8 @@ cmd_set_probes() {
     # Acquire the shared RMW lock. If we can open it but can't acquire within 10s,
     # someone else (a worker self-probe) is mid-change — FAIL rather than clobber.
     # If we can't even open the lock file (rare), proceed best-effort.
-    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
+    # Скобки — тот же капкан «exec без команды глушит stderr всего процесса», см. spec_rmw.
+    if { exec 8>"$statedir/.probes-rmw.lock"; } 2>/dev/null; then
       flock -w 10 8 2>/dev/null || die "set-probes: busy (a probe change is in progress) — retry"
     fi
   fi
@@ -1489,7 +1657,8 @@ cmd_set_probe_limit() {
   # change and a probe mutation can't interleave (self-probes reads max_probes under the
   # same lock). Skipped when a caller already holds it (CLAUDE_AUTO_PROBES_LOCKED=1).
   if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
-    if exec 8>"$statedir/.probes-rmw.lock" 2>/dev/null; then
+    # Скобки — тот же капкан «exec без команды глушит stderr всего процесса», см. spec_rmw.
+    if { exec 8>"$statedir/.probes-rmw.lock"; } 2>/dev/null; then
       flock -w 10 8 2>/dev/null || die "set-probe-limit: busy (a probe change is in progress) — retry"
     fi
   fi
@@ -1915,7 +2084,8 @@ cmd_upgrade() {
       # max_probes written by a just-finished set-probe-limit. Skip if a caller holds it.
       if [ "${CLAUDE_AUTO_PROBES_LOCKED:-}" != "1" ]; then
         mkdir -p "$home/state"
-        if exec 8>"$home/state/.probes-rmw.lock" 2>/dev/null; then
+        # Скобки — тот же капкан «exec без команды глушит stderr всего процесса», см. spec_rmw.
+        if { exec 8>"$home/state/.probes-rmw.lock"; } 2>/dev/null; then
           flock -w 10 8 2>/dev/null || die "upgrade: busy (a probe/spec change is in progress) — retry"
         fi
       fi
